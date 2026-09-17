@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 pub mod oauth2;
+pub mod odrl_filter;
 
 use axum::{
     Form, Json, Router,

@@ -26,6 +26,27 @@ thiserror = { workspace = true }
 # JWT verification for the OAuth2 Bearer gate - see src/oauth2.rs's module
 # doc and docs/oauth2-bearer-gating-2026-08-28.md.
 jsonwebtoken = { workspace = true }
+# ODRL policy evaluation for gap analysis §3.4's dataset-visibility
+# filtering - see src/odrl_filter.rs's module doc. A relative path
+# dependency on the sibling `ds-odrl-engine-rs` submodule's own `engine`
+# crate, deliberately *not* its `dsp-odrl-adapter` (that crate ingests raw
+# ODRL JSON-LD from a wire document, a concern this crate doesn't have:
+# `catalog_core::Policy` is already a real, structured, first-class type by
+# the time it reaches this bridge - the mapping this module needs is
+# catalog-core's own struct shape to `engine`'s wire types, not JSON-LD
+# ingestion). Three hops up (this crate nests one level deeper than
+# `ds-sql-dps-rs`'s `dataplane/`, which itself uses `../../ds-odrl-engine-rs/engine`
+# - see that project's `ARCHITECTURE.md`) because this manifest lives at
+# `ds-catalog-broker-rs/crates/ds-catalog-broker-rs/`, not
+# `ds-catalog-broker-rs/`: `../../../ds-odrl-engine-rs` is this repo's own
+# root's sibling, exactly as `ds-sql-dps-rs` is. Pinned implicitly to
+# whatever revision the sibling checkout has - both are submodules of the
+# same parent `dataspace` repo, not independently version-pinned here.
+engine = { path = "../../../ds-odrl-engine-rs/engine" }
+# `with_context_claims` (src/odrl_filter.rs) sets a `dateTime` context claim
+# from the current wall-clock time, mirroring `ds-sql-dps-rs`'s own
+# `dataplane/src/public.rs::get_file` pattern exactly.
+chrono = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
