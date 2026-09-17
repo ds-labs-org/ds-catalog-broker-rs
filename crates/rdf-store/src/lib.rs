@@ -334,17 +334,35 @@ pub mod memory {
 /// policy data into the generic `Dataset.properties` bag or an opaque
 /// blob.
 ///
-/// **Known limitation, not exercised by any current producer**: only
-/// *atomic* ODRL constraints (`odrl:leftOperand`/`odrl:operator`/
-/// `odrl:rightOperand` on one constraint resource) are ever written or
-/// read here - see `catalog_core::Constraint`'s own doc comment for why
-/// nested `odrl:and`/`odrl:or`/`odrl:andSequence`/`odrl:xone` logical
-/// constraint groups are out of scope. This store never has to defend
-/// against one reaching it: `crawler::parse_catalog_response` skips a
-/// constraint of that shape (with a tracing warning), one constraint at a
-/// time, before it is ever handed to `write_catalog`. Flagged here for the
-/// same reason the rest of this doc flags known gaps honestly, not
-/// because it is currently reachable.
+/// **Logical constraint groups (gap analysis §3.4, closed).** A
+/// constraint resource `<constraint>` is either the atomic shape above, or
+/// a *logical* group - `<constraint> odrl:and <child> .` / `odrl:or` /
+/// `odrl:xone` / `odrl:andSequence`, one triple per
+/// [`catalog_core::LogicalConstraint`] child, each real ODRL term reused
+/// exactly the way `odrl:leftOperand`/`odrl:operator` are reused for the
+/// atomic shape above. `<child>` is itself a full constraint resource -
+/// built from the *parent constraint's* own IRI the same way a top-level
+/// constraint is built from its rule's IRI (see [`constraint_iri`]), so
+/// nesting reuses the exact same resource-naming scheme at every depth -
+/// carrying its own `fcns:sequenceIndex` (its position among its
+/// siblings) and, recursively, either shape again. A constraint resource
+/// therefore carries **at most one** of `odrl:leftOperand` or one of the
+/// four logical predicates, never both - `load_constraint` reads whichever
+/// is present, atomic taking precedence should a hand-crafted graph
+/// (outside this store's own writes) carry both.
+///
+/// Recursion depth - both writing and reading - is bounded by
+/// `MAX_CONSTRAINT_DEPTH` (64), the exact same bound and rationale as
+/// `crawler::MAX_CONSTRAINT_DEPTH` and
+/// `ds-odrl-engine-rs::engine::constraint::MAX_CONSTRAINT_DEPTH`: a
+/// constraint nested past the bound is dropped (not written, with no
+/// dangling triple left behind) on write, the same way
+/// `crawler::parse_constraint` drops one past its own bound rather than
+/// growing a parser's call stack unboundedly - and reading back a graph
+/// that somehow carries one anyway (not producible by this store's own
+/// write path, but defended against regardless, e.g. a hand-written
+/// fixture or a future non-`crawler` producer) errors out rather than
+/// recursing without bound.
 ///
 /// ### Namespaces
 ///
@@ -385,9 +403,17 @@ pub mod memory {
 ///   respectively. Each list's `<index>` restarts at 0 independently of
 ///   the other two - they live under different path segments, so a
 ///   permission and a prohibition at the same position never collide.
-/// - **Constraint resource**: `<rule>/constraints/<index>`, where `<rule>`
-///   is whichever permission/prohibition/obligation resource IRI the
-///   constraint belongs to.
+/// - **Constraint resource**: `<parent>/constraints/<index>`, where
+///   `<parent>` is whichever permission/prohibition/obligation resource
+///   IRI the constraint directly belongs to for a rule's own top-level
+///   constraint, **or another constraint resource IRI** for a child of a
+///   logical (`odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`) group -
+///   nesting reuses this exact same `<parent>/constraints/<index>` scheme
+///   at every depth, so e.g. an `odrl:xone`'s second child, itself an
+///   `odrl:and`'s first child, gets
+///   `<rule>/constraints/<xone-index>/constraints/<and-index>/constraints/0`.
+///   See "Triples emitted" below for the logical-group predicates
+///   themselves.
 ///
 /// `Distribution.access_service` is a bare `String` in the domain model,
 /// not a typed foreign key - it is resolved to a DataService resource IRI
@@ -462,18 +488,46 @@ pub mod memory {
 /// - `<rule> odrl:constraint <constraint> .` - one per `Rule.constraints`
 ///   entry.
 ///
-/// For each constraint resource `<constraint>` (from `Rule.constraints`):
-/// - `<constraint> fcns:sequenceIndex "<index>"^^xsd:integer .`
-/// - `<constraint> odrl:leftOperand ...` - `Constraint.left_operand`,
-///   IRI-or-literal.
-/// - `<constraint> odrl:operator ...` - `Constraint.operator`,
-///   IRI-or-literal.
-/// - `<constraint> odrl:rightOperand "<value>"` - `Constraint.right_operand`,
-///   **always** a plain literal, never minted as an IRI even when the
-///   value happens to parse as one: a `rightOperand` is a value being
-///   compared against, not an identifier for another resource, so giving
-///   it the IRI-or-literal treatment would change its RDF shape based on
-///   incidental string content rather than ODRL semantics.
+/// For each constraint resource `<constraint>` (from `Rule.constraints`,
+/// or recursively from a logical constraint's own children - see
+/// "Resource IRIs" above): first, always,
+/// `<constraint> fcns:sequenceIndex "<index>"^^xsd:integer .` (this
+/// resource's position among its own siblings, atomic or logical alike);
+/// then, depending on [`catalog_core::Constraint`]'s shape:
+///
+/// - [`Atomic`](catalog_core::Constraint::Atomic):
+///   - `<constraint> odrl:leftOperand ...` - `Constraint.left_operand`,
+///     IRI-or-literal.
+///   - `<constraint> odrl:operator ...` - `Constraint.operator`,
+///     IRI-or-literal.
+///   - `<constraint> odrl:rightOperand "<value>"` - `Constraint.right_operand`,
+///     **always** a plain literal, never minted as an IRI even when the
+///     value happens to parse as one: a `rightOperand` is a value being
+///     compared against, not an identifier for another resource, so
+///     giving it the IRI-or-literal treatment would change its RDF shape
+///     based on incidental string content rather than ODRL semantics.
+/// - [`Logical`](catalog_core::Constraint::Logical) - exactly one of:
+///   - `<constraint> odrl:and <child> .` - one per
+///     [`LogicalConstraint::And`](catalog_core::LogicalConstraint::And)
+///     child, in order.
+///   - `<constraint> odrl:or <child> .` - one per
+///     [`LogicalConstraint::Or`](catalog_core::LogicalConstraint::Or)
+///     child, in order.
+///   - `<constraint> odrl:xone <child> .` - one per
+///     [`LogicalConstraint::Xone`](catalog_core::LogicalConstraint::Xone)
+///     child, in order.
+///   - `<constraint> odrl:andSequence <child> .` - one per
+///     [`LogicalConstraint::AndSequence`](catalog_core::LogicalConstraint::AndSequence)
+///     child, in order.
+///
+///   Each `<child>` is itself a full constraint resource (see "Resource
+///   IRIs" above), recursively either shape again - up to
+///   `MAX_CONSTRAINT_DEPTH` (64) levels deep, matching
+///   `crawler::MAX_CONSTRAINT_DEPTH`; a child nested past that bound is
+///   dropped entirely (no `odrl:and`/`odrl:or`/`odrl:xone`/
+///   `odrl:andSequence` link triple written for it, and none of its own
+///   triples either) rather than growing this store's own recursive
+///   write/read past a safe bound.
 ///
 /// For each distribution resource `<distribution>` (from
 /// `Dataset.distributions`):
@@ -541,7 +595,8 @@ pub mod memory {
 /// own structural predicates - `odrl:permission`, `odrl:prohibition`,
 /// `odrl:obligation`, `odrl:action`, `odrl:constraint`,
 /// `odrl:leftOperand`, `odrl:operator`, `odrl:rightOperand`,
-/// `odrl:assigner`, `odrl:assignee`, and `fcns:policyId` - are reserved on
+/// `odrl:assigner`, `odrl:assignee`, `odrl:and`, `odrl:or`, `odrl:xone`,
+/// `odrl:andSequence`, and `fcns:policyId` - are reserved on
 /// `Policy`/`Rule`/`Constraint` resources the same way, but those types
 /// have no generic property map at all, so there is nothing for them to
 /// collide with today either way. Flagged rather than defended against,
@@ -587,7 +642,9 @@ pub mod memory {
 /// `@id` means) and is not otherwise enforced by `catalog-core::Dataset`.
 pub mod oxigraph_backend {
     use super::*;
-    use catalog_core::{Constraint, DataService, Dataset, Distribution, Policy, PolicyKind, Rule};
+    use catalog_core::{
+        Constraint, DataService, Dataset, Distribution, LogicalConstraint, Policy, PolicyKind, Rule,
+    };
     use contreforts_kg::GraphError;
     use contreforts_kg::store::GraphStore;
     use oxigraph::model::{Literal, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -603,6 +660,22 @@ pub mod oxigraph_backend {
     const DCT_NS: &str = "http://purl.org/dc/terms/";
     const ODRL_NS: &str = "http://www.w3.org/ns/odrl/2/";
     const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+    /// Bounds how many nested `odrl:and`/`odrl:or`/`odrl:xone`/
+    /// `odrl:andSequence` levels [`OxigraphCatalogCache::write_constraint`]
+    /// and [`OxigraphCatalogCache::load_constraint`] will recurse into for
+    /// one constraint tree - the exact same value and rationale as
+    /// `crawler::MAX_CONSTRAINT_DEPTH` (deliberately kept in sync with it,
+    /// and in turn with `ds-odrl-engine-rs::engine::constraint::MAX_CONSTRAINT_DEPTH`):
+    /// a policy this store persists but the engine would then refuse to
+    /// evaluate (or vice versa) would be a confusing, hard-to-diagnose
+    /// mismatch between "stored" and "enforceable" for the exact same
+    /// input. Applied independently of `crawler`'s own bound - a
+    /// `Constraint` tree can reach this store from any caller, not only
+    /// `crawler::parse_catalog_response`, so this store defends its own
+    /// write/read recursion rather than trusting an upstream producer to
+    /// have already bounded it.
+    const MAX_CONSTRAINT_DEPTH: usize = 64;
 
     impl From<GraphError> for StoreError {
         fn from(err: GraphError) -> Self {
@@ -773,6 +846,47 @@ pub mod oxigraph_backend {
 
     fn odrl_right_operand_pred() -> NamedNode {
         odrl("rightOperand")
+    }
+
+    fn odrl_and_pred() -> NamedNode {
+        odrl("and")
+    }
+
+    fn odrl_or_pred() -> NamedNode {
+        odrl("or")
+    }
+
+    fn odrl_xone_pred() -> NamedNode {
+        odrl("xone")
+    }
+
+    fn odrl_and_sequence_pred() -> NamedNode {
+        odrl("andSequence")
+    }
+
+    /// Constructor signature shared by [`Constraint::and`],
+    /// [`Constraint::or`], [`Constraint::xone`], and
+    /// [`Constraint::and_sequence`] - factored into a named alias purely
+    /// so [`logical_constraint_preds`]'s own type stays readable, mirroring
+    /// `crawler::LogicalConstraintBuilder`.
+    type LogicalConstraintBuilder = fn(Vec<Constraint>) -> Constraint;
+
+    /// The four `odrl:`-namespaced logical-group predicates, each paired
+    /// with the `catalog_core::Constraint` constructor for that combinator,
+    /// in the same fixed precedence [`crawler::LOGICAL_CONSTRAINT_KEYS`]
+    /// uses when parsing (`xone`, then `or`, then `and`, then
+    /// `andSequence`): [`OxigraphCatalogCache::load_constraint`] checks
+    /// them in this order, so a hand-crafted constraint resource carrying
+    /// more than one (malformed - this store's own write path only ever
+    /// emits one) is at least read back the same way `crawler` would parse
+    /// the equivalent malformed JSON-LD, rather than an arbitrary one.
+    fn logical_constraint_preds() -> [(NamedNode, LogicalConstraintBuilder); 4] {
+        [
+            (odrl_xone_pred(), Constraint::xone),
+            (odrl_or_pred(), Constraint::or),
+            (odrl_and_pred(), Constraint::and),
+            (odrl_and_sequence_pred(), Constraint::and_sequence),
+        ]
     }
 
     fn odrl_assigner_pred() -> NamedNode {
@@ -1320,66 +1434,97 @@ pub mod oxigraph_backend {
                     &Term::from(constraint_node.clone()),
                     graph,
                 )?;
-                self.write_constraint(constraint, &constraint_node, index, graph)?;
+                // 0: a rule's own top-level constraints are depth 0, the
+                // same numbering `crawler::parse_constraint` uses for a
+                // rule's top-level `constraint` entries.
+                self.write_constraint(constraint, &constraint_node, index, 0, graph)?;
             }
             Ok(())
         }
 
-        /// `rightOperand` is always written as a plain literal, never
-        /// through [`iri_or_literal_term`] - see the module doc's "Triples
-        /// emitted" section (constraint resource bullets) for why.
+        /// Write every triple for one `constraint` (atomic or logical,
+        /// arbitrarily nested) into `constraint_node`, at `index` among its
+        /// own siblings and `depth` levels of logical nesting below its
+        /// rule's own top-level `constraint` list (0 for a top-level
+        /// entry - see [`write_rule`]). `rightOperand` is always written as
+        /// a plain literal, never through [`iri_or_literal_term`] - see the
+        /// module doc's "Triples emitted" section (constraint resource
+        /// bullets) for why.
         ///
-        /// `catalog_core::Constraint` gained a `Logical` variant (gap
-        /// analysis §3.4), but writing a `Logical` constraint's nested
-        /// triples out is separate, not-yet-done work from that scope cut.
-        /// This store still only ever writes the `Atomic` shape, exactly
-        /// as documented in this module's own "Known limitation" note.
-        /// `crawler::parse_catalog_response` still only ever constructs
-        /// `Constraint::Atomic`, so the `Logical` arm below is unreached by
-        /// every current producer; it skips silently (see its own inline
-        /// comment for why not a log line) rather than panicking, should
-        /// that change before the real write path is built.
+        /// A [`Constraint::Logical`] writes one `odrl:and`/`odrl:or`/
+        /// `odrl:xone`/`odrl:andSequence` link triple per child (matching
+        /// the combinator), then recurses into [`write_constraint`] for
+        /// each child at `depth + 1` - see the module doc's "Logical
+        /// constraint groups" note. Bounded by [`MAX_CONSTRAINT_DEPTH`]: a
+        /// child that would be written past the bound is skipped entirely,
+        /// including its link triple, so no dangling/incomplete constraint
+        /// resource is ever left in the graph - mirroring
+        /// `crawler::parse_constraint` dropping an over-deep entry from the
+        /// parsed `Vec` outright rather than including a truncated one.
         fn write_constraint(
             &self,
             constraint: &Constraint,
             constraint_node: &NamedNode,
             index: usize,
+            depth: usize,
             graph: &NamedNode,
         ) -> StoreResult<()> {
-            // `rdf-store` has no `tracing` dependency of its own (unlike
-            // `crawler`, which logs its analogous skip via
-            // `tracing::warn!` in `parse_constraint`) - this arm is
-            // unreached by any current producer (see this fn's own doc
-            // comment), so a silent skip rather than a new dependency
-            // just to log an unreachable path.
-            let atomic = match constraint {
-                Constraint::Atomic(atomic) => atomic,
-                Constraint::Logical(_) => return Ok(()),
-            };
             self.insert(
                 constraint_node,
                 &sequence_index_pred(),
                 &Term::from(Literal::from(index as i64)),
                 graph,
             )?;
-            self.insert(
-                constraint_node,
-                &odrl_left_operand_pred(),
-                &iri_or_literal_term(&atomic.left_operand),
-                graph,
-            )?;
-            self.insert(
-                constraint_node,
-                &odrl_operator_pred(),
-                &iri_or_literal_term(&atomic.operator),
-                graph,
-            )?;
-            self.insert(
-                constraint_node,
-                &odrl_right_operand_pred(),
-                &Term::from(Literal::from(atomic.right_operand.clone())),
-                graph,
-            )?;
+            match constraint {
+                Constraint::Atomic(atomic) => {
+                    self.insert(
+                        constraint_node,
+                        &odrl_left_operand_pred(),
+                        &iri_or_literal_term(&atomic.left_operand),
+                        graph,
+                    )?;
+                    self.insert(
+                        constraint_node,
+                        &odrl_operator_pred(),
+                        &iri_or_literal_term(&atomic.operator),
+                        graph,
+                    )?;
+                    self.insert(
+                        constraint_node,
+                        &odrl_right_operand_pred(),
+                        &Term::from(Literal::from(atomic.right_operand.clone())),
+                        graph,
+                    )?;
+                }
+                Constraint::Logical(logical) => {
+                    // A child would be written at `depth + 1`; skip the
+                    // whole remaining sibling list once that would exceed
+                    // the bound (uniform across siblings - see this fn's
+                    // own doc comment) rather than writing a partially
+                    // truncated group.
+                    if depth >= MAX_CONSTRAINT_DEPTH {
+                        return Ok(());
+                    }
+                    let (predicate, children): (NamedNode, &[Constraint]) = match logical {
+                        LogicalConstraint::And(children) => (odrl_and_pred(), children),
+                        LogicalConstraint::Or(children) => (odrl_or_pred(), children),
+                        LogicalConstraint::Xone(children) => (odrl_xone_pred(), children),
+                        LogicalConstraint::AndSequence(children) => {
+                            (odrl_and_sequence_pred(), children)
+                        }
+                    };
+                    for (child_index, child) in children.iter().enumerate() {
+                        let child_node = constraint_iri(constraint_node.as_str(), child_index);
+                        self.insert(
+                            constraint_node,
+                            &predicate,
+                            &Term::from(child_node.clone()),
+                            graph,
+                        )?;
+                        self.write_constraint(child, &child_node, child_index, depth + 1, graph)?;
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -1615,7 +1760,9 @@ pub mod oxigraph_backend {
             for quad in self.quads(Some(subject), Some(&constraint_pred), None, graph)? {
                 let constraint_subject =
                     expect_named_node(quad.object, "an odrl:constraint reference")?;
-                constraint_entries.push(self.load_constraint(&constraint_subject, graph)?);
+                // 0: a rule's own top-level constraints are depth 0 - see
+                // [`write_constraint`]'s doc comment for the numbering.
+                constraint_entries.push(self.load_constraint(&constraint_subject, graph, 0)?);
             }
             constraint_entries.sort_by_key(|(index, _)| *index);
             let constraints = constraint_entries
@@ -1632,44 +1779,86 @@ pub mod oxigraph_backend {
             ))
         }
 
+        /// Load the constraint at `subject`, atomic or logical, at `depth`
+        /// levels of logical nesting below its rule's own top-level
+        /// `constraint` list (0 for a top-level entry - matches
+        /// [`write_constraint`]'s own numbering). Dispatches on which
+        /// shape `subject` actually carries: `odrl:leftOperand` present
+        /// means atomic (the existing, pre-logical-support behavior,
+        /// unchanged); otherwise, whichever of
+        /// [`logical_constraint_preds`]'s four predicates `subject` carries
+        /// means logical, with that predicate's linked children loaded
+        /// recursively (sorted by their own `fcns:sequenceIndex`, the same
+        /// ordering bookkeeping every other list in this store uses - see
+        /// the module doc's "Ordering" section) and re-wrapped in the
+        /// matching combinator.
         fn load_constraint(
             &self,
             subject: &NamedNode,
             graph: &NamedNode,
+            depth: usize,
         ) -> StoreResult<(usize, Constraint)> {
+            if depth > MAX_CONSTRAINT_DEPTH {
+                return Err(StoreError::Backend(format!(
+                    "{} is nested past the maximum supported logical constraint depth ({MAX_CONSTRAINT_DEPTH})",
+                    subject.as_str()
+                )));
+            }
             let index = self.sequence_index(subject, graph)?;
-            let left_operand = self
-                .first_object(subject, &odrl_left_operand_pred(), graph)?
-                .as_ref()
-                .map(term_as_string)
-                .transpose()?
-                .ok_or_else(|| {
-                    StoreError::Backend(format!("{} is missing odrl:leftOperand", subject.as_str()))
-                })?;
-            let operator = self
-                .first_object(subject, &odrl_operator_pred(), graph)?
-                .as_ref()
-                .map(term_as_string)
-                .transpose()?
-                .ok_or_else(|| {
-                    StoreError::Backend(format!("{} is missing odrl:operator", subject.as_str()))
-                })?;
-            let right_operand = self
-                .first_object(subject, &odrl_right_operand_pred(), graph)?
-                .as_ref()
-                .map(term_as_string)
-                .transpose()?
-                .ok_or_else(|| {
-                    StoreError::Backend(format!(
-                        "{} is missing odrl:rightOperand",
-                        subject.as_str()
-                    ))
-                })?;
 
-            Ok((
-                index,
-                Constraint::atomic(left_operand, operator, right_operand),
-            ))
+            if let Some(left_operand_term) =
+                self.first_object(subject, &odrl_left_operand_pred(), graph)?
+            {
+                let left_operand = term_as_string(&left_operand_term)?;
+                let operator = self
+                    .first_object(subject, &odrl_operator_pred(), graph)?
+                    .as_ref()
+                    .map(term_as_string)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        StoreError::Backend(format!(
+                            "{} is missing odrl:operator",
+                            subject.as_str()
+                        ))
+                    })?;
+                let right_operand = self
+                    .first_object(subject, &odrl_right_operand_pred(), graph)?
+                    .as_ref()
+                    .map(term_as_string)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        StoreError::Backend(format!(
+                            "{} is missing odrl:rightOperand",
+                            subject.as_str()
+                        ))
+                    })?;
+
+                return Ok((
+                    index,
+                    Constraint::atomic(left_operand, operator, right_operand),
+                ));
+            }
+
+            for (predicate, build) in logical_constraint_preds() {
+                let child_quads = self.quads(Some(subject), Some(&predicate), None, graph)?;
+                if child_quads.is_empty() {
+                    continue;
+                }
+                let mut child_entries = Vec::new();
+                for quad in child_quads {
+                    let child_subject =
+                        expect_named_node(quad.object, "a logical constraint child reference")?;
+                    child_entries.push(self.load_constraint(&child_subject, graph, depth + 1)?);
+                }
+                child_entries.sort_by_key(|(index, _)| *index);
+                let children = child_entries.into_iter().map(|(_, c)| c).collect();
+                return Ok((index, build(children)));
+            }
+
+            Err(StoreError::Backend(format!(
+                "{} is missing odrl:leftOperand and carries none of odrl:and/odrl:or/odrl:xone/odrl:andSequence",
+                subject.as_str()
+            )))
         }
 
         fn load_distribution(
