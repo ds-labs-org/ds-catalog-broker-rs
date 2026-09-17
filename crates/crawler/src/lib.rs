@@ -241,12 +241,15 @@ async fn crawl_one(
 /// `permission`/`prohibition`/`obligation` under a policy follows the same
 /// convention. See `parse_policies` for the field-by-field mapping.
 ///
-/// **Known limitation** (deliberate, gap analysis §3.4 scope cut): only
-/// *atomic* ODRL constraints (`leftOperand`/`operator`/`rightOperand`) are
-/// modeled. A constraint that is instead a *logical* group
-/// (`odrl:and`/`odrl:or`/`odrl:andSequence`/`odrl:xone` nesting further
-/// constraints) does not have a flat `leftOperand`, so it is recognized as
-/// malformed for this parser's purposes and skipped - only that one
+/// Both *atomic* ODRL constraints (`leftOperand`/`operator`/`rightOperand`)
+/// and *logical* groups (`odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`
+/// nesting further constraints, recursively) are modeled - gap analysis
+/// §3.4's earlier atomic-only scope cut is closed; see [`parse_constraint`]
+/// for the recursive parse and [`MAX_CONSTRAINT_DEPTH`] for the nesting
+/// bound. A constraint entry that is neither shape (no flat
+/// `leftOperand`/`operator`/`rightOperand` triple and no recognized
+/// `odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence` key), or a logical
+/// group nested past [`MAX_CONSTRAINT_DEPTH`], is skipped - only that one
 /// constraint entry, never the enclosing rule or policy - with a
 /// `tracing::warn!` marking the skip rather than silently dropping it. A
 /// rule (`permission`/`prohibition`/`obligation`) missing its required
@@ -528,43 +531,109 @@ fn parse_rule(value: &Value) -> Option<Rule> {
     })
 }
 
-/// Parse a rule's `constraint` entries (one-or-many) into `Constraint`s.
-/// See `parse_catalog_response`'s doc comment: only atomic constraints are
-/// modeled, so a nested logical-group entry (no flat `leftOperand`) is
-/// recognized as malformed for this parser and skipped with a
-/// `tracing::warn!`, without dropping the rule's other constraints.
+/// Bounds how many nested `odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`
+/// levels [`parse_constraint`] will recurse into when parsing one crawled
+/// constraint tree, so a pathologically deep (or adversarial) crawled
+/// payload cannot grow this parser's call stack unboundedly. Deliberately
+/// set to the exact same value as `ds-odrl-engine-rs`'s own
+/// `engine::constraint::MAX_CONSTRAINT_DEPTH` (see that constant's doc
+/// comment for the full rationale, including why 64 specifically) rather
+/// than picking an independent number here: this crawler and that engine
+/// parse/evaluate the same wire shape into structurally the same tree, and
+/// a policy this crawler harvests but the engine would then refuse to
+/// evaluate (or vice versa) would be a confusing, hard-to-diagnose mismatch
+/// between "harvested" and "enforceable" for the exact same input.
+const MAX_CONSTRAINT_DEPTH: usize = 64;
+
+/// Constructor signature shared by [`Constraint::and`], [`Constraint::or`],
+/// [`Constraint::xone`], and [`Constraint::and_sequence`] - factored into a
+/// named alias purely so [`LOGICAL_CONSTRAINT_KEYS`]'s own type stays
+/// readable (a bare `[(&str, fn(Vec<Constraint>) -> Constraint); 4]` is a
+/// clippy `type_complexity` warning).
+type LogicalConstraintBuilder = fn(Vec<Constraint>) -> Constraint;
+
+/// The `odrl:`-prefixed JSON-LD keys a logical constraint group may use,
+/// each paired with the `catalog_core::Constraint` constructor for that
+/// combinator, in the same fixed precedence order
+/// `ds-odrl-engine-rs::engine::Constraint::evaluate` applies when more than
+/// one such key is present on a single node: `xone`, then `or`, then `and`,
+/// then `andSequence`. A crawled constraint node is expected to carry at
+/// most one of these, but keeping the same precedence as the engine (rather
+/// than an arbitrary one) means a hand-authored node setting more than one
+/// key - malformed, but not rejected outright, matching this parser's
+/// generally lenient stance - is at least interpreted identically by both
+/// this crawler and the engine that will later evaluate it.
+const LOGICAL_CONSTRAINT_KEYS: [(&str, LogicalConstraintBuilder); 4] = [
+    ("odrl:xone", Constraint::xone),
+    ("odrl:or", Constraint::or),
+    ("odrl:and", Constraint::and),
+    ("odrl:andSequence", Constraint::and_sequence),
+];
+
+/// Parse a rule's `constraint` entries (one-or-many) into `Constraint`s -
+/// see [`parse_constraint`] for the per-entry (recursive) parse.
 fn parse_constraints(value: Option<&Value>) -> Vec<Constraint> {
     one_or_many(value)
         .into_iter()
-        .filter_map(parse_constraint)
+        .filter_map(|entry| parse_constraint(entry, 0))
         .collect()
 }
 
-/// Parse one `constraint` entry into an atomic `Constraint`. Returns `None`
-/// (skipping just this entry, logged via `tracing::warn!`) when any of
-/// `leftOperand`/`operator`/`rightOperand` is missing - which is exactly
-/// what happens for a nested `odrl:and`/`odrl:or`/`odrl:xone` logical-group
-/// node, since it carries no flat `leftOperand` of its own. See the "Known
-/// limitation" paragraph on `parse_catalog_response` and gap analysis §3.4.
-fn parse_constraint(value: &Value) -> Option<Constraint> {
+/// Parse one `constraint` entry into a `Constraint`, recursively: either the
+/// atomic `leftOperand`/`operator`/`rightOperand` shape, or a logical group
+/// under one of [`LOGICAL_CONSTRAINT_KEYS`] (`odrl:and`/`odrl:or`/
+/// `odrl:xone`/`odrl:andSequence`), whose own child entries (one-or-many,
+/// same convention as everywhere else in this parser) are parsed by
+/// recursing into this same function at `depth + 1` - so a group nested
+/// inside another group is handled the same way as a top-level one.
+///
+/// `depth` is the caller's nesting depth for `value` itself (0 for a rule's
+/// own top-level `constraint` entries); recursion stops and this entry is
+/// skipped, logged via `tracing::warn!`, once `depth` exceeds
+/// [`MAX_CONSTRAINT_DEPTH`], the same bound
+/// `ds-odrl-engine-rs::engine::Constraint::evaluate` enforces on the tree it
+/// would later evaluate - see that constant's own doc comment. Also skipped
+/// the same way (single entry, not the enclosing rule/policy): a node with
+/// neither a complete atomic triple nor a recognized logical key, e.g. one
+/// missing `rightOperand`, or one using an ODRL constraint shape this parser
+/// does not recognize.
+fn parse_constraint(value: &Value, depth: usize) -> Option<Constraint> {
+    if depth > MAX_CONSTRAINT_DEPTH {
+        tracing::warn!(
+            entry = %value,
+            depth,
+            max_depth = MAX_CONSTRAINT_DEPTH,
+            "skipping a crawled ODRL logical constraint nested past MAX_CONSTRAINT_DEPTH"
+        );
+        return None;
+    }
+
     let left_operand = get_str_with_alias(value, "leftOperand", "odrl:leftOperand");
     let operator = get_str_with_alias(value, "operator", "odrl:operator");
     let right_operand = get_str_with_alias(value, "rightOperand", "odrl:rightOperand");
 
-    match (left_operand, operator, right_operand) {
-        (Some(left_operand), Some(operator), Some(right_operand)) => {
-            Some(Constraint::atomic(left_operand, operator, right_operand))
-        }
-        _ => {
-            tracing::warn!(
-                entry = %value,
-                "skipping a crawled ODRL constraint that is not an atomic leftOperand/operator/rightOperand \
-                 triple - nested logical-group constraints (odrl:and/or/xone) are out of scope, see gap \
-                 analysis §3.4"
-            );
-            None
+    if let (Some(left_operand), Some(operator), Some(right_operand)) =
+        (left_operand, operator, right_operand)
+    {
+        return Some(Constraint::atomic(left_operand, operator, right_operand));
+    }
+
+    for (key, build) in LOGICAL_CONSTRAINT_KEYS {
+        if let Some(children_value) = value.get(key) {
+            let children: Vec<Constraint> = one_or_many(Some(children_value))
+                .into_iter()
+                .filter_map(|child| parse_constraint(child, depth + 1))
+                .collect();
+            return Some(build(children));
         }
     }
+
+    tracing::warn!(
+        entry = %value,
+        "skipping a crawled ODRL constraint that is neither an atomic leftOperand/operator/rightOperand \
+         triple nor a recognized logical group (odrl:and/odrl:or/odrl:xone/odrl:andSequence)"
+    );
+    None
 }
 
 /// Spawn a background task that runs [`crawl_once`] every
@@ -1026,11 +1095,16 @@ mod tests {
     }
 
     /// (d) A permission carrying one well-formed atomic constraint
-    /// alongside one malformed/nested one (an `odrl:and` logical-group
-    /// node, out of scope per gap analysis §3.4) skips only the malformed
-    /// constraint - the well-formed constraint and the rest of the
-    /// permission/policy survive intact, and the whole crawl does not
-    /// panic.
+    /// alongside one genuinely malformed one (neither a complete atomic
+    /// `leftOperand`/`operator`/`rightOperand` triple - `rightOperand` is
+    /// missing here - nor a recognized `odrl:and`/`odrl:or`/`odrl:xone`/
+    /// `odrl:andSequence` logical key) skips only the malformed constraint -
+    /// the well-formed constraint and the rest of the permission/policy
+    /// survive intact, and the whole crawl does not panic. Note this is
+    /// *not* an `odrl:and`/etc. node: those are real, well-formed ODRL and
+    /// are now parsed into `Constraint::Logical` (see
+    /// `logical_and_constraint_is_parsed_not_skipped`), not treated as
+    /// malformed.
     #[test]
     fn malformed_nested_constraint_is_skipped_without_dropping_the_rest_of_the_policy() {
         let body = json!({
@@ -1048,10 +1122,8 @@ mod tests {
                                 "rightOperand": "10"
                             },
                             {
-                                "odrl:and": [
-                                    {"leftOperand": "dateTime", "operator": "gt", "rightOperand": "2026-01-01"},
-                                    {"leftOperand": "dateTime", "operator": "lt", "rightOperand": "2027-01-01"}
-                                ]
+                                "leftOperand": "dateTime",
+                                "operator": "gt"
                             }
                         ]
                     }]
@@ -1070,7 +1142,7 @@ mod tests {
         assert_eq!(
             policies[0].permissions[0].constraints,
             vec![Constraint::atomic("count", "lteq", "10")],
-            "the well-formed atomic constraint must survive; the nested odrl:and group must be skipped, not crash or wipe the whole list"
+            "the well-formed atomic constraint must survive; the constraint missing rightOperand must be skipped, not crash or wipe the whole list"
         );
     }
 

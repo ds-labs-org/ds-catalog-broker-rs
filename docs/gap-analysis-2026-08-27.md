@@ -175,18 +175,27 @@ based on policy (e.g. not listing a dataset a given internal caller isn't entitl
 is a genuinely open design question, not answered by this document — flag it for a
 real decision, don't guess at one here.
 
-**Status: implemented (preservation half only).** `catalog-core` now has a real
-`Policy`/`Rule`/`Constraint` model (`Dataset.policies: Vec<Policy>`); `crawler` parses
-it from a crawled participant's `odrl:hasPolicy` triples; `rdf-store` preserves it as
-real `odrl:` triples in the Oxigraph-backed semantic cache (write and read paths); the
-management API's `hasPolicy` field is populated from that preserved data instead of
-always being an empty array. Only *atomic* ODRL constraints (`leftOperand`/`operator`/
-`rightOperand`) are modeled — nested logical-constraint groups (`odrl:and`/`odrl:or`/
-`odrl:xone`) are a deliberate, known scope cut; a crawled constraint shaped as one of
-those is skipped (with a `tracing::warn!`), not silently dropped along with the rest of
-its policy, and not a crash. The *filtering* question this section raised — whether the
-broker should hide a dataset from a caller not entitled under its policy — remains
-open and unimplemented; nothing filters on policy content today.
+**Status: preservation half in progress - parsing/model now closed, persistence not
+yet.** `catalog-core` has a real `Policy`/`Rule`/`Constraint` model
+(`Dataset.policies: Vec<Policy>`), and `Constraint` covers both the atomic
+`leftOperand`/`operator`/`rightOperand` shape and logical groups (`odrl:and`/`odrl:or`/
+`odrl:xone`/`odrl:andSequence`, via `Constraint::Logical`, nesting arbitrarily). `crawler`
+parses both shapes from a crawled participant's `odrl:hasPolicy` triples, the logical
+half recursively, bounded by a `MAX_CONSTRAINT_DEPTH` (64, deliberately matching
+`ds-odrl-engine-rs::engine::constraint::MAX_CONSTRAINT_DEPTH`'s own bound and rationale)
+past which a pathologically deep group is skipped - with a `tracing::warn!`, not a crash,
+and not dropping the rest of the rule/policy - rather than growing the parser's call
+stack unboundedly. The earlier atomic-only scope cut on the crawler's own parsing is
+closed. `rdf-store`'s Oxigraph-backed semantic cache still only writes/reads the atomic
+shape (`crates/rdf-store/src/lib.rs`'s `write_constraint`/`load_constraint`): a `Logical`
+constraint the crawler now parses correctly in memory is currently silently *not*
+persisted when a catalog is upserted (`write_constraint` no-ops on
+`Constraint::Logical` rather than erroring) - so the management API's `hasPolicy` and
+the SPARQL surface do not yet reflect a harvested logical constraint at all. That gap
+must close before this section's "preserve faithfully" framing is true end to end. The
+*filtering* question this section raised — whether the broker should hide a dataset from
+a caller not entitled under its policy — remains open and unimplemented; nothing filters
+on policy content today.
 
 ### 3.5 Test-fixture impact: the DCP-gated crawl test
 
