@@ -1328,6 +1328,17 @@ pub mod oxigraph_backend {
         /// `rightOperand` is always written as a plain literal, never
         /// through [`iri_or_literal_term`] - see the module doc's "Triples
         /// emitted" section (constraint resource bullets) for why.
+        ///
+        /// `catalog_core::Constraint` gained a `Logical` variant (gap
+        /// analysis §3.4), but writing a `Logical` constraint's nested
+        /// triples out is separate, not-yet-done work from that scope cut.
+        /// This store still only ever writes the `Atomic` shape, exactly
+        /// as documented in this module's own "Known limitation" note.
+        /// `crawler::parse_catalog_response` still only ever constructs
+        /// `Constraint::Atomic`, so the `Logical` arm below is unreached by
+        /// every current producer; it skips silently (see its own inline
+        /// comment for why not a log line) rather than panicking, should
+        /// that change before the real write path is built.
         fn write_constraint(
             &self,
             constraint: &Constraint,
@@ -1335,6 +1346,16 @@ pub mod oxigraph_backend {
             index: usize,
             graph: &NamedNode,
         ) -> StoreResult<()> {
+            // `rdf-store` has no `tracing` dependency of its own (unlike
+            // `crawler`, which logs its analogous skip via
+            // `tracing::warn!` in `parse_constraint`) - this arm is
+            // unreached by any current producer (see this fn's own doc
+            // comment), so a silent skip rather than a new dependency
+            // just to log an unreachable path.
+            let atomic = match constraint {
+                Constraint::Atomic(atomic) => atomic,
+                Constraint::Logical(_) => return Ok(()),
+            };
             self.insert(
                 constraint_node,
                 &sequence_index_pred(),
@@ -1344,19 +1365,19 @@ pub mod oxigraph_backend {
             self.insert(
                 constraint_node,
                 &odrl_left_operand_pred(),
-                &iri_or_literal_term(&constraint.left_operand),
+                &iri_or_literal_term(&atomic.left_operand),
                 graph,
             )?;
             self.insert(
                 constraint_node,
                 &odrl_operator_pred(),
-                &iri_or_literal_term(&constraint.operator),
+                &iri_or_literal_term(&atomic.operator),
                 graph,
             )?;
             self.insert(
                 constraint_node,
                 &odrl_right_operand_pred(),
-                &Term::from(Literal::from(constraint.right_operand.clone())),
+                &Term::from(Literal::from(atomic.right_operand.clone())),
                 graph,
             )?;
             Ok(())
@@ -1647,11 +1668,7 @@ pub mod oxigraph_backend {
 
             Ok((
                 index,
-                Constraint {
-                    left_operand,
-                    operator,
-                    right_operand,
-                },
+                Constraint::atomic(left_operand, operator, right_operand),
             ))
         }
 
@@ -2128,16 +2145,8 @@ pub mod oxigraph_backend {
                         Rule {
                             action: "use".to_string(),
                             constraints: vec![
-                                Constraint {
-                                    left_operand: "dateTime".to_string(),
-                                    operator: "lteq".to_string(),
-                                    right_operand: "2027-01-01T00:00:00Z".to_string(),
-                                },
-                                Constraint {
-                                    left_operand: "count".to_string(),
-                                    operator: "lteq".to_string(),
-                                    right_operand: "100".to_string(),
-                                },
+                                Constraint::atomic("dateTime", "lteq", "2027-01-01T00:00:00Z"),
+                                Constraint::atomic("count", "lteq", "100"),
                             ],
                         },
                         Rule {
@@ -2174,11 +2183,14 @@ pub mod oxigraph_backend {
             // without cross-referencing `policy_catalog` above.
             let policy = &results[0].datasets[0].policies[0];
             assert_eq!(policy.permissions[0].action, "use");
-            assert_eq!(
-                policy.permissions[0].constraints[0].left_operand,
-                "dateTime"
-            );
-            assert_eq!(policy.permissions[0].constraints[1].left_operand, "count");
+            let Constraint::Atomic(first) = &policy.permissions[0].constraints[0] else {
+                panic!("expected an atomic constraint");
+            };
+            assert_eq!(first.left_operand, "dateTime");
+            let Constraint::Atomic(second) = &policy.permissions[0].constraints[1] else {
+                panic!("expected an atomic constraint");
+            };
+            assert_eq!(second.left_operand, "count");
             assert_eq!(policy.permissions[1].action, "distribute");
             assert!(policy.permissions[1].constraints.is_empty());
             assert_eq!(policy.prohibitions.len(), 1);

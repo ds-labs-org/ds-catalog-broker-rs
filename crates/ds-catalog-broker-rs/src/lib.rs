@@ -554,11 +554,15 @@ fn catalog_to_offer(catalog: &Catalog) -> Option<CatalogRequestOffer> {
 /// - each `Rule` -> `{"action": ..., "constraint": [...]}`, `action` always
 ///   present (required on the real `Permission`/`Prohibition`/`Obligation`
 ///   types), `constraint` only when non-empty.
-/// - each `Constraint` -> `{"leftOperand": ..., "operator": ...,
-///   "rightOperand": ...}`, all three always present - `AtomicConstraint`
-///   requires all three with no defaults. `catalog_core::Constraint` only
-///   models atomic constraints in the first place (see its own doc
-///   comment), so there is never a logical-group shape to emit here.
+/// - each atomic `Constraint` -> `{"leftOperand": ..., "operator": ...,
+///   "rightOperand": ...}`, all three always present - the real
+///   `AtomicConstraint` requires all three with no defaults. A `Logical`
+///   `catalog_core::Constraint` (gap analysis §3.4 - `Constraint` now
+///   models both shapes, see its own doc comment) is skipped here rather
+///   than mis-emitted as if it were atomic: mapping a logical group to the
+///   real client's own `MultiplicityConstraint` wire shape is separate,
+///   not-yet-done work this route does not perform yet, and no current
+///   producer constructs a `Logical` constraint in the first place.
 fn policy_to_json(policy: &Policy) -> serde_json::Value {
     let kind = match policy.kind {
         PolicyKind::Set => "Set",
@@ -614,12 +618,13 @@ fn rule_to_json(rule: &Rule) -> serde_json::Value {
         value["constraint"] = serde_json::Value::Array(
             rule.constraints
                 .iter()
-                .map(|constraint| {
-                    serde_json::json!({
-                        "leftOperand": constraint.left_operand,
-                        "operator": constraint.operator,
-                        "rightOperand": constraint.right_operand,
-                    })
+                .filter_map(|constraint| match constraint {
+                    catalog_core::Constraint::Atomic(atomic) => Some(serde_json::json!({
+                        "leftOperand": atomic.left_operand,
+                        "operator": atomic.operator,
+                        "rightOperand": atomic.right_operand,
+                    })),
+                    catalog_core::Constraint::Logical(_) => None,
                 })
                 .collect(),
         );
@@ -1747,11 +1752,11 @@ mod tests {
             assignee: None,
             permissions: vec![Rule {
                 action: "odrl:use".to_string(),
-                constraints: vec![Constraint {
-                    left_operand: "odrl:dateTime".to_string(),
-                    operator: "odrl:lteq".to_string(),
-                    right_operand: "2027-01-01T00:00:00Z".to_string(),
-                }],
+                constraints: vec![Constraint::atomic(
+                    "odrl:dateTime",
+                    "odrl:lteq",
+                    "2027-01-01T00:00:00Z",
+                )],
             }],
             prohibitions: vec![Rule {
                 action: "odrl:distribute".to_string(),

@@ -552,11 +552,9 @@ fn parse_constraint(value: &Value) -> Option<Constraint> {
     let right_operand = get_str_with_alias(value, "rightOperand", "odrl:rightOperand");
 
     match (left_operand, operator, right_operand) {
-        (Some(left_operand), Some(operator), Some(right_operand)) => Some(Constraint {
-            left_operand,
-            operator,
-            right_operand,
-        }),
+        (Some(left_operand), Some(operator), Some(right_operand)) => {
+            Some(Constraint::atomic(left_operand, operator, right_operand))
+        }
         _ => {
             tracing::warn!(
                 entry = %value,
@@ -983,11 +981,11 @@ mod tests {
         assert_eq!(policy.permissions[0].action, "use");
         assert_eq!(
             policy.permissions[0].constraints,
-            vec![Constraint {
-                left_operand: "dateTime".to_string(),
-                operator: "lteq".to_string(),
-                right_operand: "2027-01-01T00:00:00Z".to_string(),
-            }]
+            vec![Constraint::atomic(
+                "dateTime",
+                "lteq",
+                "2027-01-01T00:00:00Z"
+            )]
         );
 
         assert_eq!(policy.prohibitions.len(), 1);
@@ -1071,11 +1069,7 @@ mod tests {
         assert_eq!(policies[0].permissions.len(), 1);
         assert_eq!(
             policies[0].permissions[0].constraints,
-            vec![Constraint {
-                left_operand: "count".to_string(),
-                operator: "lteq".to_string(),
-                right_operand: "10".to_string(),
-            }],
+            vec![Constraint::atomic("count", "lteq", "10")],
             "the well-formed atomic constraint must survive; the nested odrl:and group must be skipped, not crash or wipe the whole list"
         );
     }

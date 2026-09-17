@@ -94,46 +94,139 @@ pub enum PolicyKind {
     Agreement,
 }
 
-/// One atomic ODRL constraint: `leftOperand operator rightOperand`, e.g.
-/// `odrl:dateTime lteq "2027-01-01T00:00:00Z"`.
-///
-/// This models only *atomic* constraints
-/// (<https://www.w3.org/TR/odrl-model/#constraint-atomic>). ODRL also allows
-/// *logical constraints* - `odrl:and` / `odrl:or` / `odrl:andSequence` /
-/// `odrl:xone` groups nesting further constraints
-/// (<https://www.w3.org/TR/odrl-model/#constraint-logical>) - and those are
-/// **not modeled here**. This is a deliberate, known scope cut for the
-/// gap-analysis §3.4 work, not an oversight: a crawled constraint that turns
-/// out to be a logical-group node rather than an atomic
-/// leftOperand/operator/rightOperand triple is skipped (that one constraint
-/// only, not the enclosing policy or rule) by the crawler/rdf-store parsing
-/// path, with the skip surfaced as a tracing warning rather than silently
-/// dropped - see the "Known limitation" notes in `crawler::parse_catalog_response`
-/// and `rdf_store`'s module doc for where that happens.
+/// The payload of [`Constraint::Atomic`]: `leftOperand operator
+/// rightOperand`, e.g. `odrl:dateTime lteq "2027-01-01T00:00:00Z"`
+/// (<https://www.w3.org/TR/odrl-model/#constraint-atomic>). Split out as
+/// its own type (rather than inlining these three fields directly into
+/// [`Constraint`]) purely so [`Constraint`]'s own doc comment has a single
+/// concrete atomic shape to point readers at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Constraint {
+pub struct AtomicConstraint {
     pub left_operand: String,
     pub operator: String,
     pub right_operand: String,
 }
 
+/// A *logical* ODRL constraint: a named Boolean combinator over nested
+/// child [`Constraint`]s
+/// (<https://www.w3.org/TR/odrl-model/#constraint-logical>). The payload
+/// of [`Constraint::Logical`].
+///
+/// Each variant is renamed to its own `odrl:`-prefixed wire key
+/// (`{"odrl:and": [...]}`, `{"odrl:xone": [...]}`, etc.) rather than left
+/// at serde's default (which would use the bare Rust variant name, and -
+/// worse - would make `And`/`Or`/`Xone`/`AndSequence` indistinguishable
+/// from each other on deserialize, since all four wrap the identical
+/// `Vec<Constraint>` shape). A distinct key per variant is not optional
+/// here: `and`/`or`/`xone` mean genuinely different things to evaluate
+/// (all children / at least one / exactly one), so collapsing them into
+/// one untagged "array of children" shape would silently discard which
+/// combinator a crawled policy actually specified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogicalConstraint {
+    #[serde(rename = "odrl:and")]
+    And(Vec<Constraint>),
+    #[serde(rename = "odrl:or")]
+    Or(Vec<Constraint>),
+    #[serde(rename = "odrl:xone")]
+    Xone(Vec<Constraint>),
+    #[serde(rename = "odrl:andSequence")]
+    AndSequence(Vec<Constraint>),
+}
+
+/// One ODRL constraint attached to a [`Rule`]: either [`Atomic`](Constraint::Atomic)
+/// (`leftOperand operator rightOperand`) or [`Logical`](Constraint::Logical)
+/// (a named Boolean group - `odrl:and`/`odrl:or`/`odrl:xone`/
+/// `odrl:andSequence` - of further nested `Constraint`s). Both shapes are
+/// part of the real W3C ODRL constraint model
+/// (<https://www.w3.org/TR/odrl-model/#constraint>); earlier revisions of
+/// this type modeled only the atomic half, with a crawled logical-group
+/// constraint skipped (one constraint at a time, not the enclosing policy)
+/// rather than represented - a deliberate, documented scope cut for gap
+/// analysis §3.4. This enum closes that cut: `Constraint` can now hold
+/// either shape end to end, though *using* the logical half in the
+/// crawler/rdf-store parsing path and in policy-filtering evaluation is
+/// separate, later work this type alone does not finish - see gap
+/// analysis §3.4 for the punch list and current status.
+///
+/// **Design: a Rust enum, not a flat struct with `Option<Vec<Constraint>>`
+/// and/or/xone/and_sequence fields** (the shape `ds-odrl-engine-rs`'s own
+/// `engine::Constraint` uses - see that type's doc comment). The engine's
+/// flat-struct design exists specifically to preserve an established flat
+/// wire contract for its own existing external consumers without a
+/// breaking rename; this type has no such external consumer to protect,
+/// and an enum makes the atomic/logical distinction exhaustively
+/// pattern-matchable (`match constraint { Constraint::Atomic(a) => ...,
+/// Constraint::Logical(l) => ... }`) rather than a caller having to check
+/// four `Option` fields to find out which, if any, is `Some`. This is
+/// also the same shape the real
+/// `edc_connector_client::types::policy::Constraint` enum already uses for
+/// this exact atomic-vs-logical distinction (`Constraint::Atomic` /
+/// `Constraint::MultiplicityConstraint`, with its own `and`/`or`/`xone`
+/// constructors) - already a dev-dependency of `ds-catalog-broker-rs` for
+/// management-API wire compatibility, so this crate's own `Constraint`
+/// now agrees with a real upstream type on how to model the same problem.
+///
+/// `#[serde(untagged)]`: [`AtomicConstraint`] requires all three of
+/// `left_operand`/`operator`/`right_operand`, and every
+/// [`LogicalConstraint`] variant supplies none of them (each is tagged by
+/// its own distinct `odrl:...` key instead) - so the two payloads are
+/// always structurally distinguishable on the wire, with no ambiguity for
+/// serde to resolve by declaration order. This keeps an atomic
+/// constraint's own JSON exactly as flat as before this enum existed
+/// (`{"left_operand": ..., "operator": ..., "right_operand": ...}`, no
+/// wrapping `"Atomic"`/`"atomic"` tag key) - the atomic wire shape is
+/// unchanged, additive-only, per this crate's own round-trip tests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Constraint {
+    Atomic(AtomicConstraint),
+    Logical(LogicalConstraint),
+}
+
 impl Constraint {
-    /// **Red-phase stub only** (gap analysis §3.4 policy-filtering work):
-    /// `Constraint` above is still atomic-only - it has no field to hold
-    /// nested children - so this constructor cannot yet build anything that
-    /// actually represents an `odrl:and` logical grouping. It exists purely
-    /// as a type-signature stub so test code that calls
-    /// `Constraint::and(children)` compiles against a real call shape;
-    /// calling it panics rather than silently returning a value that looks
-    /// like a logical constraint but isn't one. The green phase replaces
-    /// this with a real implementation once `Constraint` itself gains
-    /// `and`/`or`/`xone`/`and_sequence` storage. See
+    /// Build an atomic constraint from its three parts - the direct
+    /// replacement for the bare `Constraint { left_operand, operator,
+    /// right_operand }` struct literal every caller used before
+    /// `Constraint` became an enum (a plain struct literal naming
+    /// `Constraint` no longer type-checks once the type has variants).
+    pub fn atomic(
+        left_operand: impl Into<String>,
+        operator: impl Into<String>,
+        right_operand: impl Into<String>,
+    ) -> Self {
+        Constraint::Atomic(AtomicConstraint {
+            left_operand: left_operand.into(),
+            operator: operator.into(),
+            right_operand: right_operand.into(),
+        })
+    }
+
+    /// `odrl:and`: satisfied when every nested child is satisfied. See
     /// `tests::logical_and_constraint_round_trips_through_json_preserving_nested_order`.
-    pub fn and(_children: Vec<Constraint>) -> Self {
-        unimplemented!(
-            "Constraint::and: logical constraint grouping is not yet supported \
-             (gap analysis §3.4 red phase - catalog-core::Constraint is still atomic-only)"
-        )
+    pub fn and(children: Vec<Constraint>) -> Self {
+        Constraint::Logical(LogicalConstraint::And(children))
+    }
+
+    /// `odrl:or`: satisfied when at least one nested child is satisfied.
+    pub fn or(children: Vec<Constraint>) -> Self {
+        Constraint::Logical(LogicalConstraint::Or(children))
+    }
+
+    /// `odrl:xone`: satisfied when exactly one nested child is satisfied.
+    pub fn xone(children: Vec<Constraint>) -> Self {
+        Constraint::Logical(LogicalConstraint::Xone(children))
+    }
+
+    /// `odrl:andSequence`: per the W3C ODRL 2.2 Vocabulary, satisfied when
+    /// every nested child is satisfied *in the order specified*. Nothing
+    /// in this crate's domain model captures an execution trace to check
+    /// that ordering against (crawled/stored data is a snapshot, not a
+    /// timeline), so this is carried as its own distinct, honestly-named
+    /// variant rather than silently aliased to `and` - see
+    /// [`LogicalConstraint::AndSequence`].
+    pub fn and_sequence(children: Vec<Constraint>) -> Self {
+        Constraint::Logical(LogicalConstraint::AndSequence(children))
     }
 }
 
@@ -301,11 +394,11 @@ mod tests {
             assignee: Some("did:example:consumer".into()),
             permissions: vec![Rule {
                 action: "use".into(),
-                constraints: vec![Constraint {
-                    left_operand: "odrl:dateTime".into(),
-                    operator: "lteq".into(),
-                    right_operand: "2027-01-01T00:00:00Z".into(),
-                }],
+                constraints: vec![Constraint::atomic(
+                    "odrl:dateTime",
+                    "lteq",
+                    "2027-01-01T00:00:00Z",
+                )],
             }],
             prohibitions: vec![Rule {
                 action: "distribute".into(),
@@ -360,30 +453,23 @@ mod tests {
 
     #[test]
     fn logical_and_constraint_round_trips_through_json_preserving_nested_order() {
-        // RED (gap analysis §3.4): `Constraint` is currently atomic-only
-        // (left_operand/operator/right_operand, see its own doc comment) -
-        // it has no way to represent an `odrl:and` logical grouping of
-        // nested sub-constraints at all. This asserts that a logical `and`
-        // of two atomic sub-constraints can be constructed and round-trips
-        // through serde_json (serialize then deserialize back to an equal
-        // value), preserving the nested structure and the child order
-        // (dateTime gteq before dateTime lteq). `Constraint::and` is only a
-        // panicking stub today (see its own doc comment), so this test is
-        // expected to fail until logical constraints are really modeled.
-        let starts_after = Constraint {
-            left_operand: "odrl:dateTime".into(),
-            operator: "gteq".into(),
-            right_operand: "2026-01-01T00:00:00Z".into(),
-        };
-        let ends_before = Constraint {
-            left_operand: "odrl:dateTime".into(),
-            operator: "lteq".into(),
-            right_operand: "2027-01-01T00:00:00Z".into(),
-        };
+        // GREEN (gap analysis §3.4): `Constraint` now has a `Logical`
+        // variant (see its own doc comment) that can represent an
+        // `odrl:and` logical grouping of nested sub-constraints. This
+        // asserts that a logical `and` of two atomic sub-constraints can
+        // be constructed and round-trips through serde_json (serialize
+        // then deserialize back to an equal value), preserving the nested
+        // structure and the child order (dateTime gteq before dateTime
+        // lteq).
+        let starts_after = Constraint::atomic("odrl:dateTime", "gteq", "2026-01-01T00:00:00Z");
+        let ends_before = Constraint::atomic("odrl:dateTime", "lteq", "2027-01-01T00:00:00Z");
         let logical = Constraint::and(vec![starts_after.clone(), ends_before.clone()]);
 
         let json = serde_json::to_string(&logical).expect("serializes");
         let round_tripped: Constraint = serde_json::from_str(&json).expect("deserializes");
-        assert_eq!(round_tripped, logical, "nested structure and order must survive a JSON round trip");
+        assert_eq!(
+            round_tripped, logical,
+            "nested structure and order must survive a JSON round trip"
+        );
     }
 }
