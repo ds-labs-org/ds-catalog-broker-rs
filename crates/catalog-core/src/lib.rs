@@ -117,6 +117,26 @@ pub struct Constraint {
     pub right_operand: String,
 }
 
+impl Constraint {
+    /// **Red-phase stub only** (gap analysis §3.4 policy-filtering work):
+    /// `Constraint` above is still atomic-only - it has no field to hold
+    /// nested children - so this constructor cannot yet build anything that
+    /// actually represents an `odrl:and` logical grouping. It exists purely
+    /// as a type-signature stub so test code that calls
+    /// `Constraint::and(children)` compiles against a real call shape;
+    /// calling it panics rather than silently returning a value that looks
+    /// like a logical constraint but isn't one. The green phase replaces
+    /// this with a real implementation once `Constraint` itself gains
+    /// `and`/`or`/`xone`/`and_sequence` storage. See
+    /// `tests::logical_and_constraint_round_trips_through_json_preserving_nested_order`.
+    pub fn and(_children: Vec<Constraint>) -> Self {
+        unimplemented!(
+            "Constraint::and: logical constraint grouping is not yet supported \
+             (gap analysis §3.4 red phase - catalog-core::Constraint is still atomic-only)"
+        )
+    }
+}
+
 /// One ODRL rule entry: a single `permission`, `prohibition`, or
 /// `obligation` inside a [`Policy`].
 ///
@@ -336,5 +356,34 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&dataset).unwrap()).unwrap();
         assert_eq!(round_tripped, dataset);
         assert_eq!(round_tripped.policies[0].kind, PolicyKind::Offer);
+    }
+
+    #[test]
+    fn logical_and_constraint_round_trips_through_json_preserving_nested_order() {
+        // RED (gap analysis §3.4): `Constraint` is currently atomic-only
+        // (left_operand/operator/right_operand, see its own doc comment) -
+        // it has no way to represent an `odrl:and` logical grouping of
+        // nested sub-constraints at all. This asserts that a logical `and`
+        // of two atomic sub-constraints can be constructed and round-trips
+        // through serde_json (serialize then deserialize back to an equal
+        // value), preserving the nested structure and the child order
+        // (dateTime gteq before dateTime lteq). `Constraint::and` is only a
+        // panicking stub today (see its own doc comment), so this test is
+        // expected to fail until logical constraints are really modeled.
+        let starts_after = Constraint {
+            left_operand: "odrl:dateTime".into(),
+            operator: "gteq".into(),
+            right_operand: "2026-01-01T00:00:00Z".into(),
+        };
+        let ends_before = Constraint {
+            left_operand: "odrl:dateTime".into(),
+            operator: "lteq".into(),
+            right_operand: "2027-01-01T00:00:00Z".into(),
+        };
+        let logical = Constraint::and(vec![starts_after.clone(), ends_before.clone()]);
+
+        let json = serde_json::to_string(&logical).expect("serializes");
+        let round_tripped: Constraint = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(round_tripped, logical, "nested structure and order must survive a JSON round trip");
     }
 }
