@@ -1074,6 +1074,57 @@ mod tests {
         );
     }
 
+    /// A genuine `odrl:and` logical-group constraint node (real ODRL, not
+    /// malformed) must now be parsed into `Constraint::Logical`, preserving
+    /// nested child order - not skipped/dropped as gap analysis §3.4 used
+    /// to document. Once `catalog_core::Constraint` gained logical-grouping
+    /// support, treating this shape as "malformed because it has no flat
+    /// `leftOperand`" is outdated: it is well-formed ODRL that this parser
+    /// was choosing not to model.
+    #[test]
+    fn logical_and_constraint_is_parsed_not_skipped() {
+        let body = json!({
+            "@id": "cat-1",
+            "dataset": [{
+                "@id": "DATASET-A",
+                "hasPolicy": [{
+                    "@type": "Offer",
+                    "permission": [{
+                        "action": "use",
+                        "constraint": [{
+                            "odrl:and": [
+                                {"leftOperand": "dateTime", "operator": "gt", "rightOperand": "2026-01-01"},
+                                {"leftOperand": "dateTime", "operator": "lt", "rightOperand": "2027-01-01"}
+                            ]
+                        }]
+                    }]
+                }],
+                "distribution": [{"format": "application/json", "accessService": "svc-1"}]
+            }],
+            "service": [{"@id": "svc-1", "endpointURL": "https://example.org/dsp"}]
+        });
+        let participant = participant("logical-constraint-participant");
+        let catalog = parse_catalog_response(&body, &participant);
+
+        assert_eq!(catalog.datasets.len(), 1);
+        let policies = &catalog.datasets[0].policies;
+        assert_eq!(policies.len(), 1);
+        assert_eq!(
+            policies[0].permissions.len(),
+            1,
+            "the permission itself must survive even though its constraint is a logical group"
+        );
+        assert_eq!(
+            policies[0].permissions[0].constraints,
+            vec![Constraint::and(vec![
+                Constraint::atomic("dateTime", "gt", "2026-01-01"),
+                Constraint::atomic("dateTime", "lt", "2027-01-01"),
+            ])],
+            "a genuine odrl:and logical-group constraint must be parsed into Constraint::Logical \
+             with its children in source order, not skipped/dropped"
+        );
+    }
+
     /// A `permission`/`prohibition`/`obligation` entry missing its
     /// required `action` is skipped as a single malformed rule entry,
     /// without failing the rest of the policy - a crawled participant
