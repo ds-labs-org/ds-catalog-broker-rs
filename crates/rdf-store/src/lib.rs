@@ -1923,6 +1923,7 @@ pub mod oxigraph_backend {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use catalog_core::LogicalConstraint;
 
         fn sample_catalog(node: &str, id: &str) -> Catalog {
             Catalog::new(id, NodeId::new(node))
@@ -2200,6 +2201,111 @@ pub mod oxigraph_backend {
             assert_eq!(policy.id.as_deref(), Some("policy-1"));
             assert_eq!(policy.assigner.as_deref(), Some("did:example:assigner"));
             assert_eq!(policy.assignee.as_deref(), Some("did:example:assignee"));
+        }
+
+        /// RED (gap analysis §3.4): `catalog_core::Constraint` now has a
+        /// `Logical` variant (`odrl:and`/`odrl:or`/`odrl:xone`/
+        /// `odrl:andSequence`, nesting arbitrarily - see that type's own
+        /// doc comment), but this store's `write_constraint`/
+        /// `load_constraint` still only handle the `Atomic` shape
+        /// (`write_constraint`'s own doc comment says so explicitly:
+        /// "This store still only ever writes the `Atomic` shape"). This
+        /// asserts a policy carrying a *nested* logical constraint - an
+        /// `odrl:xone` whose second child is itself a nested `odrl:and` of
+        /// two atomic leaves - survives `upsert` then `query` byte for
+        /// byte: which combinator was used at each level, and the exact
+        /// child order at each level, both preserved.
+        ///
+        /// Expected to fail today: `write_constraint` silently no-ops on
+        /// `Constraint::Logical` (see its own doc comment for why silent),
+        /// so no `odrl:leftOperand`/`odrl:operator`/`odrl:rightOperand`
+        /// triples - nor anything describing the `odrl:xone`/`odrl:and`
+        /// grouping itself or its children - are ever written for that
+        /// constraint node. `load_constraint` then unconditionally requires
+        /// `odrl:leftOperand` on every constraint subject, so reading the
+        /// policy back errors out (`StoreError::Backend("... is missing
+        /// odrl:leftOperand")`) instead of returning the original nested
+        /// structure.
+        #[tokio::test]
+        async fn round_trips_a_nested_logical_constraint_preserving_structure_and_order() {
+            let cache = cache();
+            let mut catalog = Catalog::new("cat-logical", NodeId::new("node-logical"));
+
+            let nested_and = Constraint::and(vec![
+                Constraint::atomic("odrl:dateTime", "gteq", "2026-01-01T00:00:00Z"),
+                Constraint::atomic("odrl:dateTime", "lteq", "2027-01-01T00:00:00Z"),
+            ]);
+            let top_level_xone = Constraint::xone(vec![
+                Constraint::atomic("odrl:spatial", "eq", "https://example.org/place/eu"),
+                nested_and,
+            ]);
+
+            catalog.datasets.push(Dataset {
+                id: "ds-logical".to_string(),
+                properties: BTreeMap::new(),
+                distributions: Vec::new(),
+                policies: vec![Policy {
+                    id: Some("policy-logical".to_string()),
+                    kind: PolicyKind::Offer,
+                    assigner: None,
+                    assignee: None,
+                    permissions: vec![Rule {
+                        action: "use".to_string(),
+                        constraints: vec![top_level_xone.clone()],
+                    }],
+                    prohibitions: Vec::new(),
+                    obligations: Vec::new(),
+                }],
+            });
+
+            cache.upsert(catalog.clone()).await.unwrap();
+
+            let results = cache
+                .query(CatalogQuery::for_node(NodeId::new("node-logical")))
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0], catalog,
+                "a nested logical constraint must round-trip byte for byte - \
+                 combinator, nested structure, and child order all included"
+            );
+
+            // Spelled out explicitly too, so the nesting/order claim is
+            // legible without cross-referencing the fixture above.
+            let constraint = &results[0].datasets[0].policies[0].permissions[0].constraints[0];
+            let Constraint::Logical(LogicalConstraint::Xone(children)) = constraint else {
+                panic!(
+                    "expected the top-level constraint to round-trip as odrl:xone, got {constraint:?}"
+                );
+            };
+            assert_eq!(children.len(), 2, "xone must keep both children, in order");
+            let Constraint::Atomic(first) = &children[0] else {
+                panic!(
+                    "expected xone's first child to stay atomic (spatial eq), got {:?}",
+                    children[0]
+                );
+            };
+            assert_eq!(first.left_operand, "odrl:spatial");
+            let Constraint::Logical(LogicalConstraint::And(nested_children)) = &children[1] else {
+                panic!(
+                    "expected xone's second child to round-trip as a nested odrl:and, got {:?}",
+                    children[1]
+                );
+            };
+            assert_eq!(
+                nested_children.len(),
+                2,
+                "nested and must keep both children, in order"
+            );
+            let Constraint::Atomic(nested_first) = &nested_children[0] else {
+                panic!("expected the nested and's first child to stay atomic");
+            };
+            assert_eq!(nested_first.operator, "gteq");
+            let Constraint::Atomic(nested_second) = &nested_children[1] else {
+                panic!("expected the nested and's second child to stay atomic");
+            };
+            assert_eq!(nested_second.operator, "lteq");
         }
 
         /// Regression coverage for every dataset that predates this
