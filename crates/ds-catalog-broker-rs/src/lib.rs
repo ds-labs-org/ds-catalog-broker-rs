@@ -1007,10 +1007,19 @@ async fn sparql_route(
     headers: HeaderMap,
     query: Option<String>,
 ) -> axum::response::Response {
-    // Real query-rewriting ODRL filtering for SPARQL (gap analysis §3.4)
-    // is separate, later work (see `odrl_filter`'s own module doc) -
-    // `_claims` is threaded through now so that phase doesn't need to
-    // touch this function's `check_oauth2_bearer` call again.
+    // Real query-rewriting ODRL filtering for SPARQL (gap analysis §3.4) is
+    // separate, later work (see `odrl_filter`'s own module doc for the
+    // current status and the design this RED phase pins down) - `_claims`
+    // is threaded through now so that phase doesn't need to touch this
+    // function's `check_oauth2_bearer` call again. This function does not
+    // yet compute a per-caller allow-list of visible dataset IRIs, rewrite
+    // `query` to restrict any dataset-subject-shaped variable to it, or
+    // reject a query with no such variable per
+    // `PolicyFilterConfig::unscopeable_sparql_query_action` - every caller
+    // still sees every harvested triple regardless of policy content. See
+    // this file's own `tests` module, "SPARQL ODRL policy-based filtering
+    // (gap analysis §3.4) - RED phase" section, for the failing tests
+    // specifying the intended behavior once this is wired.
     let _claims = match check_oauth2_bearer(&state, &headers) {
         Ok(claims) => claims,
         Err(response) => return *response,
@@ -2717,6 +2726,271 @@ mod tests {
              caller the ODRL policy filter would otherwise hide it from - the policy filter must \
              run first, so no offer contains it and the id filter then drops the offer entirely. \
              Got offers: {offers:?}"
+        );
+    }
+
+    // --- SPARQL ODRL policy-based filtering (gap analysis §3.4) - RED
+    // phase --------------------------------------------------------------
+    //
+    // The one remaining serving surface from gap analysis §3.4's "nothing
+    // filters on policy content today": `GET`/`POST /sparql` does not call
+    // `odrl_filter::dataset_is_visible` at all yet (see `sparql_route`'s
+    // own doc comment) - every caller currently sees every harvested
+    // triple through this surface regardless of a dataset's policy
+    // content, exactly the same gap `GET /catalog` and the management API
+    // used to have before the "ODRL policy-based dataset visibility
+    // filtering" section above closed it on those two surfaces.
+    //
+    // This is genuinely harder than the other two surfaces: named graphs
+    // in the semantic cache are per-*participant*, not per-*dataset*
+    // (`rdf_store::oxigraph_backend`'s own module doc), while ODRL
+    // policies are attached per-*dataset* - and an arbitrary caller-
+    // supplied SELECT/ASK query may or may not even bind a variable to a
+    // dataset's subject IRI at all. The intended design (not yet
+    // implemented - these tests are the RED half of red/green TDD for it):
+    //
+    // 1. Compute the allow-list of dataset IRIs currently visible to the
+    //    caller by running `odrl_filter::dataset_is_visible` over every
+    //    dataset in the cache - the same computation
+    //    `filter_catalogs_by_policy` already does for `GET /catalog`/the
+    //    management API, meant to be factored into one shared function
+    //    both call rather than duplicated.
+    // 2. Rewrite the incoming query to inject a restriction binding any
+    //    variable that appears as the subject of a `?x a dcat:Dataset`
+    //    triple pattern (or another dataset-shaped predicate this store
+    //    recognizes) to only that allow-list - e.g. a `VALUES ?x { ... }`
+    //    or `FILTER(?x IN (...))` clause.
+    // 3. A query with no such bindable variable at all - the store cannot
+    //    tell what the query is "about" at a dataset level, so there is
+    //    nothing to inject the restriction onto - is handled per
+    //    `PolicyFilterConfig::unscopeable_sparql_query_action`'s own
+    //    conservative default ([`odrl_filter::UnscopeableSparqlQueryAction::Reject`]):
+    //    `400 Bad Request`, not silently run unfiltered.
+    //
+    // Per this session's own prior-art lesson (silent over-permission is
+    // the failure mode that matters, not a loud error), every "hidden"
+    // assertion below checks a policy-gated dataset's actual *absence*
+    // from the parsed SPARQL JSON results, mirroring the REST-surface
+    // negative-test discipline above - not merely that the response still
+    // parses. All of these are confirmed failing against today's (pre-
+    // wiring) `sparql_route`.
+
+    /// Same idea as `oauth2_sparql_state`, but seeded with a caller-
+    /// supplied catalog (via `sparql_test_state()`'s real Oxigraph
+    /// backend) rather than the fixed single-dataset `participant_catalog`
+    /// fixture - the SPARQL analogue of `oauth2_state_with_catalog`, which
+    /// does the same thing for `GET /catalog`/the management API's
+    /// in-memory-backed state.
+    async fn oauth2_sparql_state_with_catalog(
+        catalog: Catalog,
+        configure: impl FnOnce(&mut OAuth2Config),
+    ) -> (AppState, oauth2::test_support::TestKey) {
+        let key = generate_key("sparql-policy-filter-key");
+        let jwks_uri = spawn_jwks_server(serde_json::json!({"keys": [ec_jwk(&key, None)]})).await;
+        let mut config = oauth2_config(jwks_uri);
+        configure(&mut config);
+        let verifier = OAuth2Verifier::fetch(&reqwest::Client::new(), config)
+            .await
+            .expect("fetch mock JWKS");
+
+        let state = sparql_test_state();
+        state.cache.upsert(catalog).await.unwrap();
+        let state = state.with_oauth2(Some(Arc::new(verifier)));
+        (state, key)
+    }
+
+    /// `SELECT ?dataset WHERE { ?dataset a dcat:Dataset }` - the same
+    /// bindable-dataset-IRI query shape `sparql_get_select_finds_datasets_from_both_seeded_participants`
+    /// already uses above, run here against a catalog that mixes an open
+    /// and a policy-gated dataset (`catalog_with_open_and_gated_datasets`,
+    /// from the REST-surface filtering section above).
+    fn dataset_iri_query() -> String {
+        "PREFIX dcat: <http://www.w3.org/ns/dcat#> \
+         SELECT ?dataset WHERE { ?dataset a dcat:Dataset }"
+            .to_string()
+    }
+
+    /// Every `?dataset` binding's IRI string from a parsed
+    /// `application/sparql-results+json` body, as produced by
+    /// [`dataset_iri_query`].
+    fn dataset_iris_of(parsed: &serde_json::Value) -> Vec<&str> {
+        parsed["results"]["bindings"]
+            .as_array()
+            .expect("a SELECT response has a results.bindings array")
+            .iter()
+            .map(|binding| {
+                binding["dataset"]["value"]
+                    .as_str()
+                    .expect("each binding has a dataset IRI")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sparql_hides_a_policy_gated_datasets_iri_from_a_caller_without_the_required_claim() {
+        let (state, key) = oauth2_sparql_state_with_catalog(
+            catalog_with_open_and_gated_datasets("node-a", "cat-a"),
+            |_| {},
+        )
+        .await;
+        let app = build_router(state);
+        let token = sign_es256(&key, base_claims());
+
+        let uri = format!(
+            "/sparql?query={}",
+            urlencoding::encode(&dataset_iri_query())
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let dataset_iris = dataset_iris_of(&parsed);
+        assert!(
+            !dataset_iris.iter().any(|iri| iri.contains("GATED-DATASET")),
+            "a SPARQL query that binds a dataset's subject IRI must not return one the caller's \
+             claims don't entitle them to under its harvested ODRL policy, mirroring GET \
+             /catalog's own entitlement gate - real query-rewriting filtering for /sparql isn't \
+             wired yet, so this fails today. Got dataset IRIs: {dataset_iris:?}"
+        );
+        assert!(
+            dataset_iris.iter().any(|iri| iri.contains("OPEN-DATASET")),
+            "an unrelated, policy-free dataset must remain visible. Got dataset IRIs: \
+             {dataset_iris:?}"
+        );
+    }
+
+    /// The positive companion to the "hides" test above, pinned down
+    /// together the same way the REST-surface section does: a caller
+    /// whose claims *do* satisfy the gated dataset's policy must still see
+    /// it once real filtering is wired.
+    #[tokio::test]
+    async fn sparql_shows_a_policy_gated_datasets_iri_to_a_caller_with_the_required_claim() {
+        let (state, key) = oauth2_sparql_state_with_catalog(
+            catalog_with_open_and_gated_datasets("node-a", "cat-a"),
+            |_| {},
+        )
+        .await;
+        let app = build_router(state);
+        let token = sign_es256(&key, eu_resident_claims());
+
+        let uri = format!(
+            "/sparql?query={}",
+            urlencoding::encode(&dataset_iri_query())
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let dataset_iris = dataset_iris_of(&parsed);
+        assert!(
+            dataset_iris.iter().any(|iri| iri.contains("GATED-DATASET")),
+            "a caller whose claims satisfy the dataset's policy must still see it. Got dataset \
+             IRIs: {dataset_iris:?}"
+        );
+        assert!(dataset_iris.iter().any(|iri| iri.contains("OPEN-DATASET")));
+    }
+
+    /// The unauthenticated case, mirroring
+    /// `get_catalog_filters_by_policy_even_when_oauth2_is_disabled_matching_the_default_config`:
+    /// with no OAuth2 verifier configured at all, filtering must still run
+    /// against an empty claims map, per
+    /// `PolicyFilterConfig::filter_when_oauth2_disabled`'s default
+    /// (`true`).
+    #[tokio::test]
+    async fn sparql_filters_by_policy_even_when_oauth2_is_disabled_matching_the_default_config() {
+        let state = sparql_test_state();
+        state
+            .cache
+            .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))
+            .await
+            .unwrap();
+        assert!(
+            state.policy_filter.filter_when_oauth2_disabled,
+            "this test exercises PolicyFilterConfig's own default; update it if that default \
+             ever changes"
+        );
+        let app = build_router(state);
+
+        let uri = format!(
+            "/sparql?query={}",
+            urlencoding::encode(&dataset_iri_query())
+        );
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let dataset_iris = dataset_iris_of(&parsed);
+        assert!(
+            !dataset_iris.iter().any(|iri| iri.contains("GATED-DATASET")),
+            "with no OAuth2 verifier configured at all, filtering must still run against an \
+             empty claims map - an unauthenticated caller must not see a dataset whose policy \
+             requires a claim they cannot possibly present. Got dataset IRIs: {dataset_iris:?}"
+        );
+        assert!(dataset_iris.iter().any(|iri| iri.contains("OPEN-DATASET")));
+    }
+
+    /// A query with no dataset-subject-shaped variable anywhere in it -
+    /// `?s`/`?p`/`?o` here are each unconstrained, no `?x a dcat:Dataset`
+    /// triple pattern ties any of them to a dataset's subject position -
+    /// so there is no allow-list variable for query-rewriting filtering to
+    /// restrict. This query would, if ever run unfiltered, return every
+    /// harvested triple in the store including the gated dataset's own -
+    /// exactly the silent-over-permission risk
+    /// `UnscopeableSparqlQueryAction::Reject`'s default guards against.
+    #[tokio::test]
+    async fn sparql_rejects_an_unscopeable_query_by_default_rather_than_running_it_unfiltered() {
+        let state = sparql_test_state();
+        state
+            .cache
+            .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.policy_filter.unscopeable_sparql_query_action,
+            odrl_filter::UnscopeableSparqlQueryAction::Reject,
+            "this test exercises the default; update it if the default ever changes"
+        );
+        let app = build_router(state);
+
+        let query = "SELECT ?s ?p ?o WHERE { ?s ?p ?o }";
+        let uri = format!("/sparql?query={}", urlencoding::encode(query));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a query with no bindable dataset-subject variable must be rejected outright per \
+             PolicyFilterConfig::unscopeable_sparql_query_action's default (Reject), not \
+             silently run unfiltered against the whole store - query-rewriting filtering for \
+             /sparql isn't wired yet, so this fails today (actual status: 200, carrying every \
+             harvested triple, gated dataset's included)"
         );
     }
 }
