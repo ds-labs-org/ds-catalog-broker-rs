@@ -6,12 +6,16 @@
 //! surfaces (`GET /catalog`, the management API, and SPARQL via real query
 //! rewriting).
 //!
-//! **GREEN phase.** Every function below now has its real entitlement/
-//! mapping logic (the RED-phase commit had every one of them `todo!()`,
+//! **Status.** Every function below has its real entitlement/mapping
+//! logic (the original RED-phase commit had every one of them `todo!()`,
 //! with only the real, final signatures in place - see that commit's own
 //! message for the design this fills in). This module's own
-//! `#[cfg(test)] mod tests` passes end to end; the three serving-surface
-//! call sites in `lib.rs` are separate, later wiring work.
+//! `#[cfg(test)] mod tests` passes end to end, and `lib.rs` now calls
+//! `dataset_is_visible` (via its own `filter_catalogs_by_policy` helper)
+//! from both `GET /catalog` and `POST /api/management/v4/catalogs/request`,
+//! per that file's "ODRL policy-based dataset visibility filtering" test
+//! section. Real query-rewriting filtering for `GET`/`POST /sparql` remains
+//! separate, later work (see `sparql_route`'s own doc comment in `lib.rs`).
 //!
 //! ## Design: per-`(policy, action)` evaluation, OR'd across a dataset's
 //! own alternative offers
@@ -373,6 +377,13 @@ pub struct HideDatasetForUnmappableConstraint;
 /// this crate's own enum shape - see `catalog_core::Constraint`'s doc
 /// comment for why the two crates deliberately chose differently).
 ///
+/// An atomic constraint's `leftOperand` is compacted out of the ODRL
+/// namespace via [`normalize_left_operand`] (that function's own doc
+/// comment has the full rationale: it is vocabulary, meant to line up
+/// with this bridge's flat claim-map keys, not data); `rightOperand` is
+/// carried through byte for byte, unmodified - it is the value a claim is
+/// compared against, never itself a claim-map key.
+///
 /// `Ok(None)` means "this constraint was dropped" - reachable only when
 /// `config.unmappable_constraint_action` is
 /// [`UnmappableConstraintAction::SkipConstraint`] and this exact
@@ -413,6 +424,40 @@ fn parse_operator(operator: &str) -> Option<Operator> {
         "gteq" => Some(Operator::Gteq),
         _ => None,
     }
+}
+
+/// The full ODRL 2.2 vocabulary namespace, exactly as
+/// `ds-odrl-engine-rs::dsp_odrl_adapter::jsonld::ODRL_NS` defines it (that
+/// constant is private to the engine's own crate, so this restates it
+/// rather than depending on it) - used only to recognize and strip an
+/// unabbreviated `leftOperand` IRI in [`normalize_left_operand`].
+const ODRL_NS: &str = "http://www.w3.org/ns/odrl/2/";
+
+/// Compacts a harvested `leftOperand` out of the ODRL namespace, the same
+/// convention `dsp_odrl_adapter::ingest`'s own module doc documents and
+/// applies when it ingests a real DSP contract's ODRL JSON-LD: "Vocabulary
+/// terms are compacted out of the ODRL namespace ... `http://www.w3.org/ns/odrl/2/dateTime`
+/// becomes `dateTime` ... That is what makes an ingested policy line up
+/// with ... the flat claim-map keys `engine::Claims` is built from." A
+/// `leftOperand` is vocabulary, not data - unlike a `rightOperand`,
+/// carried byte for byte in [`catalog_constraint_to_engine_constraint_at_depth`]
+/// below - so a harvested `"odrl:dateTime"` or a full
+/// `"http://www.w3.org/ns/odrl/2/dateTime"` must normalize to the same
+/// bare `"dateTime"` this bridge's own claims map
+/// ([`jwt_claims_to_engine_claims`]/[`with_context_claims`]) uses as a
+/// key, or [`engine::Constraint::evaluate`]'s plain-string
+/// `claims.get(&self.left_operand)` lookup silently never matches any
+/// claim at all, denying what should be a satisfiable constraint. A
+/// `leftOperand` outside the ODRL namespace (a deployment-specific claim
+/// key such as `"role"`) is left exactly as written, matching
+/// `dsp_odrl_adapter`'s own "an IRI outside the ODRL namespace is left
+/// exactly as written" rule.
+fn normalize_left_operand(left_operand: &str) -> String {
+    left_operand
+        .strip_prefix(ODRL_NS)
+        .or_else(|| left_operand.strip_prefix("odrl:"))
+        .unwrap_or(left_operand)
+        .to_string()
 }
 
 /// [`catalog_constraint_to_engine_constraint`]'s actual recursion, with an
@@ -457,7 +502,7 @@ fn catalog_constraint_to_engine_constraint_at_depth(
     match constraint {
         CoreConstraint::Atomic(atomic) => match parse_operator(&atomic.operator) {
             Some(operator) => Ok(Some(EngineConstraint::new(
-                atomic.left_operand.clone(),
+                normalize_left_operand(&atomic.left_operand),
                 operator,
                 atomic.right_operand.clone(),
             ))),
@@ -889,6 +934,77 @@ mod tests {
             dataset_is_visible(&dataset, &claims, "use", &config),
             "skipping just the unmappable constraint must leave the rule's other (zero, here) \
              constraints to grant an otherwise-unconstrained permission"
+        );
+    }
+
+    // --- leftOperand normalization (normalize_left_operand) --------------
+    //
+    // A harvested `leftOperand` is vocabulary, compacted out of the ODRL
+    // namespace the same way `dsp_odrl_adapter::ingest` compacts one when
+    // it ingests a real DSP contract - see `normalize_left_operand`'s own
+    // doc comment. Caught during this feature's own end-to-end
+    // verification: a permission constrained by `("odrl:dateTime", "odrl:lteq", ...)`
+    // (the compact-IRI form a real crawled participant may well advertise)
+    // silently never matched this bridge's own `"dateTime"` claims-map key
+    // before this normalization existed - `engine::Constraint::evaluate`'s
+    // claim lookup is a plain string match, so an un-normalized
+    // `"odrl:dateTime"` looked up nothing and a genuinely satisfiable
+    // constraint was denied instead of granted.
+
+    #[test]
+    fn an_odrl_prefixed_left_operand_matches_a_bare_claim_key() {
+        let dataset = dataset_with_policies(vec![policy(
+            vec![CoreRule {
+                action: "use".to_string(),
+                constraints: vec![CoreConstraint::atomic(
+                    "odrl:dateTime",
+                    "odrl:lteq",
+                    "2027-01-01T00:00:00Z",
+                )],
+            }],
+            Vec::new(),
+        )]);
+        let claims = with_context_claims(Claims::new());
+        let config = PolicyFilterConfig::default();
+
+        assert!(
+            dataset_is_visible(&dataset, &claims, "use", &config),
+            "an 'odrl:'-prefixed leftOperand must normalize to the same bare key \
+             with_context_claims sets ('dateTime'), so a satisfiable dateTime constraint is \
+             actually evaluated against it, not silently denied for matching nothing"
+        );
+    }
+
+    #[test]
+    fn a_full_iri_left_operand_matches_a_bare_claim_key() {
+        let dataset = dataset_with_policies(vec![policy(
+            vec![CoreRule {
+                action: "use".to_string(),
+                constraints: vec![CoreConstraint::atomic(
+                    "http://www.w3.org/ns/odrl/2/dateTime",
+                    "lteq",
+                    "2027-01-01T00:00:00Z",
+                )],
+            }],
+            Vec::new(),
+        )]);
+        let claims = with_context_claims(Claims::new());
+        let config = PolicyFilterConfig::default();
+
+        assert!(
+            dataset_is_visible(&dataset, &claims, "use", &config),
+            "an unabbreviated ODRL-namespace leftOperand IRI must normalize the same way the \
+             'odrl:'-prefixed compact form does"
+        );
+    }
+
+    #[test]
+    fn a_non_odrl_left_operand_is_left_exactly_as_written() {
+        assert_eq!(normalize_left_operand("role"), "role");
+        assert_eq!(
+            normalize_left_operand("https://example.org/ns#region"),
+            "https://example.org/ns#region",
+            "a leftOperand outside the ODRL namespace must not be altered"
         );
     }
 

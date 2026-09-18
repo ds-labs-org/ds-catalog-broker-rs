@@ -71,13 +71,10 @@ pub struct AppState {
     /// comment for the three conservative-by-default judgment calls it
     /// makes explicit. Defaults to `PolicyFilterConfig::default()`.
     ///
-    /// Threaded through `AppState` now so this field exists for the
-    /// serving-surface tests that specify the intended per-request
-    /// filtering behavior (`GET /catalog` and the management API); the
-    /// actual `odrl_filter::dataset_is_visible` call sites in those two
-    /// routes are separate, not-yet-wired work - see this file's own
-    /// `tests` module for the failing tests this field exists to make
-    /// possible.
+    /// Consulted by `filter_catalogs_by_policy`, called from both
+    /// `GET /catalog` and `POST /api/management/v4/catalogs/request` -
+    /// see this file's own `tests` module (the "ODRL policy-based dataset
+    /// visibility filtering" section) for the behavior this drives.
     pub policy_filter: odrl_filter::PolicyFilterConfig,
 }
 
@@ -342,17 +339,74 @@ fn unauthorized_bearer_response() -> axum::response::Response {
         .into_response()
 }
 
+/// The ODRL action `GET /catalog` and the management API check when
+/// deciding whether a caller may see a harvested dataset at all (gap
+/// analysis §3.4). Fixed to ODRL's own general-purpose "make use of this
+/// asset" action rather than a bespoke broker-specific action string no
+/// real crawled policy would ever grant/deny - listing/browsing a dataset
+/// in this broker's own re-served catalog is the closest fit to that
+/// action; actually transferring the underlying data stays entirely the
+/// connector's own, separate DSP contract-negotiation concern this broker
+/// never participates in.
+const CATALOG_VISIBILITY_ACTION: &str = "odrl:use";
+
+/// Whether ODRL policy-based dataset filtering (gap analysis §3.4) should
+/// run at all for this request: always once an OAuth2 Bearer gate is
+/// configured (`check_oauth2_bearer` already produced a genuine, if
+/// possibly claim-sparse, verified identity to evaluate against), and
+/// otherwise per `PolicyFilterConfig::filter_when_oauth2_disabled` - see
+/// that field's own doc comment for why its default keeps filtering on
+/// even then, evaluated against an empty claims map.
+fn should_filter_by_policy(state: &AppState) -> bool {
+    state.oauth2.is_some() || state.policy_filter.filter_when_oauth2_disabled
+}
+
+/// Removes, from each of `catalogs`, every dataset
+/// `odrl_filter::dataset_is_visible` says the caller identified by
+/// `claims` (`check_oauth2_bearer`'s own verified-claims output - `None`
+/// when OAuth2 is disabled) is not entitled to see for
+/// [`CATALOG_VISIBILITY_ACTION`] - the shared filtering step both
+/// `GET /catalog` and `POST /api/management/v4/catalogs/request` apply
+/// (gap analysis §3.4). A no-op (per [`should_filter_by_policy`]) when
+/// OAuth2 is off and `PolicyFilterConfig::filter_when_oauth2_disabled` was
+/// explicitly set to `false`.
+///
+/// A catalog left with zero visible datasets is kept, with an empty
+/// `datasets` list, not dropped - `catalog_request_route`'s own doc
+/// comment (decision 2) records why: consistent with
+/// `CatalogRequestDataset`'s existing empty-vs-omitted convention, a
+/// participant a caller has zero entitlement into still gets to be known
+/// about, just with nothing they may see inside it.
+fn filter_catalogs_by_policy(
+    catalogs: &mut [Catalog],
+    claims: Option<&serde_json::Value>,
+    state: &AppState,
+) {
+    if !should_filter_by_policy(state) {
+        return;
+    }
+
+    let engine_claims = odrl_filter::with_context_claims(odrl_filter::jwt_claims_to_engine_claims(
+        claims.unwrap_or(&serde_json::Value::Null),
+    ));
+    for catalog in catalogs.iter_mut() {
+        catalog.datasets.retain(|dataset| {
+            odrl_filter::dataset_is_visible(
+                dataset,
+                &engine_claims,
+                CATALOG_VISIBILITY_ACTION,
+                &state.policy_filter,
+            )
+        });
+    }
+}
+
 async fn get_catalog(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<CatalogParams>,
 ) -> impl IntoResponse {
-    // `_claims` will drive per-dataset ODRL visibility filtering (gap
-    // analysis §3.4, via `odrl_filter::dataset_is_visible`) once that call
-    // is wired in - see this file's `tests` module for the failing tests
-    // specifying the intended behavior. Not yet consumed here: this is
-    // the RED half of that change.
-    let _claims = match check_oauth2_bearer(&state, &headers) {
+    let claims = match check_oauth2_bearer(&state, &headers) {
         Ok(claims) => claims,
         Err(response) => return *response,
     };
@@ -363,7 +417,10 @@ async fn get_catalog(
     };
 
     match state.cache.query(query).await {
-        Ok(catalogs) => Json(CatalogListResponse { catalogs }).into_response(),
+        Ok(mut catalogs) => {
+            filter_catalogs_by_policy(&mut catalogs, claims.as_ref(), &state);
+            Json(CatalogListResponse { catalogs }).into_response()
+        }
         Err(err) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -784,20 +841,27 @@ struct CatalogRequestConstraint {
 /// catalog-listing surface, so gating it the same way is the consistent
 /// choice. Unchanged/open when `state.oauth2` is `None`, exactly like
 /// those two routes.
+///
+/// Also applies the same ODRL policy-based dataset-visibility filtering
+/// as `GET /catalog` (`filter_catalogs_by_policy`, gap analysis §3.4),
+/// *before* the `filterExpression` handling below - a caller not entitled
+/// to a dataset under its harvested policy must not be able to retrieve
+/// it merely by asking for it by id via `datasets.id`/`=`. An offer left
+/// with zero visible datasets after policy filtering is kept, with an
+/// empty `dataset` array, not omitted - consistent with this file's
+/// existing "empty, not omitted" convention for `hasPolicy` on a
+/// policy-free dataset.
 async fn catalog_request_route(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    // See `get_catalog`'s matching comment: `_claims` is threaded through
-    // ready for the ODRL dataset-visibility filtering this route will also
-    // need (gap analysis §3.4), but not yet consumed - RED phase only.
-    let _claims = match check_oauth2_bearer(&state, &headers) {
+    let claims = match check_oauth2_bearer(&state, &headers) {
         Ok(claims) => claims,
         Err(response) => return *response,
     };
 
-    let catalogs = match state.cache.query(CatalogQuery::all()).await {
+    let mut catalogs = match state.cache.query(CatalogQuery::all()).await {
         Ok(catalogs) => catalogs,
         Err(err) => {
             return (
@@ -809,6 +873,7 @@ async fn catalog_request_route(
                 .into_response();
         }
     };
+    filter_catalogs_by_policy(&mut catalogs, claims.as_ref(), &state);
 
     let mut skipped = 0usize;
     let mut offers: Vec<CatalogRequestOffer> = Vec::with_capacity(catalogs.len());
@@ -2192,21 +2257,21 @@ mod tests {
     }
 
     // --- ODRL policy-based dataset visibility filtering (gap analysis
-    // §3.4) - RED phase --------------------------------------------------
+    // §3.4) ----------------------------------------------------------------
     //
     // `odrl_filter::dataset_is_visible` (and the rest of that module)
-    // already works end to end - see `crates/ds-catalog-broker-rs/src/odrl_filter.rs`'s
-    // own module doc and test suite. What's still missing is the actual
-    // wiring of that decision into `GET /catalog` and
-    // `POST /api/management/v4/catalogs/request`: today neither route
-    // calls it at all, so every harvested dataset is listed to every
-    // caller regardless of its policy content - exactly the "nothing
-    // filters on policy content today" gap the gap analysis names.
+    // already worked end to end before this section - see
+    // `crates/ds-catalog-broker-rs/src/odrl_filter.rs`'s own module doc and
+    // test suite. This section proves the remaining wiring of that
+    // decision into `GET /catalog` and
+    // `POST /api/management/v4/catalogs/request`
+    // (`filter_catalogs_by_policy`, called from both routes): every
+    // harvested dataset used to be listed to every caller regardless of
+    // its policy content - exactly the "nothing filters on policy content
+    // today" gap the gap analysis names - and these tests are the proof
+    // that gap is now closed on these two surfaces.
     //
-    // These tests specify the intended end-to-end behavior of that still-
-    // to-be-wired filtering and are expected to **fail** against the
-    // current (pre-wiring) code - the RED half of red/green TDD. Per this
-    // session's own prior-art lesson
+    // Per this session's own prior-art lesson
     // (`docs/spikes/2026-08-27-edc-catalog-metadata-exposure-policy.md`'s
     // central finding: the real failure mode is *silent over-permission*,
     // not a loud error), every "hidden" assertion below checks for the
@@ -2219,14 +2284,15 @@ mod tests {
     // own three:
     //
     // 1. **Which ODRL action these two catalog-*listing* surfaces check.**
-    //    Fixed to `odrl:use` (see `TEST_CATALOG_VISIBILITY_ACTION` below) -
-    //    ODRL's own general-purpose "make use of this asset" action, not a
-    //    bespoke broker-specific action string no real crawled policy
-    //    would ever grant/deny. Listing/browsing a dataset in this
-    //    broker's own re-served catalog is the closest fit to that
-    //    action; actually transferring the underlying data stays entirely
-    //    the connector's own, separate DSP contract-negotiation concern
-    //    this broker never participates in.
+    //    Fixed to `odrl:use` (`CATALOG_VISIBILITY_ACTION`, defined above
+    //    near `get_catalog` and reused here as `TEST_CATALOG_VISIBILITY_ACTION`
+    //    below) - ODRL's own general-purpose "make use of this asset"
+    //    action, not a bespoke broker-specific action string no real
+    //    crawled policy would ever grant/deny. Listing/browsing a dataset
+    //    in this broker's own re-served catalog is the closest fit to
+    //    that action; actually transferring the underlying data stays
+    //    entirely the connector's own, separate DSP contract-negotiation
+    //    concern this broker never participates in.
     // 2. **A `Catalog`/offer left with zero visible datasets after
     //    filtering is kept, not omitted** - with an empty `datasets`/
     //    `dataset` list, not dropped from the response entirely. Chosen
@@ -2239,14 +2305,14 @@ mod tests {
     //    entitlement into still gets to be *known about*, just with
     //    nothing they may see inside it.
 
-    /// The ODRL action `GET /catalog` and the management API are expected
-    /// to check when deciding whether a caller may see a harvested
-    /// dataset at all - see this section's own doc comment, decision 1.
-    /// Kept test-only for now since production code doesn't consume it
-    /// yet (RED phase); the eventual `dataset_is_visible` call sites in
-    /// `get_catalog`/`catalog_to_offer` will need the same constant (or an
-    /// equivalent one) once wired.
-    const TEST_CATALOG_VISIBILITY_ACTION: &str = "odrl:use";
+    /// The ODRL action `GET /catalog` and the management API check when
+    /// deciding whether a caller may see a harvested dataset at all - see
+    /// this section's own doc comment, decision 1. A local alias for
+    /// `super::CATALOG_VISIBILITY_ACTION` (the same constant
+    /// `filter_catalogs_by_policy` actually uses) so these tests assert
+    /// against the real production value by name, not a copy that could
+    /// silently drift from it.
+    const TEST_CATALOG_VISIBILITY_ACTION: &str = CATALOG_VISIBILITY_ACTION;
 
     /// One `catalog_core::Policy` granting `TEST_CATALOG_VISIBILITY_ACTION`
     /// only to a caller whose claims carry `role = "eu-resident"` - an
