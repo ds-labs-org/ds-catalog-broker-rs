@@ -6,16 +6,12 @@
 //! surfaces (`GET /catalog`, the management API, and SPARQL via real query
 //! rewriting).
 //!
-//! **RED phase.** Every type and function below has its real, final
-//! signature - the workspace compiles, and every call site this module
-//! will eventually need (in `lib.rs`'s three route handlers) already
-//! type-checks against it - but the actual entitlement/mapping *logic* is
-//! `todo!()` for now, matching this session's own established TDD posture
-//! (see e.g. `crates/rdf-store/src/lib.rs`'s
-//! `round_trips_a_nested_logical_constraint_preserving_structure_and_order`
-//! red/green history). This module's own `#[cfg(test)] mod tests` therefore
-//! fails at assertion/panic time today, not at compile time; a later
-//! "green:" commit fills these bodies in.
+//! **GREEN phase.** Every function below now has its real entitlement/
+//! mapping logic (the RED-phase commit had every one of them `todo!()`,
+//! with only the real, final signatures in place - see that commit's own
+//! message for the design this fills in). This module's own
+//! `#[cfg(test)] mod tests` passes end to end; the three serving-surface
+//! call sites in `lib.rs` are separate, later wiring work.
 //!
 //! ## Design: per-`(policy, action)` evaluation, OR'd across a dataset's
 //! own alternative offers
@@ -45,9 +41,19 @@
 //! [`PolicyFilterConfig::filter_when_oauth2_disabled`]'s default (`true`,
 //! filtering still runs against an empty claims map).
 
-use catalog_core::{Constraint as CoreConstraint, Dataset, Policy as CorePolicy, Rule as CoreRule};
+use std::collections::BTreeSet;
+
+use catalog_core::{
+    Constraint as CoreConstraint, Dataset, LogicalConstraint, Policy as CorePolicy,
+    PolicyKind as CorePolicyKind, Rule as CoreRule,
+};
 use chrono::Utc;
-use engine::{ClaimValue, Claims, Constraint as EngineConstraint, Rule as EngineRule, WirePolicy};
+use engine::wire::WireActionDecl;
+use engine::{
+    Behaviour, ClaimValue, Claims, ConflictStrategy, Constraint as EngineConstraint, DutyMode,
+    MAX_CONSTRAINT_DEPTH, Operator, Request as EngineRequest, RequestConfig, Rule as EngineRule,
+    WireDecision, WirePolicy, evaluate_request,
+};
 
 // --- Configuration (gap analysis §3.4's "driven by a new, explicit runtime
 // config rather than hardcoded") -------------------------------------------
@@ -268,11 +274,47 @@ impl PolicyFilterConfig {
 /// `odrl:assignee`-scoped policy is actually honored - see
 /// [`dataset_is_visible`].
 pub fn jwt_claims_to_engine_claims(claims: &serde_json::Value) -> Claims {
-    let _ = claims;
-    todo!(
-        "RED phase (gap analysis \u{a7}3.4): jwt_claims_to_engine_claims mapping logic is not \
-         yet implemented - see odrl_filter's module doc comment"
-    )
+    let mut mapped = Claims::new();
+    let Some(object) = claims.as_object() else {
+        return mapped;
+    };
+
+    for (key, value) in object {
+        // `scope`, and only when it is actually the OAuth2-conventional
+        // bare string - a non-string `scope` (a caller that already sends
+        // an array, however unconventional) falls through to the generic
+        // rule below via `or_else` rather than being dropped outright.
+        let scope_multi = (key == "scope")
+            .then(|| value.as_str())
+            .flatten()
+            .map(|scope| {
+                ClaimValue::Multi(scope.split_ascii_whitespace().map(str::to_string).collect())
+            });
+
+        let mapped_value = scope_multi.or_else(|| match value {
+            serde_json::Value::String(s) => Some(ClaimValue::Single(s.clone())),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect::<Option<Vec<String>>>()
+                .map(ClaimValue::Multi),
+            // An array containing anything other than strings has no
+            // representation in `ClaimValue` - dropped (`None` from the
+            // `collect` above), not an error. Numbers, bools, nested
+            // objects, and `null` are not auto-flattened either - see this
+            // function's own doc comment.
+            serde_json::Value::Number(_)
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Object(_)
+            | serde_json::Value::Null => None,
+        });
+
+        if let Some(mapped_value) = mapped_value {
+            mapped.insert(key.clone(), mapped_value);
+        }
+    }
+
+    mapped
 }
 
 /// Layers host-synthesized context claims on top of JWT-derived ones -
@@ -345,11 +387,114 @@ pub fn catalog_constraint_to_engine_constraint(
     constraint: &CoreConstraint,
     config: &PolicyFilterConfig,
 ) -> Result<Option<EngineConstraint>, UnmappableConstraint> {
-    let _ = (constraint, config);
-    todo!(
-        "RED phase (gap analysis \u{a7}3.4): recursive Constraint mapping is not yet \
-         implemented - see odrl_filter's module doc comment"
-    )
+    catalog_constraint_to_engine_constraint_at_depth(constraint, config, 0)
+}
+
+/// The `operator` wire spellings `ds-odrl-engine-rs::engine::Operator`
+/// recognizes (`engine::wire::operator_wire_name`'s own inverse - that
+/// function is private to the engine crate, so this restates its fixed set
+/// rather than depending on it), with an optional leading `odrl:` stripped
+/// first - a crawled participant's harvested operator string is sometimes
+/// the bare local name (`"lteq"`) and sometimes the `odrl:`-prefixed form
+/// (`"odrl:lteq"`); both mean the same operator, and there is no ambiguity
+/// between them worth preserving as a distinct mapping outcome.
+fn parse_operator(operator: &str) -> Option<Operator> {
+    let bare = operator.strip_prefix("odrl:").unwrap_or(operator);
+    match bare {
+        "eq" => Some(Operator::Eq),
+        "neq" => Some(Operator::Neq),
+        "isAnyOf" => Some(Operator::IsAnyOf),
+        "isAllOf" => Some(Operator::IsAllOf),
+        "isNoneOf" => Some(Operator::IsNoneOf),
+        "isPartOf" => Some(Operator::IsPartOf),
+        "lt" => Some(Operator::Lt),
+        "lteq" => Some(Operator::Lteq),
+        "gt" => Some(Operator::Gt),
+        "gteq" => Some(Operator::Gteq),
+        _ => None,
+    }
+}
+
+/// [`catalog_constraint_to_engine_constraint`]'s actual recursion, with an
+/// explicit depth counter this crate's own public signature has no room
+/// for. Bounded by the same [`MAX_CONSTRAINT_DEPTH`] the crawler's own
+/// parsing already bounds itself by (gap analysis \u{a7}3.4's own note on
+/// why the two are kept in step) - a harvested `Constraint` reaching this
+/// function has already been through that bound once, so this is a
+/// defense-in-depth guard against a `Constraint` value built some other
+/// way (directly, in a test, or by a future caller), not a bound this
+/// function expects to actually hit against real crawled data. A tree that
+/// somehow exceeds it is treated exactly like an unmappable operator -
+/// this crate has no third notion of "too deep to evaluate" distinct from
+/// "cannot evaluate this constraint" - so the configured
+/// `unmappable_constraint_action` still governs what happens to it.
+/// One of [`EngineConstraint`]'s own `and`/`or`/`xone`/`and_sequence`
+/// logical constructors - a plain type alias purely so the `match` in
+/// [`catalog_constraint_to_engine_constraint_at_depth`] below doesn't spell
+/// this function-pointer type out inline (clippy's own `type_complexity`
+/// lint).
+type ConstraintCtor = fn(Vec<EngineConstraint>) -> EngineConstraint;
+
+fn catalog_constraint_to_engine_constraint_at_depth(
+    constraint: &CoreConstraint,
+    config: &PolicyFilterConfig,
+    depth: usize,
+) -> Result<Option<EngineConstraint>, UnmappableConstraint> {
+    if depth > MAX_CONSTRAINT_DEPTH {
+        tracing::warn!(
+            depth,
+            "ODRL constraint nested past MAX_CONSTRAINT_DEPTH while mapping to the ODRL \
+             engine's wire shape; treating it the same as an unmappable operator"
+        );
+        return match config.unmappable_constraint_action {
+            UnmappableConstraintAction::SkipConstraint => Ok(None),
+            UnmappableConstraintAction::DropPolicy | UnmappableConstraintAction::HideDataset => {
+                Err(UnmappableConstraint)
+            }
+        };
+    }
+
+    match constraint {
+        CoreConstraint::Atomic(atomic) => match parse_operator(&atomic.operator) {
+            Some(operator) => Ok(Some(EngineConstraint::new(
+                atomic.left_operand.clone(),
+                operator,
+                atomic.right_operand.clone(),
+            ))),
+            None => match config.unmappable_constraint_action {
+                UnmappableConstraintAction::SkipConstraint => {
+                    tracing::warn!(
+                        left_operand = %atomic.left_operand,
+                        operator = %atomic.operator,
+                        "dropping unmappable ODRL constraint operator \
+                         (POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION=skip)"
+                    );
+                    Ok(None)
+                }
+                UnmappableConstraintAction::DropPolicy
+                | UnmappableConstraintAction::HideDataset => Err(UnmappableConstraint),
+            },
+        },
+        CoreConstraint::Logical(logical) => {
+            let (children, build): (&[CoreConstraint], ConstraintCtor) = match logical {
+                LogicalConstraint::And(children) => (children.as_slice(), EngineConstraint::and),
+                LogicalConstraint::Or(children) => (children.as_slice(), EngineConstraint::or),
+                LogicalConstraint::Xone(children) => (children.as_slice(), EngineConstraint::xone),
+                LogicalConstraint::AndSequence(children) => {
+                    (children.as_slice(), EngineConstraint::and_sequence)
+                }
+            };
+            let mut mapped = Vec::with_capacity(children.len());
+            for child in children {
+                if let Some(engine_child) =
+                    catalog_constraint_to_engine_constraint_at_depth(child, config, depth + 1)?
+                {
+                    mapped.push(engine_child);
+                }
+            }
+            Ok(Some(build(mapped)))
+        }
+    }
 }
 
 /// Maps one harvested [`catalog_core::Rule`] (a `permission`/`prohibition`/
@@ -373,11 +518,27 @@ pub fn catalog_rule_to_engine_rule(
     rule: &CoreRule,
     config: &PolicyFilterConfig,
 ) -> Result<Option<EngineRule>, UnmappableConstraint> {
-    let _ = (rule, config);
-    todo!(
-        "RED phase (gap analysis \u{a7}3.4): Rule mapping is not yet implemented - see \
-         odrl_filter's module doc comment"
-    )
+    let mut constraints = Vec::with_capacity(rule.constraints.len());
+    for constraint in &rule.constraints {
+        if let Some(engine_constraint) =
+            catalog_constraint_to_engine_constraint(constraint, config)?
+        {
+            constraints.push(engine_constraint);
+        }
+    }
+    Ok(Some(EngineRule::new(rule.action.clone(), constraints)))
+}
+
+/// [`catalog_core::PolicyKind`]'s wire spelling on [`WirePolicy::kind`] -
+/// a plain label the engine never itself branches on (see that field's
+/// own doc comment), so this is a direct, lossless rename rather than a
+/// judgment call.
+fn policy_kind_wire_name(kind: CorePolicyKind) -> &'static str {
+    match kind {
+        CorePolicyKind::Set => "Set",
+        CorePolicyKind::Offer => "Offer",
+        CorePolicyKind::Agreement => "Agreement",
+    }
 }
 
 /// Maps one harvested [`catalog_core::Policy`] (one of a dataset's
@@ -406,14 +567,124 @@ pub fn catalog_policy_to_wire_policy(
     fallback_id: &str,
     config: &PolicyFilterConfig,
 ) -> Result<Option<WirePolicy>, HideDatasetForUnmappableConstraint> {
-    let _ = (policy, fallback_id, config);
-    todo!(
-        "RED phase (gap analysis \u{a7}3.4): Policy mapping is not yet implemented - see \
-         odrl_filter's module doc comment"
-    )
+    let map_rules = |rules: &[CoreRule]| -> Result<Vec<EngineRule>, UnmappableConstraint> {
+        let mut mapped = Vec::with_capacity(rules.len());
+        for rule in rules {
+            if let Some(engine_rule) = catalog_rule_to_engine_rule(rule, config)? {
+                mapped.push(engine_rule);
+            }
+        }
+        Ok(mapped)
+    };
+
+    let mapped = (|| -> Result<WirePolicy, UnmappableConstraint> {
+        Ok(WirePolicy {
+            id: policy.id.clone().unwrap_or_else(|| fallback_id.to_string()),
+            kind: policy_kind_wire_name(policy.kind).to_string(),
+            assigner: policy.assigner.clone().unwrap_or_default(),
+            assignee: policy.assignee.clone(),
+            permissions: map_rules(&policy.permissions)?,
+            prohibitions: map_rules(&policy.prohibitions)?,
+            obligations: map_rules(&policy.obligations)?,
+            conflict: ConflictStrategy::default(),
+            inherit_from: None,
+        })
+    })();
+
+    match mapped {
+        Ok(wire_policy) => Ok(Some(wire_policy)),
+        Err(UnmappableConstraint) => match config.unmappable_constraint_action {
+            UnmappableConstraintAction::DropPolicy => Ok(None),
+            UnmappableConstraintAction::HideDataset => Err(HideDatasetForUnmappableConstraint),
+            UnmappableConstraintAction::SkipConstraint => {
+                // Fully resolved at the constraint level - see
+                // `catalog_constraint_to_engine_constraint`'s own doc
+                // comment. An `Err` never reaches this match arm under
+                // this setting.
+                unreachable!(
+                    "SkipConstraint drops the offending constraint before an Err can propagate \
+                     this far"
+                )
+            }
+        },
+    }
 }
 
 // --- The entitlement decision -------------------------------------------
+
+/// Builds the single-policy `engine::Request` [`dataset_is_visible`] sends
+/// to [`evaluate_request`] for one already-mapped `wire_policy`.
+///
+/// `config.actions` is every action `wire_policy`'s own rules mention,
+/// plus `action` itself - mirroring `ds-odrl-engine-rs::dsp_odrl_adapter`'s
+/// own `minimal_config` (a real precedent in the sibling engine repo for
+/// exactly this "declare a floor, not a profile" situation: no
+/// `odrl:includedIn` taxonomy, since a harvested dataset's policy declares
+/// none). `action` itself must always be included even when no rule
+/// mentions it at all - `evaluate_request` treats an unrecognized
+/// *requested* action as a hard `Decision::Error`, and a dataset with only
+/// unrelated permissions (or none at all) must still evaluate to a
+/// `Deny`/`Allow`, never an `Error`.
+///
+/// `party_identity_claim` is fixed to `"sub"` (see
+/// [`jwt_claims_to_engine_claims`]'s own doc comment), so a policy naming
+/// an `odrl:assignee` is actually scoped to the caller identified by that
+/// claim. `behaviour` mirrors `config.no_policy_visibility` - the same
+/// judgment call now also governing the engine's own reading of "no
+/// permissions" for one already-mapped policy, not only this function's
+/// own empty-`Vec<Policy>` short circuit. `duty_mode` is fixed to
+/// [`DutyMode::Advise`]: this broker tracks no duty fulfillment of its own
+/// (there is no negotiation, no obligation ledger), so an outstanding
+/// `odrl:duty`/`odrl:obligation` is surfaced as advisory rather than
+/// silently forcing a `Deny` a caller has no way to have resolved.
+fn build_request(
+    dataset: &Dataset,
+    wire_policy: &WirePolicy,
+    action: &str,
+    claims: &Claims,
+    config: &PolicyFilterConfig,
+) -> EngineRequest {
+    let mut actions: BTreeSet<String> = BTreeSet::new();
+    actions.insert(action.to_string());
+    for rule in wire_policy
+        .permissions
+        .iter()
+        .chain(&wire_policy.prohibitions)
+        .chain(&wire_policy.obligations)
+    {
+        actions.insert(rule.action.clone());
+    }
+
+    let behaviour = match config.no_policy_visibility {
+        NoPolicyVisibility::Open => Behaviour::Open,
+        NoPolicyVisibility::Closed => Behaviour::Closed,
+    };
+
+    let request_config = RequestConfig {
+        type_: "odrl:Profile".to_string(),
+        id: "urn:ds-catalog-broker-rs:odrl-filter-config".to_string(),
+        actions: actions
+            .into_iter()
+            .map(|id| WireActionDecl {
+                id,
+                included_in: None,
+            })
+            .collect(),
+        duty_mode: DutyMode::Advise,
+        behaviour,
+        party_identity_claim: Some("sub".to_string()),
+        agreement_assignee_claim: None,
+    };
+
+    EngineRequest {
+        dataset_id: dataset.id.clone(),
+        action: action.to_string(),
+        config: request_config,
+        policies: vec![wire_policy.clone()],
+        claims: claims.clone(),
+        asset_collections: Vec::new(),
+    }
+}
 
 /// Is `dataset` visible to the caller `claims` describes, for `action`,
 /// under `config`?
@@ -456,11 +727,26 @@ pub fn dataset_is_visible(
     action: &str,
     config: &PolicyFilterConfig,
 ) -> bool {
-    let _ = (dataset, claims, action, config);
-    todo!(
-        "RED phase (gap analysis \u{a7}3.4): the per-(policy, action) entitlement decision is \
-         not yet implemented - see odrl_filter's module doc comment"
-    )
+    if dataset.policies.is_empty() {
+        return config.no_policy_visibility == NoPolicyVisibility::Open;
+    }
+
+    for (index, policy) in dataset.policies.iter().enumerate() {
+        let fallback_id = format!("{}-policy-{index}", dataset.id);
+        match catalog_policy_to_wire_policy(policy, &fallback_id, config) {
+            Err(HideDatasetForUnmappableConstraint) => return false,
+            Ok(None) => continue,
+            Ok(Some(wire_policy)) => {
+                let request = build_request(dataset, &wire_policy, action, claims, config);
+                let response = evaluate_request(&request);
+                if response.decision == WireDecision::Allow {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
