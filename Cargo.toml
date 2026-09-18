@@ -88,5 +88,18 @@ jsonwebtoken = "9"
 # contreforts-kg is built with `--no-default-features` - see rdf-store's
 # Cargo.toml for which one this project actually uses.
 oxigraph = { version = "0.5", default-features = false }
+# The exact SPARQL algebra parser oxigraph 0.5.10 itself depends on
+# (oxigraph's own Cargo.toml pins `spargebra = "=0.4.7"` with these same
+# two features) - used directly by ds-catalog-broker-rs to parse a
+# caller's SPARQL query into its real algebra tree and inject an ODRL
+# policy-filtering restriction into it (gap analysis §3.4's SPARQL
+# query-rewriting surface, `sparql_rewrite.rs`) before handing the
+# rewritten query text to `rdf_store::oxigraph_backend::sparql_query_json`
+# for evaluation. Pinned to the exact same version oxigraph already
+# resolves this workspace's `Cargo.lock` to, so there is exactly one copy
+# of this crate (and its algebra types) in the dependency graph - not an
+# independent, potentially-drifting SPARQL grammar implementation of its
+# own.
+spargebra = { version = "=0.4.7", features = ["sep-0002", "sep-0006"] }
 contreforts-core = { path = "vendor/contreforts-core" }
 contreforts-config = { path = "vendor/contreforts-config" }

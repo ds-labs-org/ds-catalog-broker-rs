@@ -47,11 +47,24 @@ engine = { path = "../../../ds-odrl-engine-rs/engine" }
 # from the current wall-clock time, mirroring `ds-sql-dps-rs`'s own
 # `dataplane/src/public.rs::get_file` pattern exactly.
 chrono = { workspace = true }
+# SPARQL query-rewriting ODRL policy filtering for GET/POST /sparql (gap
+# analysis §3.4) - see src/sparql_rewrite.rs's module doc. See the
+# workspace-level `[workspace.dependencies]` entry for why this exact
+# version/feature set.
+spargebra = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
 http-body-util = "0.1"
 urlencoding = { workspace = true }
+# `src/sparql_rewrite.rs`'s own tests execute a rewritten query against a
+# tiny real Oxigraph store (proving the restriction actually restricts,
+# not just that the rewritten text looks plausible) - the same crate
+# `rdf-store` itself is backed by, at the same workspace-pinned version.
+# Not a production dependency of this crate: production code only ever
+# hands the rewritten query *text* to `rdf_store`'s own
+# `sparql_query_json`, never touches `oxigraph` directly.
+oxigraph = { workspace = true }
 # Mint EC keypairs and hand-sign compact JWS test tokens for a mock JWKS
 # endpoint in oauth2.rs's and lib.rs's own tests - independent of both
 # jsonwebtoken's own EncodingKey and of dcp-core's sign_jws, so the

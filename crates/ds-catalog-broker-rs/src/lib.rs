@@ -9,10 +9,12 @@
 //! returns `dspace:`/`edc:` JSON-LD) are all deferred to a later
 //! iteration.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub mod oauth2;
 pub mod odrl_filter;
+pub mod sparql_rewrite;
 
 use axum::{
     Form, Json, Router,
@@ -361,15 +363,28 @@ fn should_filter_by_policy(state: &AppState) -> bool {
     state.oauth2.is_some() || state.policy_filter.filter_when_oauth2_disabled
 }
 
+/// `check_oauth2_bearer`'s own verified-claims output (`None` when OAuth2
+/// is disabled), converted to `ds-odrl-engine-rs`'s own claims shape and
+/// layered with host-synthesized context claims - the one path every
+/// caller of `odrl_filter::dataset_is_visible` in this file goes through
+/// first, shared by [`filter_catalogs_by_policy`] (`GET /catalog`/the
+/// management API) and [`visible_dataset_resource_iris`] (`sparql_route`'s
+/// own query-rewriting filtering) alike, so the two surfaces can never
+/// silently diverge on how a bearer token's claims get mapped.
+fn engine_claims_from_bearer(claims: Option<&serde_json::Value>) -> engine::Claims {
+    odrl_filter::with_context_claims(odrl_filter::jwt_claims_to_engine_claims(
+        claims.unwrap_or(&serde_json::Value::Null),
+    ))
+}
+
 /// Removes, from each of `catalogs`, every dataset
 /// `odrl_filter::dataset_is_visible` says the caller identified by
-/// `claims` (`check_oauth2_bearer`'s own verified-claims output - `None`
-/// when OAuth2 is disabled) is not entitled to see for
-/// [`CATALOG_VISIBILITY_ACTION`] - the shared filtering step both
-/// `GET /catalog` and `POST /api/management/v4/catalogs/request` apply
-/// (gap analysis §3.4). A no-op (per [`should_filter_by_policy`]) when
-/// OAuth2 is off and `PolicyFilterConfig::filter_when_oauth2_disabled` was
-/// explicitly set to `false`.
+/// `claims` is not entitled to see for [`CATALOG_VISIBILITY_ACTION`] - the
+/// shared filtering step both `GET /catalog` and
+/// `POST /api/management/v4/catalogs/request` apply (gap analysis §3.4). A
+/// no-op (per [`should_filter_by_policy`]) when OAuth2 is off and
+/// `PolicyFilterConfig::filter_when_oauth2_disabled` was explicitly set to
+/// `false`.
 ///
 /// A catalog left with zero visible datasets is kept, with an empty
 /// `datasets` list, not dropped - `catalog_request_route`'s own doc
@@ -386,9 +401,7 @@ fn filter_catalogs_by_policy(
         return;
     }
 
-    let engine_claims = odrl_filter::with_context_claims(odrl_filter::jwt_claims_to_engine_claims(
-        claims.unwrap_or(&serde_json::Value::Null),
-    ));
+    let engine_claims = engine_claims_from_bearer(claims);
     for catalog in catalogs.iter_mut() {
         catalog.datasets.retain(|dataset| {
             odrl_filter::dataset_is_visible(
@@ -399,6 +412,45 @@ fn filter_catalogs_by_policy(
             )
         });
     }
+}
+
+/// The allow-list of dataset *resource IRIs* (exactly as
+/// `rdf_store::oxigraph_backend::dataset_resource_iri` - and therefore a
+/// real `?x a dcat:Dataset` SPARQL binding - would spell them) the caller
+/// identified by `engine_claims` is entitled to see across every harvested
+/// `catalogs`, for [`CATALOG_VISIBILITY_ACTION`] - the same per-dataset
+/// decision [`filter_catalogs_by_policy`] already makes for
+/// `GET /catalog`/the management API, reused here for `sparql_route`'s own
+/// query-rewriting filtering (gap analysis §3.4,
+/// `sparql_rewrite::restrict_to_visible_dataset_iris`'s own allow-list
+/// input).
+fn visible_dataset_resource_iris(
+    catalogs: &[Catalog],
+    engine_claims: &engine::Claims,
+    state: &AppState,
+) -> BTreeSet<String> {
+    catalogs
+        .iter()
+        .flat_map(|catalog| {
+            catalog
+                .datasets
+                .iter()
+                .filter(move |dataset| {
+                    odrl_filter::dataset_is_visible(
+                        dataset,
+                        engine_claims,
+                        CATALOG_VISIBILITY_ACTION,
+                        &state.policy_filter,
+                    )
+                })
+                .map(move |dataset| {
+                    rdf_store::oxigraph_backend::dataset_resource_iri(
+                        &catalog.origin_node,
+                        &dataset.id,
+                    )
+                })
+        })
+        .collect()
 }
 
 async fn get_catalog(
@@ -987,15 +1039,37 @@ fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 ///   the in-memory cache is running - see that field's doc comment): 501
 ///   Not Implemented. This is a genuine backend limitation, not a
 ///   not-yet-built route, hence 501 rather than 404.
-/// - Missing/empty `query`: 400 Bad Request.
 /// - `Accept` header present and none of its media ranges match
 ///   `application/sparql-results+json` (see `accepts_sparql_results_json`):
 ///   406 Not Acceptable.
+/// - Missing/empty `query`: 400 Bad Request.
+/// - ODRL policy-based query-rewriting filtering (gap analysis §3.4,
+///   `sparql_rewrite`) runs next, whenever [`should_filter_by_policy`] says
+///   it should: the caller's own per-dataset allow-list is computed via
+///   [`visible_dataset_resource_iris`] (the same decision
+///   `filter_catalogs_by_policy` already makes for `GET /catalog`/the
+///   management API) and `query` is rewritten to restrict every
+///   recognized dataset-subject variable to it
+///   (`sparql_rewrite::restrict_to_visible_dataset_iris`). A query that
+///   cannot be scoped this way (no such variable found anywhere in its own
+///   top scope) is handled per
+///   `PolicyFilterConfig::unscopeable_sparql_query_action`: `400 Bad
+///   Request` under its default ([`odrl_filter::UnscopeableSparqlQueryAction::Reject`]),
+///   or run completely unrewritten under the explicit
+///   `run_unfiltered` opt-out. When filtering is off entirely (OAuth2
+///   disabled and `PolicyFilterConfig::filter_when_oauth2_disabled` set to
+///   `false`), `query` reaches evaluation completely unrewritten, exactly
+///   as before this feature existed.
 /// - Query fails to parse, fails to evaluate, or is a `CONSTRUCT`/
 ///   `DESCRIBE` (unsupported result shape - see `SparqlError`'s own doc
 ///   comments): 400 Bad Request with a plain-text explanation - these are
-///   all the caller's own query's fault.
-/// - Otherwise: 200 with an `application/sparql-results+json` body.
+///   all the caller's own query's fault. A query rejected here was either
+///   already like this before any rewriting (rewriting passes an unparseable
+///   query through unchanged, per `sparql_rewrite`'s own doc comment) or
+///   became so only in a way that itself proves the original could never
+///   have evaluated either.
+/// - Otherwise: 200 with an `application/sparql-results+json` body,
+///   computed from the (possibly policy-rewritten) query.
 ///
 /// Checked first, ahead of all of the above: the OAuth2 Bearer gate (see
 /// `check_oauth2_bearer`'s doc comment) - `401`/`403` when
@@ -1007,20 +1081,7 @@ async fn sparql_route(
     headers: HeaderMap,
     query: Option<String>,
 ) -> axum::response::Response {
-    // Real query-rewriting ODRL filtering for SPARQL (gap analysis §3.4) is
-    // separate, later work (see `odrl_filter`'s own module doc for the
-    // current status and the design this RED phase pins down) - `_claims`
-    // is threaded through now so that phase doesn't need to touch this
-    // function's `check_oauth2_bearer` call again. This function does not
-    // yet compute a per-caller allow-list of visible dataset IRIs, rewrite
-    // `query` to restrict any dataset-subject-shaped variable to it, or
-    // reject a query with no such variable per
-    // `PolicyFilterConfig::unscopeable_sparql_query_action` - every caller
-    // still sees every harvested triple regardless of policy content. See
-    // this file's own `tests` module, "SPARQL ODRL policy-based filtering
-    // (gap analysis §3.4) - RED phase" section, for the failing tests
-    // specifying the intended behavior once this is wired.
-    let _claims = match check_oauth2_bearer(&state, &headers) {
+    let claims = match check_oauth2_bearer(&state, &headers) {
         Ok(claims) => claims,
         Err(response) => return *response,
     };
@@ -1052,6 +1113,46 @@ async fn sparql_route(
             )
                 .into_response();
         }
+    };
+
+    let query = if should_filter_by_policy(&state) {
+        let engine_claims = engine_claims_from_bearer(claims.as_ref());
+        let catalogs = match state.cache.query(CatalogQuery::all()).await {
+            Ok(catalogs) => catalogs,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: err.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let visible = visible_dataset_resource_iris(&catalogs, &engine_claims, &state);
+
+        match sparql_rewrite::restrict_to_visible_dataset_iris(&query, &visible) {
+            Ok(rewritten) => rewritten,
+            Err(sparql_rewrite::UnscopeableQuery) => {
+                match state.policy_filter.unscopeable_sparql_query_action {
+                    odrl_filter::UnscopeableSparqlQueryAction::Reject => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "this query cannot be scoped to a per-caller allow-list of visible \
+                             datasets (no dataset-subject-shaped variable, e.g. '?x a \
+                             dcat:Dataset', found anywhere in it) - rejected rather than run \
+                             unfiltered against the whole store; see \
+                             PolicyFilterConfig::unscopeable_sparql_query_action"
+                                .to_string(),
+                        )
+                            .into_response();
+                    }
+                    odrl_filter::UnscopeableSparqlQueryAction::RunUnfiltered => query,
+                }
+            }
+        }
+    } else {
+        query
     };
 
     match sparql.sparql_query_json(&query) {
@@ -2729,40 +2830,42 @@ mod tests {
         );
     }
 
-    // --- SPARQL ODRL policy-based filtering (gap analysis §3.4) - RED
-    // phase --------------------------------------------------------------
+    // --- SPARQL ODRL policy-based filtering (gap analysis §3.4)
+    // ------------------------------------------------------------------
     //
-    // The one remaining serving surface from gap analysis §3.4's "nothing
-    // filters on policy content today": `GET`/`POST /sparql` does not call
-    // `odrl_filter::dataset_is_visible` at all yet (see `sparql_route`'s
-    // own doc comment) - every caller currently sees every harvested
-    // triple through this surface regardless of a dataset's policy
-    // content, exactly the same gap `GET /catalog` and the management API
-    // used to have before the "ODRL policy-based dataset visibility
-    // filtering" section above closed it on those two surfaces.
+    // The last of gap analysis §3.4's three serving surfaces: `GET`/
+    // `POST /sparql` now calls `odrl_filter::dataset_is_visible` (via
+    // `visible_dataset_resource_iris`) and rewrites the caller's query
+    // through `sparql_rewrite::restrict_to_visible_dataset_iris` before
+    // ever evaluating it - see `sparql_route`'s own doc comment for the
+    // exact behavior, and `sparql_rewrite`'s module doc for the design
+    // and its documented residual gaps.
     //
-    // This is genuinely harder than the other two surfaces: named graphs
+    // This surface was genuinely harder than the other two: named graphs
     // in the semantic cache are per-*participant*, not per-*dataset*
     // (`rdf_store::oxigraph_backend`'s own module doc), while ODRL
     // policies are attached per-*dataset* - and an arbitrary caller-
     // supplied SELECT/ASK query may or may not even bind a variable to a
-    // dataset's subject IRI at all. The intended design (not yet
-    // implemented - these tests are the RED half of red/green TDD for it):
+    // dataset's subject IRI at all. The design actually shipped:
     //
     // 1. Compute the allow-list of dataset IRIs currently visible to the
     //    caller by running `odrl_filter::dataset_is_visible` over every
-    //    dataset in the cache - the same computation
-    //    `filter_catalogs_by_policy` already does for `GET /catalog`/the
-    //    management API, meant to be factored into one shared function
-    //    both call rather than duplicated.
-    // 2. Rewrite the incoming query to inject a restriction binding any
+    //    dataset in the cache (`visible_dataset_resource_iris`) - the
+    //    same computation `filter_catalogs_by_policy` already does for
+    //    `GET /catalog`/the management API, factored into a shared
+    //    `engine_claims_from_bearer` helper both paths call rather than
+    //    duplicated.
+    // 2. Rewrite the incoming query, at the level of its real parsed
+    //    SPARQL algebra (not its text - see `sparql_rewrite`'s own module
+    //    doc for why that distinction matters), to inject a
+    //    `FILTER(!BOUND(?x) || ?x IN (...))` restriction for every
     //    variable that appears as the subject of a `?x a dcat:Dataset`
-    //    triple pattern (or another dataset-shaped predicate this store
-    //    recognizes) to only that allow-list - e.g. a `VALUES ?x { ... }`
-    //    or `FILTER(?x IN (...))` clause.
-    // 3. A query with no such bindable variable at all - the store cannot
-    //    tell what the query is "about" at a dataset level, so there is
-    //    nothing to inject the restriction onto - is handled per
+    //    triple pattern and is still visible at the query's own top
+    //    scope.
+    // 3. A query with no such bindable variable anywhere in its own top
+    //    scope - the store cannot tell what the query is "about" at a
+    //    dataset level, so there is nothing to inject the restriction
+    //    onto - is handled per
     //    `PolicyFilterConfig::unscopeable_sparql_query_action`'s own
     //    conservative default ([`odrl_filter::UnscopeableSparqlQueryAction::Reject`]):
     //    `400 Bad Request`, not silently run unfiltered.
@@ -2772,8 +2875,7 @@ mod tests {
     // assertion below checks a policy-gated dataset's actual *absence*
     // from the parsed SPARQL JSON results, mirroring the REST-surface
     // negative-test discipline above - not merely that the response still
-    // parses. All of these are confirmed failing against today's (pre-
-    // wiring) `sparql_route`.
+    // parses.
 
     /// Same idea as `oauth2_sparql_state`, but seeded with a caller-
     /// supplied catalog (via `sparql_test_state()`'s real Oxigraph
@@ -2859,8 +2961,7 @@ mod tests {
             !dataset_iris.iter().any(|iri| iri.contains("GATED-DATASET")),
             "a SPARQL query that binds a dataset's subject IRI must not return one the caller's \
              claims don't entitle them to under its harvested ODRL policy, mirroring GET \
-             /catalog's own entitlement gate - real query-rewriting filtering for /sparql isn't \
-             wired yet, so this fails today. Got dataset IRIs: {dataset_iris:?}"
+             /catalog's own entitlement gate. Got dataset IRIs: {dataset_iris:?}"
         );
         assert!(
             dataset_iris.iter().any(|iri| iri.contains("OPEN-DATASET")),
@@ -2988,9 +3089,7 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "a query with no bindable dataset-subject variable must be rejected outright per \
              PolicyFilterConfig::unscopeable_sparql_query_action's default (Reject), not \
-             silently run unfiltered against the whole store - query-rewriting filtering for \
-             /sparql isn't wired yet, so this fails today (actual status: 200, carrying every \
-             harvested triple, gated dataset's included)"
+             silently run unfiltered against the whole store"
         );
     }
 }

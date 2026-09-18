@@ -6,26 +6,20 @@
 //! surfaces (`GET /catalog`, the management API, and SPARQL via real query
 //! rewriting).
 //!
-//! **Status.** Every function below has its real entitlement/mapping
-//! logic (the original RED-phase commit had every one of them `todo!()`,
-//! with only the real, final signatures in place - see that commit's own
-//! message for the design this fills in). This module's own
-//! `#[cfg(test)] mod tests` passes end to end, and `lib.rs` now calls
+//! **Status: closed on all three surfaces.** Every function below has its
+//! real entitlement/mapping logic (the original RED-phase commit had every
+//! one of them `todo!()`, with only the real, final signatures in place -
+//! see that commit's own message for the design this fills in). This
+//! module's own `#[cfg(test)] mod tests` passes end to end. `lib.rs` calls
 //! `dataset_is_visible` (via its own `filter_catalogs_by_policy` helper)
 //! from both `GET /catalog` and `POST /api/management/v4/catalogs/request`,
 //! per that file's "ODRL policy-based dataset visibility filtering" test
-//! section. Real query-rewriting filtering for `GET`/`POST /sparql` is
-//! still **not wired** - `sparql_route` does not yet call `dataset_is_visible`
-//! at all, so today every caller sees every harvested triple regardless of
-//! policy content, same as before this file existed. `lib.rs`'s own
-//! `tests` module has a "SPARQL ODRL policy-based filtering (gap analysis
-//! §3.4) - RED phase" section specifying the intended behavior (a
-//! bindable-dataset-IRI query hides a policy-gated dataset's triples from
-//! a disallowed caller; an unscopeable query - no dataset-subject-shaped
-//! variable anywhere in it - is rejected per
-//! [`PolicyFilterConfig::unscopeable_sparql_query_action`]'s default) -
-//! those tests fail today, intentionally; wiring them green is separate,
-//! later work.
+//! section, and via `visible_dataset_resource_iris` +
+//! `sparql_rewrite::restrict_to_visible_dataset_iris` from `sparql_route`,
+//! per that file's own "SPARQL ODRL policy-based filtering" test section -
+//! a real, if deliberately conservative (see `sparql_rewrite`'s own module
+//! doc for its documented residual gaps), query-rewriting filter, not a
+//! stub.
 //!
 //! ## Design: per-`(policy, action)` evaluation, OR'd across a dataset's
 //! own alternative offers

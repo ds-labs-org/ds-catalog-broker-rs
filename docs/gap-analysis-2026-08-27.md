@@ -175,27 +175,50 @@ based on policy (e.g. not listing a dataset a given internal caller isn't entitl
 is a genuinely open design question, not answered by this document — flag it for a
 real decision, don't guess at one here.
 
-**Status: preservation half in progress - parsing/model now closed, persistence not
-yet.** `catalog-core` has a real `Policy`/`Rule`/`Constraint` model
-(`Dataset.policies: Vec<Policy>`), and `Constraint` covers both the atomic
-`leftOperand`/`operator`/`rightOperand` shape and logical groups (`odrl:and`/`odrl:or`/
-`odrl:xone`/`odrl:andSequence`, via `Constraint::Logical`, nesting arbitrarily). `crawler`
-parses both shapes from a crawled participant's `odrl:hasPolicy` triples, the logical
-half recursively, bounded by a `MAX_CONSTRAINT_DEPTH` (64, deliberately matching
+**Status: closed - preservation and filtering both, end to end.** `catalog-core` has a
+real `Policy`/`Rule`/`Constraint` model (`Dataset.policies: Vec<Policy>`), and
+`Constraint` covers both the atomic `leftOperand`/`operator`/`rightOperand` shape and
+logical groups (`odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`, via
+`Constraint::Logical`, nesting arbitrarily). `crawler` parses both shapes from a crawled
+participant's `odrl:hasPolicy` triples, the logical half recursively, bounded by a
+`MAX_CONSTRAINT_DEPTH` (64, deliberately matching
 `ds-odrl-engine-rs::engine::constraint::MAX_CONSTRAINT_DEPTH`'s own bound and rationale)
 past which a pathologically deep group is skipped - with a `tracing::warn!`, not a crash,
 and not dropping the rest of the rule/policy - rather than growing the parser's call
 stack unboundedly. The earlier atomic-only scope cut on the crawler's own parsing is
-closed. `rdf-store`'s Oxigraph-backed semantic cache still only writes/reads the atomic
-shape (`crates/rdf-store/src/lib.rs`'s `write_constraint`/`load_constraint`): a `Logical`
-constraint the crawler now parses correctly in memory is currently silently *not*
-persisted when a catalog is upserted (`write_constraint` no-ops on
-`Constraint::Logical` rather than erroring) - so the management API's `hasPolicy` and
-the SPARQL surface do not yet reflect a harvested logical constraint at all. That gap
-must close before this section's "preserve faithfully" framing is true end to end. The
-*filtering* question this section raised — whether the broker should hide a dataset from
-a caller not entitled under its policy — remains open and unimplemented; nothing filters
-on policy content today.
+closed. `rdf-store`'s Oxigraph-backed semantic cache also writes/reads the logical shape
+now (`crates/rdf-store/src/lib.rs`'s `write_constraint`/`load_constraint`, persisting a
+`Logical` constraint via one blank-node subtree per nesting level, reconstructed on read
+via ordered, joined queries and `Term`-based pattern matching - deliberately *not* by
+re-embedding a printed blank node label into new SPARQL query text, a known correctness
+trap this same organization already hit once building a similar thing in
+`ds-sql-dps-rs`'s `config-graph/src/store.rs`) - so the management API's `hasPolicy` and
+the SPARQL surface both faithfully reflect a harvested logical constraint too. This
+section's "preserve faithfully" framing is now true end to end.
+
+The *filtering* question this section raised - whether the broker should hide a dataset
+from a caller not entitled under its policy - is answered yes, and implemented across
+all three serving surfaces: `crates/ds-catalog-broker-rs/src/odrl_filter.rs` bridges a
+harvested `Policy`/`Rule`/`Constraint` to `ds-odrl-engine-rs`'s own evaluation engine
+(`dataset_is_visible`, evaluated per-`(policy, action)` and OR'd across a dataset's
+alternative offers), driven by a new, explicit `PolicyFilterConfig` (env-var configured,
+conservative by default) rather than any hardcoded judgment call. `GET /catalog` and the
+management API apply it directly (`filter_catalogs_by_policy`); `GET`/`POST /sparql`
+applies it via real SPARQL query-rewriting
+(`crates/ds-catalog-broker-rs/src/sparql_rewrite.rs`) - parsing the caller's query into
+its real algebra (not scanning query text, the same known correctness trap noted above),
+finding every dataset-subject-shaped variable still visible at the query's own top
+scope, and injecting a `FILTER(!BOUND(?x) || ?x IN (...))` restriction per variable. That
+module's own doc comment documents its real, non-hypothetical residual gaps rather than
+claiming unconditional soundness: a dataset-subject variable that never escapes a
+subquery's or `GROUP BY`'s own projection is not scoped (the query is conservatively
+rejected as unscopeable, not silently run unfiltered); and a query mixing a recognized
+dataset-typing pattern in one branch with an unrelated, unrecognized pattern exposing
+other data in a sibling `UNION`/`OPTIONAL` branch is accepted as scopeable overall but
+does not restrict that sibling branch. A deployment with hard per-triple security
+requirements against arbitrary caller-supplied SPARQL should treat that endpoint as a
+coarser-grained capability (scoped to trusted tooling) rather than relying on this filter
+alone as a complete boundary.
 
 ### 3.5 Test-fixture impact: the DCP-gated crawl test
 

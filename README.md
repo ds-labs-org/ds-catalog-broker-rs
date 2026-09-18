@@ -38,10 +38,12 @@ Three serving surfaces, all non-DSP:
   real EDC Federated Catalog UI tooling
   (`edc-federated-catalog-client`'s `list_offers`/`get_offer_by_dataset_id`):
   a `QuerySpec`-shaped request, a `Vec<FederatedCatalogOffer>` response.
-  `hasPolicy` carries a crawled dataset's real ODRL policies (atomic
-  constraints only, see "Known gaps");
+  `hasPolicy` carries a crawled dataset's real ODRL policies, atomic and
+  nested logical constraints alike;
   `title`/`description`/`version`/`creator`/`thumbnail`/`keywords` are
-  populated whenever a crawled dataset carries them.
+  populated whenever a crawled dataset carries them. All three surfaces
+  filter what they re-serve against a caller's entitlement under a
+  harvested dataset's own ODRL policy — see "Known gaps".
 
 All three can be gated behind an **OAuth2 Bearer** resource-server check
 (JWT + JWKS) — opt-in via `OAUTH2_JWKS_URI`, unauthenticated by default,
@@ -58,7 +60,9 @@ Rust crates rather than Java SPI modules, echoing EDC's `crawler-spi` /
 
 - `catalog-core` — domain types: participant/node id, crawl work item,
   `Catalog`/`Dataset`/`DataService`, and a real ODRL `Policy`/`Rule`/
-  `Constraint` model (atomic constraints only).
+  `Constraint` model (atomic `leftOperand`/`operator`/`rightOperand`
+  constraints and nested `odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`
+  logical groups alike).
 - `rdf-store` — the semantic cache: `CatalogCache` trait, in-memory and
   Oxigraph-backed implementations. See ["The RDF backend"](#the-rdf-backend-semantic-cache).
 - `dcp-core` — DCP JWS sign/verify and `did:web` primitives, used by
@@ -113,14 +117,32 @@ end to end (see the "Known limitation" note in the module doc).
 ## Known gaps
 
 ODRL policies are preserved and propagated end to end — crawl, semantic
-cache, management API — but only *atomic* constraints
-(`leftOperand`/`operator`/`rightOperand`); nested logical-constraint
-groups (`odrl:and`/`odrl:or`/`odrl:xone`) aren't modeled, and a crawled
-constraint shaped that way is skipped rather than guessed at. Whether the
-broker should also *filter* what it re-serves based on policy (e.g. hide
-a dataset a given caller isn't entitled to) is a genuinely open design
-question this product does not currently answer — nothing filters on
-policy content today. See
+cache, management API, SPARQL — including nested logical-constraint
+groups (`odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`), not just
+atomic `leftOperand`/`operator`/`rightOperand` constraints. All three
+serving surfaces also *filter* what they re-serve against a caller's
+entitlement under a harvested dataset's own ODRL policy, evaluated via
+[`ds-odrl-engine-rs`](https://labs.deepthought-solutions.net/Deepthought-Solutions/ds-odrl-engine-rs)
+(`crates/ds-catalog-broker-rs/src/odrl_filter.rs`), driven by an explicit,
+env-var-configured `PolicyFilterConfig` rather than a hardcoded judgment
+call (unmappable-constraint handling, default visibility for
+policy-free/empty-permissions datasets, and — for `GET`/`POST /sparql`
+specifically — what to do with a query that cannot be scoped to a
+per-caller allow-list at all).
+
+`GET /catalog` and the management API filter directly; `GET`/`POST
+/sparql` does it via real SPARQL query-rewriting
+(`crates/ds-catalog-broker-rs/src/sparql_rewrite.rs`), which is
+deliberately conservative rather than unconditionally sound — see that
+module's own doc comment for its documented residual gaps (a
+dataset-subject variable that never escapes a subquery's or `GROUP BY`'s
+own projection is rejected as unscopeable rather than silently
+unfiltered; a query mixing a recognized dataset-typing pattern with an
+unrelated one under a different variable in a sibling `UNION`/`OPTIONAL`
+branch is not fully protected on that sibling branch). A deployment with
+hard per-triple security requirements against arbitrary caller-supplied
+SPARQL should treat that endpoint as a coarser-grained capability rather
+than relying on this filter alone. See
 [`docs/gap-analysis-2026-08-27.md`](docs/gap-analysis-2026-08-27.md) §3.4
 for history and the full punch list.
 

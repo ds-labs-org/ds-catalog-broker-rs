@@ -983,6 +983,22 @@ pub mod oxigraph_backend {
         ))
     }
 
+    /// The stable resource IRI a harvested dataset is stored under in this
+    /// store's semantic cache - the exact string a `?x a dcat:Dataset`
+    /// SPARQL binding for that dataset resolves to (see this module's own
+    /// doc comment, "Resource IRIs"). Exposed publicly (unlike the private
+    /// [`dataset_iri`] this wraps) so a caller layering per-caller ODRL
+    /// policy filtering on top of [`OxigraphCatalogCache::sparql_query_json`]
+    /// (gap analysis §3.4's SPARQL query-rewriting surface, in
+    /// `ds-catalog-broker-rs`) can compute the same allow-list of visible
+    /// dataset IRIs this store itself would produce, from the same
+    /// `NodeId`/dataset-id pairs `CatalogCache::query` already hands back,
+    /// without duplicating this module's own IRI-construction scheme (or
+    /// - worse - re-deriving it from a printed/re-parsed IRI string).
+    pub fn dataset_resource_iri(node: &NodeId, dataset_id: &str) -> String {
+        dataset_iri(&node_base(node), dataset_id).into_string()
+    }
+
     fn distribution_iri(node_base: &str, dataset_id: &str, index: usize) -> NamedNode {
         iri(format!(
             "{node_base}/datasets/{}/distributions/{index}",
