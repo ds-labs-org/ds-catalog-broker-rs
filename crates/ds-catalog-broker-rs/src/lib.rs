@@ -3092,4 +3092,113 @@ mod tests {
              silently run unfiltered against the whole store"
         );
     }
+
+    // --- SPARQL: query shapes the rewrite alone cannot scope -------------
+    //
+    // `sparql_rewrite` restricts only the variables it recognizes as a
+    // dataset subject (`?x a dcat:Dataset`). A sibling `UNION`/`OPTIONAL`
+    // branch that reads harvested triples through some *other* variable is
+    // not tied to that restriction at all, and `RunUnfiltered` skips the
+    // rewrite entirely. These tests pin down that a policy-gated dataset's
+    // triples stay hidden on those paths too.
+
+    /// Every binding value (IRI or literal) anywhere in a parsed
+    /// `application/sparql-results+json` body.
+    fn all_binding_values(parsed: &serde_json::Value) -> Vec<String> {
+        parsed["results"]["bindings"]
+            .as_array()
+            .expect("a SELECT response has a results.bindings array")
+            .iter()
+            .flat_map(|binding| {
+                binding
+                    .as_object()
+                    .expect("each binding is an object")
+                    .values()
+                    .map(|term| term["value"].as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Runs `query` unauthenticated (so filtering runs against an empty
+    /// claims map, per `PolicyFilterConfig`'s default) against the open +
+    /// gated catalog, with `policy_filter` applied, and returns every
+    /// binding value in the 200 response.
+    async fn unauthenticated_sparql_binding_values(
+        query: &str,
+        policy_filter: odrl_filter::PolicyFilterConfig,
+    ) -> Vec<String> {
+        let state = sparql_test_state().with_policy_filter(policy_filter);
+        state
+            .cache
+            .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))
+            .await
+            .unwrap();
+        let app = build_router(state);
+
+        let uri = format!("/sparql?query={}", urlencoding::encode(query));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "query: {query}");
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        all_binding_values(&parsed)
+    }
+
+    #[tokio::test]
+    async fn sparql_union_sibling_branch_does_not_leak_a_gated_datasets_triples() {
+        let values = unauthenticated_sparql_binding_values(
+            "PREFIX dcat: <http://www.w3.org/ns/dcat#> \
+             SELECT * WHERE { { ?x a dcat:Dataset } UNION { ?s ?p ?o } }",
+            odrl_filter::PolicyFilterConfig::default(),
+        )
+        .await;
+        assert!(
+            !values.iter().any(|v| v.contains("GATED-DATASET")),
+            "the `?s ?p ?o` UNION branch is not tied to the recognized `?x` dataset variable, \
+             but must still not expose a gated dataset's triples. Got: {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| v.contains("OPEN-DATASET")),
+            "the open dataset's triples must stay visible. Got: {values:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparql_optional_branch_does_not_leak_a_gated_datasets_triples() {
+        let values = unauthenticated_sparql_binding_values(
+            "PREFIX dcat: <http://www.w3.org/ns/dcat#> \
+             SELECT * WHERE { ?x a dcat:Dataset OPTIONAL { ?s ?p ?o } }",
+            odrl_filter::PolicyFilterConfig::default(),
+        )
+        .await;
+        assert!(
+            !values.iter().any(|v| v.contains("GATED-DATASET")),
+            "an OPTIONAL branch reading triples through an unrecognized variable must not \
+             expose a gated dataset's triples. Got: {values:?}"
+        );
+        assert!(values.iter().any(|v| v.contains("OPEN-DATASET")));
+    }
+
+    #[tokio::test]
+    async fn sparql_run_unfiltered_still_hides_a_gated_datasets_triples() {
+        let values = unauthenticated_sparql_binding_values(
+            "SELECT * WHERE { ?s ?p ?o }",
+            odrl_filter::PolicyFilterConfig {
+                unscopeable_sparql_query_action:
+                    odrl_filter::UnscopeableSparqlQueryAction::RunUnfiltered,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            !values.iter().any(|v| v.contains("GATED-DATASET")),
+            "RunUnfiltered skips the query rewrite, but a gated dataset's triples must still be \
+             hidden from a caller its policy does not entitle. Got: {values:?}"
+        );
+        assert!(values.iter().any(|v| v.contains("OPEN-DATASET")));
+    }
 }
