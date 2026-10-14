@@ -1,7 +1,7 @@
 //! ODRL policy-based dataset-visibility filtering - closes gap analysis
 //! §3.4's "nothing filters on policy content today" by bridging harvested
 //! `catalog_core::Policy` data to `ds-odrl-engine-rs`'s evaluation engine
-//! (the sibling `ds-odrl-engine-rs` submodule's `engine` crate) to decide
+//! (its `engine` crate, a pinned git dependency) to decide
 //! which harvested datasets a caller may see, across all three serving
 //! surfaces (`GET /catalog`, the management API, and SPARQL via real query
 //! rewriting).
@@ -118,7 +118,7 @@ pub enum UnmappableConstraintAction {
 ///
 /// **Default: [`Self::Open`]** - matching `ds-odrl-engine-rs`'s own
 /// documented `Behaviour::Open` rationale (`engine::profile::Behaviour`'s
-/// doc comment, in the sibling `ds-odrl-engine-rs` submodule): an
+/// doc comment): an
 /// `odrl:Offer` with no permissions at all is the *common* harvested-data
 /// case, not a denial - most real DSP catalogs advertise plenty of
 /// policy-free or empty-permissions datasets, and defaulting this to
@@ -805,6 +805,10 @@ fn build_request(
         policies: vec![wire_policy.clone()],
         claims: claims.clone(),
         asset_collections: Vec::new(),
+        // The engine's typed request `context` is unused here: the
+        // `dateTime` context value travels as a claim instead (see
+        // `with_context_claims`).
+        context: None,
     }
 }
 
