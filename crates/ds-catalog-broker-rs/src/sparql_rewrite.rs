@@ -103,22 +103,16 @@
 //!   grouped by something else) does not escape the `Group` node either,
 //!   for the same reason, and is rejected as unscopeable too.
 //! - **A query that reveals dataset data through a pattern this module
-//!   does not recognize as dataset-typing at all is not protected by the
-//!   fact that some *other* part of the same query happens to be
-//!   recognized.** For example, a query mixing a recognized
-//!   `?x a dcat:Dataset` pattern in one `UNION`/`OPTIONAL` branch with an
-//!   unrelated pattern exposing other harvested triples under a
-//!   *different* variable in a sibling branch is accepted as "scopeable"
-//!   (because `?x` was found), rewritten, and run - but the sibling
-//!   branch's own data is not restricted by this filter at all, since
-//!   nothing ties it to any dataset-subject variable this module
-//!   recognizes. This is the module's most significant residual gap:
-//!   soundness here is per-recognized-variable, not per-query. A
-//!   deployment with real concerns about this query shape should treat
-//!   `GET`/`POST /sparql` as a coarser-grained capability (behind a scope
-//!   only trusted internal tooling receives) rather than relying on this
-//!   filter alone as a hard per-triple security boundary against
-//!   arbitrary caller-supplied queries.
+//!   does not recognize as dataset-typing at all is not restricted by this
+//!   rewrite**, even when some *other* part of the same query is. For
+//!   example, a recognized `?x a dcat:Dataset` pattern in one
+//!   `UNION`/`OPTIONAL` branch next to a `?s ?p ?o` sibling branch: `?x` is
+//!   restricted, `?s` is not. This rewrite alone is sound per recognized
+//!   variable, not per query. `sparql_route` closes that gap underneath it
+//!   by evaluating every filtered query with the caller's hidden datasets
+//!   removed from the data
+//!   (`OxigraphCatalogCache::sparql_query_json_hiding`), so no query shape
+//!   can reach their triples whatever this module does or misses.
 //! - **`CONSTRUCT`/`DESCRIBE` are still rejected outright by
 //!   `sparql_query_json`** (`SparqlError::UnsupportedGraphResult`) after
 //!   this module runs, same as before this feature existed - this module

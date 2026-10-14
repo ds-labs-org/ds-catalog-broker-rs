@@ -368,7 +368,7 @@ fn should_filter_by_policy(state: &AppState) -> bool {
 /// layered with host-synthesized context claims - the one path every
 /// caller of `odrl_filter::dataset_is_visible` in this file goes through
 /// first, shared by [`filter_catalogs_by_policy`] (`GET /catalog`/the
-/// management API) and [`visible_dataset_resource_iris`] (`sparql_route`'s
+/// management API) and [`dataset_resource_iris_by_visibility`] (`sparql_route`'s
 /// own query-rewriting filtering) alike, so the two surfaces can never
 /// silently diverge on how a bearer token's claims get mapped.
 fn engine_claims_from_bearer(claims: Option<&serde_json::Value>) -> engine::Claims {
@@ -414,43 +414,44 @@ fn filter_catalogs_by_policy(
     }
 }
 
-/// The allow-list of dataset *resource IRIs* (exactly as
+/// Every harvested dataset's *resource IRI* (exactly as
 /// `rdf_store::oxigraph_backend::dataset_resource_iri` - and therefore a
-/// real `?x a dcat:Dataset` SPARQL binding - would spell them) the caller
-/// identified by `engine_claims` is entitled to see across every harvested
-/// `catalogs`, for [`CATALOG_VISIBILITY_ACTION`] - the same per-dataset
-/// decision [`filter_catalogs_by_policy`] already makes for
-/// `GET /catalog`/the management API, reused here for `sparql_route`'s own
-/// query-rewriting filtering (gap analysis §3.4,
-/// `sparql_rewrite::restrict_to_visible_dataset_iris`'s own allow-list
-/// input).
-fn visible_dataset_resource_iris(
+/// real `?x a dcat:Dataset` SPARQL binding - would spell it) across
+/// `catalogs`, split into the ones the caller identified by
+/// `engine_claims` is entitled to see for [`CATALOG_VISIBILITY_ACTION`]
+/// and the ones it is not - the same per-dataset decision
+/// [`filter_catalogs_by_policy`] already makes for `GET /catalog`/the
+/// management API, reused here for `sparql_route`. The visible set is the
+/// allow-list `sparql_rewrite::restrict_to_visible_dataset_iris` rewrites
+/// the query against; the hidden set is what
+/// `OxigraphCatalogCache::sparql_query_json_hiding` removes from the data
+/// the query runs over.
+fn dataset_resource_iris_by_visibility(
     catalogs: &[Catalog],
     engine_claims: &engine::Claims,
     state: &AppState,
-) -> BTreeSet<String> {
-    catalogs
-        .iter()
-        .flat_map(|catalog| {
-            catalog
-                .datasets
-                .iter()
-                .filter(move |dataset| {
-                    odrl_filter::dataset_is_visible(
-                        dataset,
-                        engine_claims,
-                        CATALOG_VISIBILITY_ACTION,
-                        &state.policy_filter,
-                    )
-                })
-                .map(move |dataset| {
-                    rdf_store::oxigraph_backend::dataset_resource_iri(
-                        &catalog.origin_node,
-                        &dataset.id,
-                    )
-                })
-        })
-        .collect()
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut visible = BTreeSet::new();
+    let mut hidden = BTreeSet::new();
+    for catalog in catalogs {
+        for dataset in &catalog.datasets {
+            let iri = rdf_store::oxigraph_backend::dataset_resource_iri(
+                &catalog.origin_node,
+                &dataset.id,
+            );
+            if odrl_filter::dataset_is_visible(
+                dataset,
+                engine_claims,
+                CATALOG_VISIBILITY_ACTION,
+                &state.policy_filter,
+            ) {
+                visible.insert(iri);
+            } else {
+                hidden.insert(iri);
+            }
+        }
+    }
+    (visible, hidden)
 }
 
 async fn get_catalog(
@@ -1046,7 +1047,7 @@ fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 /// - ODRL policy-based query-rewriting filtering (gap analysis §3.4,
 ///   `sparql_rewrite`) runs next, whenever [`should_filter_by_policy`] says
 ///   it should: the caller's own per-dataset allow-list is computed via
-///   [`visible_dataset_resource_iris`] (the same decision
+///   [`dataset_resource_iris_by_visibility`] (the same decision
 ///   `filter_catalogs_by_policy` already makes for `GET /catalog`/the
 ///   management API) and `query` is rewritten to restrict every
 ///   recognized dataset-subject variable to it
@@ -1060,6 +1061,13 @@ fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 ///   disabled and `PolicyFilterConfig::filter_when_oauth2_disabled` set to
 ///   `false`), `query` reaches evaluation completely unrewritten, exactly
 ///   as before this feature existed.
+/// - Whenever filtering runs, rewritten or `run_unfiltered` alike, the
+///   query is evaluated with every dataset the caller is not entitled to
+///   removed from the data it runs over
+///   (`OxigraphCatalogCache::sparql_query_json_hiding`). The rewrite only
+///   restricts variables it recognizes as a dataset subject, so this is
+///   what keeps a hidden dataset's triples out of every other query shape
+///   (a sibling `UNION`/`OPTIONAL` branch, a pattern on another variable).
 /// - Query fails to parse, fails to evaluate, or is a `CONSTRUCT`/
 ///   `DESCRIBE` (unsupported result shape - see `SparqlError`'s own doc
 ///   comments): 400 Bad Request with a plain-text explanation - these are
@@ -1115,7 +1123,7 @@ async fn sparql_route(
         }
     };
 
-    let query = if should_filter_by_policy(&state) {
+    let (query, hidden) = if should_filter_by_policy(&state) {
         let engine_claims = engine_claims_from_bearer(claims.as_ref());
         let catalogs = match state.cache.query(CatalogQuery::all()).await {
             Ok(catalogs) => catalogs,
@@ -1129,9 +1137,10 @@ async fn sparql_route(
                     .into_response();
             }
         };
-        let visible = visible_dataset_resource_iris(&catalogs, &engine_claims, &state);
+        let (visible, hidden) =
+            dataset_resource_iris_by_visibility(&catalogs, &engine_claims, &state);
 
-        match sparql_rewrite::restrict_to_visible_dataset_iris(&query, &visible) {
+        let query = match sparql_rewrite::restrict_to_visible_dataset_iris(&query, &visible) {
             Ok(rewritten) => rewritten,
             Err(sparql_rewrite::UnscopeableQuery) => {
                 match state.policy_filter.unscopeable_sparql_query_action {
@@ -1150,12 +1159,13 @@ async fn sparql_route(
                     odrl_filter::UnscopeableSparqlQueryAction::RunUnfiltered => query,
                 }
             }
-        }
+        };
+        (query, hidden)
     } else {
-        query
+        (query, BTreeSet::new())
     };
 
-    match sparql.sparql_query_json(&query) {
+    match sparql.sparql_query_json_hiding(&query, &hidden) {
         Ok(body) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, SPARQL_RESULTS_JSON)],
@@ -2835,7 +2845,7 @@ mod tests {
     //
     // The last of gap analysis §3.4's three serving surfaces: `GET`/
     // `POST /sparql` now calls `odrl_filter::dataset_is_visible` (via
-    // `visible_dataset_resource_iris`) and rewrites the caller's query
+    // `dataset_resource_iris_by_visibility`) and rewrites the caller's query
     // through `sparql_rewrite::restrict_to_visible_dataset_iris` before
     // ever evaluating it - see `sparql_route`'s own doc comment for the
     // exact behavior, and `sparql_rewrite`'s module doc for the design
@@ -2850,7 +2860,7 @@ mod tests {
     //
     // 1. Compute the allow-list of dataset IRIs currently visible to the
     //    caller by running `odrl_filter::dataset_is_visible` over every
-    //    dataset in the cache (`visible_dataset_resource_iris`) - the
+    //    dataset in the cache (`dataset_resource_iris_by_visibility`) - the
     //    same computation `filter_catalogs_by_policy` already does for
     //    `GET /catalog`/the management API, factored into a shared
     //    `engine_claims_from_bearer` helper both paths call rather than
