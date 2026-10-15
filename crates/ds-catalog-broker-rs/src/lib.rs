@@ -3138,12 +3138,23 @@ mod tests {
         query: &str,
         policy_filter: odrl_filter::PolicyFilterConfig,
     ) -> Vec<String> {
+        unauthenticated_sparql_binding_values_over(
+            catalog_with_open_and_gated_datasets("node-a", "cat-a"),
+            query,
+            policy_filter,
+        )
+        .await
+    }
+
+    /// [`unauthenticated_sparql_binding_values`] over a caller-supplied
+    /// catalog.
+    async fn unauthenticated_sparql_binding_values_over(
+        catalog: Catalog,
+        query: &str,
+        policy_filter: odrl_filter::PolicyFilterConfig,
+    ) -> Vec<String> {
         let state = sparql_test_state().with_policy_filter(policy_filter);
-        state
-            .cache
-            .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))
-            .await
-            .unwrap();
+        state.cache.upsert(catalog).await.unwrap();
         let app = build_router(state);
 
         let uri = format!("/sparql?query={}", urlencoding::encode(query));
@@ -3193,17 +3204,74 @@ mod tests {
         assert!(values.iter().any(|v| v.contains("OPEN-DATASET")));
     }
 
+    fn run_unfiltered() -> odrl_filter::PolicyFilterConfig {
+        odrl_filter::PolicyFilterConfig {
+            unscopeable_sparql_query_action:
+                odrl_filter::UnscopeableSparqlQueryAction::RunUnfiltered,
+            ..Default::default()
+        }
+    }
+
+    /// A data service only the gated dataset's distribution uses is that
+    /// dataset's data too: its endpoint URL names the gated partner.
     #[tokio::test]
-    async fn sparql_run_unfiltered_still_hides_a_gated_datasets_triples() {
-        let values = unauthenticated_sparql_binding_values(
+    async fn sparql_hides_a_data_service_only_a_gated_dataset_uses() {
+        let mut catalog = catalog_with_open_and_gated_datasets("node-a", "cat-a");
+        catalog.data_services.push(DataService {
+            id: "GATED-SVC".to_string(),
+            endpoint_url: "https://secret-partner.example/dsp".to_string(),
+            endpoint_description: Some("secret endpoint".to_string()),
+        });
+        let gated = catalog
+            .datasets
+            .iter_mut()
+            .find(|d| d.id == "GATED-DATASET")
+            .unwrap();
+        gated.distributions[0].access_service = "GATED-SVC".to_string();
+
+        let values = unauthenticated_sparql_binding_values_over(
+            catalog,
             "SELECT * WHERE { ?s ?p ?o }",
-            odrl_filter::PolicyFilterConfig {
-                unscopeable_sparql_query_action:
-                    odrl_filter::UnscopeableSparqlQueryAction::RunUnfiltered,
-                ..Default::default()
-            },
+            run_unfiltered(),
         )
         .await;
+        assert!(
+            !values
+                .iter()
+                .any(|v| v.contains("GATED-SVC") || v.contains("secret")),
+            "a data service referenced only by a hidden dataset must be hidden too. Got:              {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| v.contains("OPEN-DATASET-svc")),
+            "the open dataset's own service must stay visible. Got: {values:?}"
+        );
+    }
+
+    /// Visible datasets must not carry position numbers that leave gaps
+    /// where hidden datasets used to be.
+    #[tokio::test]
+    async fn sparql_does_not_reveal_hidden_datasets_through_position_gaps() {
+        let mut catalog = catalog_with_open_and_gated_datasets("node-a", "cat-a");
+        catalog.datasets.reverse();
+        assert_eq!(catalog.datasets[0].id, "GATED-DATASET");
+
+        let values = unauthenticated_sparql_binding_values_over(
+            catalog,
+            "SELECT ?x ?i WHERE { ?x a <http://www.w3.org/ns/dcat#Dataset> ;              <https://federated-catalog-rs.internal/ns#sequenceIndex> ?i }",
+            odrl_filter::PolicyFilterConfig::default(),
+        )
+        .await;
+        assert!(
+            !values.iter().any(|v| v == "1"),
+            "the open dataset's original position (1, after the hidden one) must not be              exposed. Got: {values:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparql_run_unfiltered_still_hides_a_gated_datasets_triples() {
+        let values =
+            unauthenticated_sparql_binding_values("SELECT * WHERE { ?s ?p ?o }", run_unfiltered())
+                .await;
         assert!(
             !values.iter().any(|v| v.contains("GATED-DATASET")),
             "RunUnfiltered skips the query rewrite, but a gated dataset's triples must still be \
