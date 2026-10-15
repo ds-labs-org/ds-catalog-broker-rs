@@ -647,10 +647,14 @@ pub mod oxigraph_backend {
     };
     use contreforts_kg::GraphError;
     use contreforts_kg::store::GraphStore;
-    use oxigraph::model::{Literal, NamedNode, NamedOrBlankNode, Quad, Term};
+    use oxigraph::model::{
+        GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Quad,
+        Term,
+    };
     use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
-    use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+    use oxigraph::sparql::{PreparedSparqlQuery, QueryResults, SparqlEvaluator};
     use oxigraph::store::StorageError;
+    use spareval::{InternalQuad, QueryableDataset};
     use std::collections::{BTreeMap, BTreeSet};
 
     const NODE_NS: &str = "https://federated-catalog-rs.internal/nodes/";
@@ -1011,6 +1015,14 @@ pub mod oxigraph_backend {
             "{node_base}/services/{}",
             urlencoding::encode(service_id)
         ))
+    }
+
+    /// The stable resource IRI a harvested data service is stored under -
+    /// the service counterpart of [`dataset_resource_iri`], for building
+    /// the allow-list [`OxigraphCatalogCache::sparql_query_json_restricted`]
+    /// takes.
+    pub fn service_resource_iri(node: &NodeId, service_id: &str) -> String {
+        service_iri(&node_base(node), service_id).into_string()
     }
 
     fn policy_iri(node_base: &str, dataset_id: &str, index: usize) -> NamedNode {
@@ -2023,12 +2035,19 @@ pub mod oxigraph_backend {
         /// - `CONSTRUCT`/`DESCRIBE` -> `Err(SparqlError::UnsupportedGraphResult)`,
         ///   see that variant's own doc comment.
         pub fn sparql_query_json(&self, query: &str) -> SparqlQueryResult<Vec<u8>> {
-            self.sparql_query_json_hiding(query, &BTreeSet::new())
+            let prepared = Self::prepare_sparql(query)?;
+            let results = prepared
+                .on_store(self.store.inner())
+                .execute()
+                .map_err(|err| SparqlError::Evaluation(err.to_string()))?;
+            serialize_sparql_results(results)
         }
 
-        /// [`Self::sparql_query_json`], evaluated as if every harvested
-        /// dataset in `hidden_dataset_iris` (each a
-        /// [`dataset_resource_iri`]) were not in the store at all.
+        /// [`Self::sparql_query_json`], evaluated over only the part of the
+        /// store a caller may see: every harvested dataset or data service
+        /// whose resource IRI ([`dataset_resource_iri`],
+        /// [`service_resource_iri`]) is not in `visible_resource_iris` is
+        /// treated as absent, along with everything minted under it.
         ///
         /// ## Why hide at the data level, not only in the query
         ///
@@ -2037,28 +2056,50 @@ pub mod oxigraph_backend {
         /// rewrite can only restrict the variables it recognizes as a
         /// dataset subject: a sibling `UNION`/`OPTIONAL` branch, or any
         /// triple pattern on another variable, can still read a hidden
-        /// dataset's triples. Hiding them from the data the query runs over
-        /// is sound for every query shape, because no pattern can match a
+        /// dataset's triples. Filtering the data the query runs over is
+        /// sound for every query shape, because no pattern can match a
         /// triple that is not there.
         ///
-        /// A quad is hidden when its subject or object is a hidden
-        /// dataset's IRI or any resource minted under it (distributions,
-        /// policies, rules, constraints - all `{dataset_iri}/...`, see
-        /// "Resource IRIs" above), so the catalog's own `dcat:dataset` link
-        /// to a hidden dataset disappears too. This store never mints blank
-        /// nodes, so every such resource is reachable by that prefix.
+        /// ## What is hidden
+        ///
+        /// A quad is dropped when its subject or object belongs to a
+        /// dataset or data service ([`owning_resource_iri`]) that is not in
+        /// `visible_resource_iris` - so the catalog's own `dcat:dataset` /
+        /// `dcat:service` links to it disappear too. This store never mints
+        /// blank nodes, so every such resource is reachable that way.
+        ///
+        /// - **An allow-list, not a deny-list.** A dataset or service
+        ///   harvested after the caller computed its allow-list (a crawl
+        ///   landing mid-request) is hidden, not leaked.
+        /// - **No position numbers.** Every `internal:sequenceIndex` quad is
+        ///   dropped: visible datasets would otherwise keep their original
+        ///   positions, and the gaps would show where hidden ones were.
         ///
         /// ## Cost
         ///
-        /// With nothing hidden this evaluates directly against the store.
-        /// Otherwise it copies every visible quad into a per-request
-        /// in-memory store first, so each such query costs time and memory
-        /// proportional to the whole cache, not just the query's matches.
-        pub fn sparql_query_json_hiding(
+        /// Nothing is copied: the query runs through oxigraph's own
+        /// evaluator over a [`VisibleDataset`] view of the live store,
+        /// which filters each triple-pattern lookup as it happens.
+        pub fn sparql_query_json_restricted(
             &self,
             query: &str,
-            hidden_dataset_iris: &BTreeSet<String>,
+            visible_resource_iris: &BTreeSet<String>,
         ) -> SparqlQueryResult<Vec<u8>> {
+            let prepared = Self::prepare_sparql(query)?;
+            let results = prepared
+                .on_queryable_dataset(VisibleDataset {
+                    store: self.store.inner(),
+                    visible_resource_iris,
+                })
+                .execute()
+                .map_err(|err| SparqlError::Evaluation(err.to_string()))?;
+            serialize_sparql_results(results)
+        }
+
+        /// Parses `query` (Query grammar only - see "Why this is inherently
+        /// read-only" on [`Self::sparql_query_json`]) and defaults its
+        /// dataset to the union of every named graph.
+        fn prepare_sparql(query: &str) -> SparqlQueryResult<PreparedSparqlQuery> {
             let mut prepared = SparqlEvaluator::new()
                 .parse_query(query)
                 .map_err(|err| SparqlError::Parse(err.to_string()))?;
@@ -2066,92 +2107,169 @@ pub mod oxigraph_backend {
             if prepared.dataset().is_default_dataset() {
                 prepared.dataset_mut().set_default_graph_as_union();
             }
+            Ok(prepared)
+        }
+    }
 
-            let visible_view;
-            let store = if hidden_dataset_iris.is_empty() {
-                self.store.inner()
-            } else {
-                visible_view = self.visible_view(hidden_dataset_iris)?;
-                &visible_view
+    fn serialize_sparql_results(results: QueryResults<'_>) -> SparqlQueryResult<Vec<u8>> {
+        let serializer = QueryResultsSerializer::from_format(QueryResultsFormat::Json);
+        match results {
+            QueryResults::Boolean(value) => serializer
+                .serialize_boolean_to_writer(Vec::new(), value)
+                .map_err(|err| SparqlError::Serialize(err.to_string())),
+            QueryResults::Solutions(solutions) => {
+                let variables = solutions.variables().to_vec();
+                let mut writer = serializer
+                    .serialize_solutions_to_writer(Vec::new(), variables)
+                    .map_err(|err| SparqlError::Serialize(err.to_string()))?;
+                for solution in solutions {
+                    let solution =
+                        solution.map_err(|err| SparqlError::Evaluation(err.to_string()))?;
+                    writer
+                        .serialize(&solution)
+                        .map_err(|err| SparqlError::Serialize(err.to_string()))?;
+                }
+                writer
+                    .finish()
+                    .map_err(|err| SparqlError::Serialize(err.to_string()))
+            }
+            QueryResults::Graph(_) => Err(SparqlError::UnsupportedGraphResult),
+        }
+    }
+
+    /// The harvested dataset or data service `iri` belongs to: `iri`
+    /// itself when it is a dataset or service IRI
+    /// (`{node_base}/datasets/{id}`, `{node_base}/services/{id}`), or that
+    /// IRI when `iri` was minted under it (`{node_base}/datasets/{id}/...`).
+    /// `None` for anything else. Node, dataset and service ids are
+    /// percent-encoded, so none of them can contain a literal `/`.
+    fn owning_resource_iri(iri: &str) -> Option<&str> {
+        let rest = iri.strip_prefix(NODE_NS)?;
+        let (node, tail) = rest.split_once('/')?;
+        let (kind, tail) = tail.split_once('/')?;
+        if kind != "datasets" && kind != "services" {
+            return None;
+        }
+        let id = tail.split('/').next()?;
+        if id.is_empty() {
+            return None;
+        }
+        Some(&iri[..NODE_NS.len() + node.len() + 1 + kind.len() + 1 + id.len()])
+    }
+
+    /// Whether a caller restricted to `visible_resource_iris` may see
+    /// `quad` - see [`OxigraphCatalogCache::sparql_query_json_restricted`].
+    fn quad_is_visible(quad: &Quad, visible_resource_iris: &BTreeSet<String>) -> bool {
+        if quad.predicate.as_str() == sequence_index_pred().as_str() {
+            return false;
+        }
+        let visible = |iri: &str| {
+            owning_resource_iri(iri).is_none_or(|owner| visible_resource_iris.contains(owner))
+        };
+        let subject_visible = match &quad.subject {
+            NamedOrBlankNode::NamedNode(node) => visible(node.as_str()),
+            NamedOrBlankNode::BlankNode(_) => true,
+        };
+        let object_visible = match &quad.object {
+            Term::NamedNode(node) => visible(node.as_str()),
+            _ => true,
+        };
+        subject_visible && object_visible
+    }
+
+    /// The live store, minus every quad [`quad_is_visible`] rejects, as a
+    /// dataset oxigraph's SPARQL evaluator can query directly. Terms are
+    /// passed through as plain [`Term`]s; `FROM`/`FROM NAMED` and the
+    /// default-graph-as-union setting are applied by the evaluator on top
+    /// of this view, exactly as for [`Store`](oxigraph::store::Store).
+    #[derive(Clone, Copy)]
+    struct VisibleDataset<'a> {
+        store: &'a oxigraph::store::Store,
+        visible_resource_iris: &'a BTreeSet<String>,
+    }
+
+    impl<'a> QueryableDataset<'a> for VisibleDataset<'a> {
+        type InternalTerm = Term;
+        type Error = StorageError;
+
+        fn internal_quads_for_pattern(
+            &self,
+            subject: Option<&Term>,
+            predicate: Option<&Term>,
+            object: Option<&Term>,
+            graph_name: Option<Option<&Term>>,
+        ) -> impl Iterator<Item = Result<InternalQuad<Term>, StorageError>> + use<'a> {
+            let Self {
+                store,
+                visible_resource_iris,
+            } = *self;
+
+            // A bound term that cannot appear in that position (a literal
+            // subject, a non-IRI predicate, a literal graph name) matches
+            // nothing.
+            let subject = match subject {
+                None => Some(None),
+                Some(Term::NamedNode(node)) => Some(Some(NamedOrBlankNodeRef::from(node))),
+                Some(Term::BlankNode(node)) => Some(Some(NamedOrBlankNodeRef::from(node))),
+                Some(_) => None,
+            };
+            let predicate = match predicate {
+                None => Some(None),
+                Some(Term::NamedNode(node)) => Some(Some(node.as_ref())),
+                Some(_) => None,
+            };
+            // `None` = any named graph (not the default one), per
+            // `QueryableDataset`'s contract.
+            let graph = match graph_name {
+                None => Some(None),
+                Some(None) => Some(Some(GraphNameRef::DefaultGraph)),
+                Some(Some(Term::NamedNode(node))) => Some(Some(GraphNameRef::from(node))),
+                Some(Some(Term::BlankNode(node))) => Some(Some(GraphNameRef::from(node))),
+                Some(Some(_)) => None,
+            };
+            let named_graphs_only = graph_name.is_none();
+
+            let quads = match (subject, predicate, graph) {
+                (Some(subject), Some(predicate), Some(graph)) => Some(store.quads_for_pattern(
+                    subject,
+                    predicate,
+                    object.map(Term::as_ref),
+                    graph,
+                )),
+                _ => None,
             };
 
-            let results = prepared
-                .on_store(store)
-                .execute()
-                .map_err(|err| SparqlError::Evaluation(err.to_string()))?;
-
-            let serializer = QueryResultsSerializer::from_format(QueryResultsFormat::Json);
-            match results {
-                QueryResults::Boolean(value) => serializer
-                    .serialize_boolean_to_writer(Vec::new(), value)
-                    .map_err(|err| SparqlError::Serialize(err.to_string())),
-                QueryResults::Solutions(solutions) => {
-                    let variables = solutions.variables().to_vec();
-                    let mut writer = serializer
-                        .serialize_solutions_to_writer(Vec::new(), variables)
-                        .map_err(|err| SparqlError::Serialize(err.to_string()))?;
-                    for solution in solutions {
-                        let solution =
-                            solution.map_err(|err| SparqlError::Evaluation(err.to_string()))?;
-                        writer
-                            .serialize(&solution)
-                            .map_err(|err| SparqlError::Serialize(err.to_string()))?;
-                    }
-                    writer
-                        .finish()
-                        .map_err(|err| SparqlError::Serialize(err.to_string()))
+            quads.into_iter().flatten().filter_map(move |quad| {
+                let quad = match quad {
+                    Ok(quad) => quad,
+                    Err(err) => return Some(Err(err)),
+                };
+                if named_graphs_only && quad.graph_name.is_default_graph() {
+                    return None;
                 }
-                QueryResults::Graph(_) => Err(SparqlError::UnsupportedGraphResult),
-            }
+                if !quad_is_visible(&quad, visible_resource_iris) {
+                    return None;
+                }
+                Some(Ok(InternalQuad {
+                    subject: quad.subject.into(),
+                    predicate: quad.predicate.into(),
+                    object: quad.object,
+                    graph_name: match quad.graph_name {
+                        GraphName::DefaultGraph => None,
+                        GraphName::NamedNode(node) => Some(node.into()),
+                        GraphName::BlankNode(node) => Some(node.into()),
+                    },
+                }))
+            })
         }
 
-        /// An in-memory copy of this store minus every quad
-        /// [`hides_quad`] drops for `hidden_dataset_iris` - see
-        /// [`Self::sparql_query_json_hiding`].
-        fn visible_view(
-            &self,
-            hidden_dataset_iris: &BTreeSet<String>,
-        ) -> SparqlQueryResult<oxigraph::store::Store> {
-            let evaluation = |err: StorageError| SparqlError::Evaluation(err.to_string());
-            let view = oxigraph::store::Store::new().map_err(evaluation)?;
-            for quad in self.store.inner().iter() {
-                let quad = quad.map_err(evaluation)?;
-                if !hides_quad(&quad, hidden_dataset_iris) {
-                    view.insert(&quad).map_err(evaluation)?;
-                }
-            }
-            Ok(view)
+        fn internalize_term(&self, term: Term) -> Result<Term, StorageError> {
+            Ok(term)
         }
-    }
 
-    /// The harvested dataset `iri` belongs to: `iri` itself when it is a
-    /// dataset IRI (`{node_base}/datasets/{id}`), or that dataset IRI when
-    /// `iri` was minted under it (`{node_base}/datasets/{id}/...`). `None`
-    /// for anything else. Node and dataset ids are percent-encoded, so
-    /// neither can contain a literal `/`.
-    fn owning_dataset_iri(iri: &str) -> Option<&str> {
-        const SEGMENT: &str = "/datasets/";
-        let rest = iri.strip_prefix(NODE_NS)?;
-        let id_start = rest.find(SEGMENT)? + SEGMENT.len();
-        let id_end = rest[id_start..]
-            .find('/')
-            .map_or(rest.len(), |offset| id_start + offset);
-        Some(&iri[..NODE_NS.len() + id_end])
-    }
-
-    fn hides_quad(quad: &Quad, hidden_dataset_iris: &BTreeSet<String>) -> bool {
-        let hidden = |iri: &str| {
-            owning_dataset_iri(iri).is_some_and(|dataset| hidden_dataset_iris.contains(dataset))
-        };
-        let subject_hidden = match &quad.subject {
-            NamedOrBlankNode::NamedNode(node) => hidden(node.as_str()),
-            NamedOrBlankNode::BlankNode(_) => false,
-        };
-        let object_hidden = match &quad.object {
-            Term::NamedNode(node) => hidden(node.as_str()),
-            _ => false,
-        };
-        subject_hidden || object_hidden
+        fn externalize_term(&self, term: Term) -> Result<Term, StorageError> {
+            Ok(term)
+        }
     }
 
     #[async_trait]
@@ -2956,7 +3074,7 @@ pub mod oxigraph_backend {
             assert!(matches!(outcome, Err(SparqlError::Parse(_))));
         }
 
-        // --- `sparql_query_json_hiding` ---------------------------------------
+        // --- `sparql_query_json_restricted` -----------------------------------
 
         /// Every binding value (IRI or literal) of a `SELECT` result body.
         fn binding_values(bytes: &[u8]) -> Vec<String> {
@@ -2977,9 +3095,10 @@ pub mod oxigraph_backend {
         }
 
         #[test]
-        fn owning_dataset_iri_maps_every_resource_minted_under_a_dataset_to_it() {
-            let node = NodeId::new("node-a");
+        fn owning_resource_iri_maps_every_resource_minted_under_a_dataset_or_service_to_it() {
+            let node = NodeId::new("node/a");
             let dataset = dataset_resource_iri(&node, "ds/1");
+            let service = service_resource_iri(&node, "svc/1");
             let base = node_base(&node);
             let policy = policy_iri(&base, "ds/1", 0);
             let rule = rule_iri(policy.as_str(), "permissions", 0);
@@ -2989,26 +3108,28 @@ pub mod oxigraph_backend {
                 policy.as_str().to_string(),
                 constraint_iri(rule.as_str(), 0).into_string(),
             ] {
-                assert_eq!(owning_dataset_iri(&iri), Some(dataset.as_str()), "{iri}");
+                assert_eq!(owning_resource_iri(&iri), Some(dataset.as_str()), "{iri}");
             }
+            assert_eq!(owning_resource_iri(&service), Some(service.as_str()));
             for iri in [
                 node_iri(&node).into_string(),
-                catalog_iri(&base, "cat-a").into_string(),
-                service_iri(&base, "svc-1").into_string(),
+                catalog_iri(&base, "cat/datasets/x").into_string(),
+                format!("{base}/datasets/"),
                 "http://www.w3.org/ns/dcat#Dataset".to_string(),
             ] {
-                assert_eq!(owning_dataset_iri(&iri), None, "{iri}");
+                assert_eq!(owning_resource_iri(&iri), None, "{iri}");
             }
         }
 
-        /// A hidden dataset's own triples, every resource minted under it
-        /// (distributions, policies, rules), and the catalog's link to it
-        /// must all be unreachable - even by `?s ?p ?o`, which no query
-        /// rewrite could scope. Everything else must stay, including a
-        /// dataset whose id merely starts with the hidden one's and a
-        /// same-id dataset harvested from another participant.
+        /// Everything not on the allow-list is unreachable, even by
+        /// `?s ?p ?o`, which no query rewrite could scope: a hidden
+        /// dataset's own triples, every resource minted under it, the
+        /// catalog's link to it, a data service not on the list, and a
+        /// dataset harvested after the allow-list was computed. Everything
+        /// on it stays, including a same-id dataset from another
+        /// participant.
         #[tokio::test]
-        async fn sparql_query_json_hiding_removes_a_hidden_datasets_triples_only() {
+        async fn sparql_query_json_restricted_shows_only_allow_listed_resources() {
             let cache = cache();
             let mut catalog = rich_catalog();
             catalog.datasets.push(Dataset {
@@ -3027,42 +3148,146 @@ pub mod oxigraph_backend {
             });
             cache.upsert(other).await.unwrap();
 
-            let hidden_iri = dataset_resource_iri(&NodeId::new("node-rich"), "ds-1");
-            let hidden = BTreeSet::from([hidden_iri.clone()]);
+            let rich = NodeId::new("node-rich");
+            let hidden_dataset = dataset_resource_iri(&rich, "ds-1");
+            let hidden_service = service_resource_iri(&rich, "svc-1");
+            let visible = BTreeSet::from([
+                dataset_resource_iri(&rich, "ds-2"),
+                dataset_resource_iri(&rich, "ds-10"),
+                service_resource_iri(&rich, "svc-2"),
+                dataset_resource_iri(&NodeId::new("node-other"), "ds-1"),
+            ]);
+
+            // Harvested after `visible` was computed, so not on it.
+            let mut late = Catalog::new("cat-late", NodeId::new("node-late"));
+            late.datasets.push(Dataset {
+                id: "late-ds".to_string(),
+                properties: BTreeMap::new(),
+                distributions: vec![],
+                policies: Vec::new(),
+            });
+            cache.upsert(late).await.unwrap();
+
             let bytes = cache
-                .sparql_query_json_hiding("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", &hidden)
+                .sparql_query_json_restricted("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", &visible)
                 .unwrap();
             let values = binding_values(&bytes);
 
-            assert!(
-                !values
-                    .iter()
-                    .any(|v| v == &hidden_iri || v.starts_with(&format!("{hidden_iri}/"))),
-                "no triple may mention the hidden dataset or anything minted under it. Got:                  {values:?}"
-            );
+            for hidden in [&hidden_dataset, &hidden_service] {
+                assert!(
+                    !values
+                        .iter()
+                        .any(|v| v == hidden || v.starts_with(&format!("{hidden}/"))),
+                    "no triple may mention {hidden} or anything minted under it. Got: {values:?}"
+                );
+            }
             assert!(
                 !values.iter().any(|v| v == "data.rest"),
                 "the hidden dataset's own literal properties must not be reachable"
             );
-            for still_visible in [
-                dataset_resource_iri(&NodeId::new("node-rich"), "ds-2"),
-                dataset_resource_iri(&NodeId::new("node-rich"), "ds-10"),
-                dataset_resource_iri(&NodeId::new("node-other"), "ds-1"),
-            ] {
+            assert!(
+                !values.iter().any(|v| v.contains("late-ds")),
+                "a dataset harvested after the allow-list was computed must stay hidden"
+            );
+            assert!(
+                !values.iter().any(|v| v.ends_with("#sequenceIndex")),
+                "position numbers must not be exposed"
+            );
+            for still_visible in &visible {
                 assert!(
-                    values.contains(&still_visible),
+                    values.contains(still_visible),
                     "{still_visible} must stay visible. Got: {values:?}"
                 );
             }
 
-            let unhidden = binding_values(
+            let unrestricted = binding_values(
                 &cache
                     .sparql_query_json("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
                     .unwrap(),
             );
             assert!(
-                unhidden.contains(&hidden_iri),
-                "without hiding, the same query must still see every dataset"
+                unrestricted.contains(&hidden_dataset),
+                "without restriction, the same query must still see every dataset"
+            );
+        }
+
+        /// The view must behave like the store for the query shapes that
+        /// depend on graph handling and aggregation: `GRAPH ?g`, `FROM`,
+        /// `ASK` and `COUNT`.
+        #[tokio::test]
+        async fn sparql_query_json_restricted_supports_graph_from_ask_and_count() {
+            let cache = cache();
+            cache.upsert(rich_catalog()).await.unwrap();
+            let rich = NodeId::new("node-rich");
+            let visible = BTreeSet::from([
+                dataset_resource_iri(&rich, "ds-2"),
+                service_resource_iri(&rich, "svc-2"),
+            ]);
+            let graph = node_iri(&rich).into_string();
+            let dataset_count = |bytes: &[u8]| -> String {
+                let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                parsed["results"]["bindings"][0]["n"]["value"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+
+            let count_query = format!(
+                "PREFIX dcat: <{DCAT_NS}> \
+                 SELECT (COUNT(*) AS ?n) WHERE {{ ?d a dcat:Dataset }}"
+            );
+            assert_eq!(
+                dataset_count(&cache.sparql_query_json(&count_query).unwrap()),
+                "2"
+            );
+            assert_eq!(
+                dataset_count(
+                    &cache
+                        .sparql_query_json_restricted(&count_query, &visible)
+                        .unwrap()
+                ),
+                "1",
+                "COUNT must not count hidden datasets"
+            );
+
+            let graph_query = format!(
+                "PREFIX dcat: <{DCAT_NS}> \
+                 SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH ?g {{ ?d a dcat:Dataset }} }}"
+            );
+            assert_eq!(
+                dataset_count(
+                    &cache
+                        .sparql_query_json_restricted(&graph_query, &visible)
+                        .unwrap()
+                ),
+                "1"
+            );
+
+            let from_query = format!(
+                "PREFIX dcat: <{DCAT_NS}> \
+                 SELECT (COUNT(*) AS ?n) FROM <{graph}> WHERE {{ ?d a dcat:Dataset }}"
+            );
+            assert_eq!(
+                dataset_count(
+                    &cache
+                        .sparql_query_json_restricted(&from_query, &visible)
+                        .unwrap()
+                ),
+                "1"
+            );
+
+            let hidden = dataset_resource_iri(&rich, "ds-1");
+            let ask = |query: &str| -> serde_json::Value {
+                let bytes = cache.sparql_query_json_restricted(query, &visible).unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["boolean"].clone()
+            };
+            assert_eq!(ask(&format!("ASK {{ <{hidden}> ?p ?o }}")), false);
+            assert_eq!(
+                ask(&format!(
+                    "ASK {{ <{}> ?p ?o }}",
+                    dataset_resource_iri(&rich, "ds-2")
+                )),
+                true
             );
         }
     }

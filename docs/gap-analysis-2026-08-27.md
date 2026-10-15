@@ -215,10 +215,9 @@ subquery's or `GROUP BY`'s own projection is not scoped (the query is conservati
 rejected as unscopeable, not silently run unfiltered); and the rewrite does not restrict
 a sibling `UNION`/`OPTIONAL` branch that reads data through an unrecognized variable.
 That second gap is closed underneath the rewrite: every filtered `/sparql` query is
-evaluated with the caller's hidden datasets removed from the data it runs over
-(`OxigraphCatalogCache::sparql_query_json_hiding` in `rdf-store`), so no query shape can
-reach a hidden dataset's triples. Its cost is a per-request copy of the visible part of
-the store whenever anything is hidden.
+evaluated over a no-copy view of the store holding only the datasets the caller may see
+and the data services they use (`OxigraphCatalogCache::sparql_query_json_restricted` in
+`rdf-store`), so no query shape can reach a hidden dataset's triples.
 
 ### 3.5 Test-fixture impact: the DCP-gated crawl test
 

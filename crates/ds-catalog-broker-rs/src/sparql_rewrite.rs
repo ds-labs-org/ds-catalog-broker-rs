@@ -109,10 +109,10 @@
 //!   `UNION`/`OPTIONAL` branch next to a `?s ?p ?o` sibling branch: `?x` is
 //!   restricted, `?s` is not. This rewrite alone is sound per recognized
 //!   variable, not per query. `sparql_route` closes that gap underneath it
-//!   by evaluating every filtered query with the caller's hidden datasets
-//!   removed from the data
-//!   (`OxigraphCatalogCache::sparql_query_json_hiding`), so no query shape
-//!   can reach their triples whatever this module does or misses.
+//!   by evaluating every filtered query over only the datasets and data
+//!   services the caller may see
+//!   (`OxigraphCatalogCache::sparql_query_json_restricted`), so no query
+//!   shape can reach hidden ones whatever this module does or misses.
 //! - **`CONSTRUCT`/`DESCRIBE` are still rejected outright by
 //!   `sparql_query_json`** (`SparqlError::UnsupportedGraphResult`) after
 //!   this module runs, same as before this feature existed - this module

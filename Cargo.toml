@@ -87,7 +87,15 @@ jsonwebtoken = "9"
 # still re-enables `oxigraph/rocksdb` unless rdf-store's own dependency on
 # contreforts-kg is built with `--no-default-features` - see rdf-store's
 # Cargo.toml for which one this project actually uses.
-oxigraph = { version = "0.5", default-features = false }
+# Pinned exactly so `spareval` below always matches the copy oxigraph
+# itself uses (Cargo.lock is not committed).
+oxigraph = { version = "=0.5.11", default-features = false }
+# The SPARQL evaluator oxigraph 0.5.11 pins (`spareval = "=0.2.7"`). Used
+# only for its `QueryableDataset` trait, so rdf-store can evaluate a
+# per-caller ODRL-filtered view of the store through oxigraph's own
+# `on_queryable_dataset` without copying it. It must be the exact version
+# oxigraph uses, or the trait would be a different type.
+spareval = { version = "=0.2.7", default-features = false }
 # The exact SPARQL algebra parser oxigraph 0.5.10 itself depends on
 # (oxigraph's own Cargo.toml pins `spargebra = "=0.4.7"` with these same
 # two features) - used directly by ds-catalog-broker-rs to parse a

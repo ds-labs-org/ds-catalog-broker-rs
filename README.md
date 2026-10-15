@@ -131,16 +131,16 @@ specifically — what to do with a query that cannot be scoped to a
 per-caller allow-list at all).
 
 `GET /catalog` and the management API filter directly. `GET`/`POST
-/sparql` evaluates every filtered query against the store with the
-caller's hidden datasets removed (their triples, everything minted under
-their IRIs, and the catalog's links to them), so no query shape can reach
-them. It also rewrites the query
+/sparql` evaluates every filtered query over a view of the store that
+contains only the datasets the caller may see and the data services they
+use, filtering each lookup as it happens rather than copying anything.
+Hidden datasets' triples, everything minted under their IRIs, the
+catalog's links to them, services only they use, and the internal
+position numbers that would reveal gaps are all absent, so no query shape
+can reach them. It also rewrites the query
 (`crates/ds-catalog-broker-rs/src/sparql_rewrite.rs`) to restrict
 recognized dataset-subject variables, and by default rejects a query with
-no such variable as unscopeable. Hiding copies the visible part of the
-store into a per-request in-memory store whenever anything is hidden, so
-the cost of a filtered `/sparql` query grows with the size of the whole
-cache. See
+no such variable as unscopeable. See
 [`docs/gap-analysis-2026-08-27.md`](docs/gap-analysis-2026-08-27.md) §3.4
 for history and the full punch list.
 
