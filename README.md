@@ -140,7 +140,9 @@ position numbers that would reveal gaps are all absent, so no query shape
 can reach them. It also rewrites the query
 (`crates/ds-catalog-broker-rs/src/sparql_rewrite.rs`) to restrict
 recognized dataset-subject variables, and by default rejects a query with
-no such variable as unscopeable. See
+no such variable as unscopeable. `GET /catalog` likewise omits data
+services only hidden datasets use; the management API keeps them, since
+its offers are built around a catalog's service. See
 [`docs/gap-analysis-2026-08-27.md`](docs/gap-analysis-2026-08-27.md) §3.4
 for history and the full punch list.
 
