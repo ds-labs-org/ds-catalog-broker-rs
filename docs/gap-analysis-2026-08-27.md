@@ -212,13 +212,12 @@ scope, and injecting a `FILTER(!BOUND(?x) || ?x IN (...))` restriction per varia
 module's own doc comment documents its real, non-hypothetical residual gaps rather than
 claiming unconditional soundness: a dataset-subject variable that never escapes a
 subquery's or `GROUP BY`'s own projection is not scoped (the query is conservatively
-rejected as unscopeable, not silently run unfiltered); and a query mixing a recognized
-dataset-typing pattern in one branch with an unrelated, unrecognized pattern exposing
-other data in a sibling `UNION`/`OPTIONAL` branch is accepted as scopeable overall but
-does not restrict that sibling branch. A deployment with hard per-triple security
-requirements against arbitrary caller-supplied SPARQL should treat that endpoint as a
-coarser-grained capability (scoped to trusted tooling) rather than relying on this filter
-alone as a complete boundary.
+rejected as unscopeable, not silently run unfiltered); and the rewrite does not restrict
+a sibling `UNION`/`OPTIONAL` branch that reads data through an unrecognized variable.
+That second gap is closed underneath the rewrite: every filtered `/sparql` query is
+evaluated over a no-copy view of the store holding only the datasets the caller may see
+and the data services they use (`OxigraphCatalogCache::sparql_query_json_restricted` in
+`rdf-store`), so no query shape can reach a hidden dataset's triples.
 
 ### 3.5 Test-fixture impact: the DCP-gated crawl test
 

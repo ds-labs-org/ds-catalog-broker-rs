@@ -130,19 +130,19 @@ policy-free/empty-permissions datasets, and — for `GET`/`POST /sparql`
 specifically — what to do with a query that cannot be scoped to a
 per-caller allow-list at all).
 
-`GET /catalog` and the management API filter directly; `GET`/`POST
-/sparql` does it via real SPARQL query-rewriting
-(`crates/ds-catalog-broker-rs/src/sparql_rewrite.rs`), which is
-deliberately conservative rather than unconditionally sound — see that
-module's own doc comment for its documented residual gaps (a
-dataset-subject variable that never escapes a subquery's or `GROUP BY`'s
-own projection is rejected as unscopeable rather than silently
-unfiltered; a query mixing a recognized dataset-typing pattern with an
-unrelated one under a different variable in a sibling `UNION`/`OPTIONAL`
-branch is not fully protected on that sibling branch). A deployment with
-hard per-triple security requirements against arbitrary caller-supplied
-SPARQL should treat that endpoint as a coarser-grained capability rather
-than relying on this filter alone. See
+`GET /catalog` and the management API filter directly. `GET`/`POST
+/sparql` evaluates every filtered query over a view of the store that
+contains only the datasets the caller may see and the data services they
+use, filtering each lookup as it happens rather than copying anything.
+Hidden datasets' triples, everything minted under their IRIs, the
+catalog's links to them, services only they use, and the internal
+position numbers that would reveal gaps are all absent, so no query shape
+can reach them. It also rewrites the query
+(`crates/ds-catalog-broker-rs/src/sparql_rewrite.rs`) to restrict
+recognized dataset-subject variables, and by default rejects a query with
+no such variable as unscopeable. `GET /catalog` likewise omits data
+services only hidden datasets use; the management API keeps them, since
+its offers are built around a catalog's service. See
 [`docs/gap-analysis-2026-08-27.md`](docs/gap-analysis-2026-08-27.md) §3.4
 for history and the full punch list.
 

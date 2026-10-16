@@ -14,7 +14,7 @@
 //! `dataset_is_visible` (via its own `filter_catalogs_by_policy` helper)
 //! from both `GET /catalog` and `POST /api/management/v4/catalogs/request`,
 //! per that file's "ODRL policy-based dataset visibility filtering" test
-//! section, and via `visible_dataset_resource_iris` +
+//! section, and via `visible_resource_iris` +
 //! `sparql_rewrite::restrict_to_visible_dataset_iris` from `sparql_route`,
 //! per that file's own "SPARQL ODRL policy-based filtering" test section -
 //! a real, if deliberately conservative (see `sparql_rewrite`'s own module
