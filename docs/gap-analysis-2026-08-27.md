@@ -203,21 +203,14 @@ harvested `Policy`/`Rule`/`Constraint` to `ds-odrl-engine-rs`'s own evaluation e
 (`dataset_is_visible`, evaluated per-`(policy, action)` and OR'd across a dataset's
 alternative offers), driven by a new, explicit `PolicyFilterConfig` (env-var configured,
 conservative by default) rather than any hardcoded judgment call. `GET /catalog` and the
-management API apply it directly (`filter_catalogs_by_policy`); `GET`/`POST /sparql`
-applies it via real SPARQL query-rewriting
-(`crates/ds-catalog-broker-rs/src/sparql_rewrite.rs`) - parsing the caller's query into
-its real algebra (not scanning query text, the same known correctness trap noted above),
-finding every dataset-subject-shaped variable still visible at the query's own top
-scope, and injecting a `FILTER(!BOUND(?x) || ?x IN (...))` restriction per variable. That
-module's own doc comment documents its real, non-hypothetical residual gaps rather than
-claiming unconditional soundness: a dataset-subject variable that never escapes a
-subquery's or `GROUP BY`'s own projection is not scoped (the query is conservatively
-rejected as unscopeable, not silently run unfiltered); and the rewrite does not restrict
-a sibling `UNION`/`OPTIONAL` branch that reads data through an unrecognized variable.
-That second gap is closed underneath the rewrite: every filtered `/sparql` query is
-evaluated over a no-copy view of the store holding only the datasets the caller may see
-and the data services they use (`OxigraphCatalogCache::sparql_query_json_restricted` in
-`rdf-store`), so no query shape can reach a hidden dataset's triples.
+management API apply it directly (`filter_catalogs_by_policy`). `GET`/`POST /sparql`
+evaluates every filtered query over a no-copy view of the store holding only the datasets
+the caller may see and the data services they use
+(`OxigraphCatalogCache::sparql_query_json_restricted` in `rdf-store`), so no query shape
+can reach a hidden dataset's triples and every query shape is answered. An earlier
+version also rewrote the caller's query to restrict `?x a dcat:Dataset` variables and
+rejected queries with no such variable; that rewriter was removed once the restricted
+view made it redundant.
 
 ### 3.5 Test-fixture impact: the DCP-gated crawl test
 
