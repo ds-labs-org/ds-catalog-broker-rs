@@ -3140,42 +3140,25 @@ mod tests {
         assert!(dataset_iris.iter().any(|iri| iri.contains("OPEN-DATASET")));
     }
 
-    /// A query with no dataset-subject-shaped variable anywhere in it -
-    /// `?s`/`?p`/`?o` here are each unconstrained, no `?x a dcat:Dataset`
-    /// triple pattern ties any of them to a dataset's subject position -
-    /// so there is no allow-list variable for query-rewriting filtering to
-    /// restrict. This query would, if ever run unfiltered, return every
-    /// harvested triple in the store including the gated dataset's own -
-    /// exactly the silent-over-permission risk
-    /// `UnscopeableSparqlQueryAction::Reject`'s default guards against.
+    /// A query with no dataset-subject-shaped variable anywhere in it
+    /// (`?s ?p ?o`, nothing ties any of them to a dataset) is answered,
+    /// not rejected, under the default config: it is evaluated over only
+    /// the datasets and data services the caller may see, so the gated
+    /// dataset's triples stay out of it.
     #[tokio::test]
-    async fn sparql_rejects_an_unscopeable_query_by_default_rather_than_running_it_unfiltered() {
-        let state = sparql_test_state();
-        state
-            .cache
-            .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))
-            .await
-            .unwrap();
-        assert_eq!(
-            state.policy_filter.unscopeable_sparql_query_action,
-            odrl_filter::UnscopeableSparqlQueryAction::Reject,
-            "this test exercises the default; update it if the default ever changes"
+    async fn sparql_answers_a_query_with_no_dataset_variable_over_only_visible_datasets() {
+        let values = unauthenticated_sparql_binding_values(
+            "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+            odrl_filter::PolicyFilterConfig::default(),
+        )
+        .await;
+        assert!(
+            !values.iter().any(|v| v.contains("GATED-DATASET")),
+            "a gated dataset's triples must stay hidden. Got: {values:?}"
         );
-        let app = build_router(state);
-
-        let query = "SELECT ?s ?p ?o WHERE { ?s ?p ?o }";
-        let uri = format!("/sparql?query={}", urlencoding::encode(query));
-        let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "a query with no bindable dataset-subject variable must be rejected outright per \
-             PolicyFilterConfig::unscopeable_sparql_query_action's default (Reject), not \
-             silently run unfiltered against the whole store"
+        assert!(
+            values.iter().any(|v| v.contains("OPEN-DATASET")),
+            "the open dataset's triples must be returned. Got: {values:?}"
         );
     }
 
