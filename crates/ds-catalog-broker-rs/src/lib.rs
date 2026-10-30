@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 pub mod oauth2;
 pub mod odrl_filter;
-pub mod sparql_rewrite;
 
 use axum::{
     Form, Json, Router,
@@ -369,7 +368,7 @@ fn should_filter_by_policy(state: &AppState) -> bool {
 /// caller of `odrl_filter::dataset_is_visible` in this file goes through
 /// first, shared by [`filter_catalogs_by_policy`] (`GET /catalog`/the
 /// management API) and [`visible_resource_iris`] (`sparql_route`'s
-/// own query-rewriting filtering) alike, so the two surfaces can never
+/// own filtering) alike, so the two surfaces can never
 /// silently diverge on how a bearer token's claims get mapped.
 fn engine_claims_from_bearer(claims: Option<&serde_json::Value>) -> engine::Claims {
     odrl_filter::with_context_claims(odrl_filter::jwt_claims_to_engine_claims(
@@ -467,21 +466,15 @@ fn service_is_visible(
 /// makes for `GET /catalog`/the management API, for
 /// [`CATALOG_VISIBILITY_ACTION`].
 ///
-/// Returns `(visible_datasets, visible_resources)`:
-///
-/// - `visible_datasets` - the allow-list
-///   `sparql_rewrite::restrict_to_visible_dataset_iris` rewrites the query
-///   against.
-/// - `visible_resources` - those datasets plus every data service a
-///   visible dataset's distribution uses, or that no dataset uses at all
-///   ([`service_is_visible`]); the allow-list
-///   `OxigraphCatalogCache::sparql_query_json_restricted` evaluates over.
+/// Returns the visible datasets plus every data service a visible
+/// dataset's distribution uses, or that no dataset uses at all
+/// ([`service_is_visible`]): the allow-list
+/// `OxigraphCatalogCache::sparql_query_json_restricted` evaluates over.
 fn visible_resource_iris(
     catalogs: &[Catalog],
     engine_claims: &engine::Claims,
     state: &AppState,
-) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut visible_datasets = BTreeSet::new();
+) -> BTreeSet<String> {
     let mut visible_resources = BTreeSet::new();
     for catalog in catalogs {
         let node = &catalog.origin_node;
@@ -498,9 +491,10 @@ fn visible_resource_iris(
             })
             .collect();
         for dataset in &visible {
-            let iri = rdf_store::oxigraph_backend::dataset_resource_iri(node, &dataset.id);
-            visible_datasets.insert(iri.clone());
-            visible_resources.insert(iri);
+            visible_resources.insert(rdf_store::oxigraph_backend::dataset_resource_iri(
+                node,
+                &dataset.id,
+            ));
         }
         let used_by_any = services_used_by(catalog.datasets.iter());
         let used_by_visible = services_used_by(visible.into_iter());
@@ -514,7 +508,7 @@ fn visible_resource_iris(
                 }),
         );
     }
-    (visible_datasets, visible_resources)
+    visible_resources
 }
 
 async fn get_catalog(
@@ -1117,40 +1111,22 @@ fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 ///   `application/sparql-results+json` (see `accepts_sparql_results_json`):
 ///   406 Not Acceptable.
 /// - Missing/empty `query`: 400 Bad Request.
-/// - ODRL policy-based query-rewriting filtering (gap analysis §3.4,
-///   `sparql_rewrite`) runs next, whenever [`should_filter_by_policy`] says
-///   it should: the caller's own per-dataset allow-list is computed via
-///   [`visible_resource_iris`] (the same decision
-///   `filter_catalogs_by_policy` already makes for `GET /catalog`/the
-///   management API) and `query` is rewritten to restrict every
-///   recognized dataset-subject variable to it
-///   (`sparql_rewrite::restrict_to_visible_dataset_iris`). A query that
-///   cannot be scoped this way (no such variable found anywhere in its own
-///   top scope) is handled per
-///   `PolicyFilterConfig::unscopeable_sparql_query_action`: `400 Bad
-///   Request` under its default ([`odrl_filter::UnscopeableSparqlQueryAction::Reject`]),
-///   or run completely unrewritten under the explicit
-///   `run_unfiltered` opt-out. When filtering is off entirely (OAuth2
-///   disabled and `PolicyFilterConfig::filter_when_oauth2_disabled` set to
-///   `false`), `query` reaches evaluation completely unrewritten, exactly
-///   as before this feature existed.
-/// - Whenever filtering runs, rewritten or `run_unfiltered` alike, the
-///   query is evaluated over only the datasets and data services the
-///   caller may see (`OxigraphCatalogCache::sparql_query_json_restricted`,
-///   allow-list from [`visible_resource_iris`]). The rewrite only restricts
-///   variables it recognizes as a dataset subject, so this is what keeps a
-///   hidden dataset's triples out of every other query shape (a sibling
-///   `UNION`/`OPTIONAL` branch, a pattern on another variable).
+/// - ODRL policy-based filtering (gap analysis §3.4) runs next, whenever
+///   [`should_filter_by_policy`] says it should: the query is evaluated
+///   over only the datasets and data services the caller may see
+///   (`OxigraphCatalogCache::sparql_query_json_restricted`, allow-list
+///   from [`visible_resource_iris`], the same per-dataset decision
+///   `filter_catalogs_by_policy` makes for `GET /catalog`/the management
+///   API). Hidden data is absent from what the query reads, so every
+///   query shape is answered and none can reach it. When filtering is
+///   off entirely (OAuth2 disabled and
+///   `PolicyFilterConfig::filter_when_oauth2_disabled` set to `false`),
+///   the query runs over the whole store.
 /// - Query fails to parse, fails to evaluate, or is a `CONSTRUCT`/
 ///   `DESCRIBE` (unsupported result shape - see `SparqlError`'s own doc
 ///   comments): 400 Bad Request with a plain-text explanation - these are
-///   all the caller's own query's fault. A query rejected here was either
-///   already like this before any rewriting (rewriting passes an unparseable
-///   query through unchanged, per `sparql_rewrite`'s own doc comment) or
-///   became so only in a way that itself proves the original could never
-///   have evaluated either.
-/// - Otherwise: 200 with an `application/sparql-results+json` body,
-///   computed from the (possibly policy-rewritten) query.
+///   all the caller's own query's fault.
+/// - Otherwise: 200 with an `application/sparql-results+json` body.
 ///
 /// Checked first, ahead of all of the above: the OAuth2 Bearer gate (see
 /// `check_oauth2_bearer`'s doc comment) - `401`/`403` when
@@ -1196,7 +1172,7 @@ async fn sparql_route(
         }
     };
 
-    let (query, visible_resources) = if should_filter_by_policy(&state) {
+    let visible_resources = if should_filter_by_policy(&state) {
         let engine_claims = engine_claims_from_bearer(claims.as_ref());
         let catalogs = match state.cache.query(CatalogQuery::all()).await {
             Ok(catalogs) => catalogs,
@@ -1210,31 +1186,9 @@ async fn sparql_route(
                     .into_response();
             }
         };
-        let (visible, visible_resources) = visible_resource_iris(&catalogs, &engine_claims, &state);
-
-        let query = match sparql_rewrite::restrict_to_visible_dataset_iris(&query, &visible) {
-            Ok(rewritten) => rewritten,
-            Err(sparql_rewrite::UnscopeableQuery) => {
-                match state.policy_filter.unscopeable_sparql_query_action {
-                    odrl_filter::UnscopeableSparqlQueryAction::Reject => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            "this query cannot be scoped to a per-caller allow-list of visible \
-                             datasets (no dataset-subject-shaped variable, e.g. '?x a \
-                             dcat:Dataset', found anywhere in it) - rejected rather than run \
-                             unfiltered against the whole store; see \
-                             PolicyFilterConfig::unscopeable_sparql_query_action"
-                                .to_string(),
-                        )
-                            .into_response();
-                    }
-                    odrl_filter::UnscopeableSparqlQueryAction::RunUnfiltered => query,
-                }
-            }
-        };
-        (query, Some(visible_resources))
+        Some(visible_resource_iris(&catalogs, &engine_claims, &state))
     } else {
-        (query, None)
+        None
     };
 
     let result = match &visible_resources {
@@ -2920,41 +2874,14 @@ mod tests {
     // ------------------------------------------------------------------
     //
     // The last of gap analysis §3.4's three serving surfaces: `GET`/
-    // `POST /sparql` now calls `odrl_filter::dataset_is_visible` (via
-    // `visible_resource_iris`) and rewrites the caller's query
-    // through `sparql_rewrite::restrict_to_visible_dataset_iris` before
-    // ever evaluating it - see `sparql_route`'s own doc comment for the
-    // exact behavior, and `sparql_rewrite`'s module doc for the design
-    // and its documented residual gaps.
-    //
-    // This surface was genuinely harder than the other two: named graphs
-    // in the semantic cache are per-*participant*, not per-*dataset*
-    // (`rdf_store::oxigraph_backend`'s own module doc), while ODRL
-    // policies are attached per-*dataset* - and an arbitrary caller-
-    // supplied SELECT/ASK query may or may not even bind a variable to a
-    // dataset's subject IRI at all. The design actually shipped:
-    //
-    // 1. Compute the allow-list of dataset IRIs currently visible to the
-    //    caller by running `odrl_filter::dataset_is_visible` over every
-    //    dataset in the cache (`visible_resource_iris`) - the
-    //    same computation `filter_catalogs_by_policy` already does for
-    //    `GET /catalog`/the management API, factored into a shared
-    //    `engine_claims_from_bearer` helper both paths call rather than
-    //    duplicated.
-    // 2. Rewrite the incoming query, at the level of its real parsed
-    //    SPARQL algebra (not its text - see `sparql_rewrite`'s own module
-    //    doc for why that distinction matters), to inject a
-    //    `FILTER(!BOUND(?x) || ?x IN (...))` restriction for every
-    //    variable that appears as the subject of a `?x a dcat:Dataset`
-    //    triple pattern and is still visible at the query's own top
-    //    scope.
-    // 3. A query with no such bindable variable anywhere in its own top
-    //    scope - the store cannot tell what the query is "about" at a
-    //    dataset level, so there is nothing to inject the restriction
-    //    onto - is handled per
-    //    `PolicyFilterConfig::unscopeable_sparql_query_action`'s own
-    //    conservative default ([`odrl_filter::UnscopeableSparqlQueryAction::Reject`]):
-    //    `400 Bad Request`, not silently run unfiltered.
+    // `POST /sparql` evaluates every filtered query over a view of the
+    // store holding only what `odrl_filter::dataset_is_visible` (via
+    // `visible_resource_iris`) lets the caller see - see `sparql_route`'s
+    // own doc comment, and `rdf_store::oxigraph_backend`'s
+    // `sparql_query_json_restricted` for the view itself. Named graphs in
+    // the semantic cache are per-*participant* while ODRL policies are
+    // per-*dataset*, so the view filters each quad by the dataset or
+    // service resource it belongs to rather than by graph.
     //
     // Per this session's own prior-art lesson (silent over-permission is
     // the failure mode that matters, not a loud error), every "hidden"
@@ -3140,53 +3067,33 @@ mod tests {
         assert!(dataset_iris.iter().any(|iri| iri.contains("OPEN-DATASET")));
     }
 
-    /// A query with no dataset-subject-shaped variable anywhere in it -
-    /// `?s`/`?p`/`?o` here are each unconstrained, no `?x a dcat:Dataset`
-    /// triple pattern ties any of them to a dataset's subject position -
-    /// so there is no allow-list variable for query-rewriting filtering to
-    /// restrict. This query would, if ever run unfiltered, return every
-    /// harvested triple in the store including the gated dataset's own -
-    /// exactly the silent-over-permission risk
-    /// `UnscopeableSparqlQueryAction::Reject`'s default guards against.
+    /// A query with no dataset-subject-shaped variable anywhere in it
+    /// (`?s ?p ?o`, nothing ties any of them to a dataset) is answered,
+    /// not rejected, under the default config: it is evaluated over only
+    /// the datasets and data services the caller may see, so the gated
+    /// dataset's triples stay out of it.
     #[tokio::test]
-    async fn sparql_rejects_an_unscopeable_query_by_default_rather_than_running_it_unfiltered() {
-        let state = sparql_test_state();
-        state
-            .cache
-            .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))
-            .await
-            .unwrap();
-        assert_eq!(
-            state.policy_filter.unscopeable_sparql_query_action,
-            odrl_filter::UnscopeableSparqlQueryAction::Reject,
-            "this test exercises the default; update it if the default ever changes"
+    async fn sparql_answers_a_query_with_no_dataset_variable_over_only_visible_datasets() {
+        let values = unauthenticated_sparql_binding_values(
+            "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+            odrl_filter::PolicyFilterConfig::default(),
+        )
+        .await;
+        assert!(
+            !values.iter().any(|v| v.contains("GATED-DATASET")),
+            "a gated dataset's triples must stay hidden. Got: {values:?}"
         );
-        let app = build_router(state);
-
-        let query = "SELECT ?s ?p ?o WHERE { ?s ?p ?o }";
-        let uri = format!("/sparql?query={}", urlencoding::encode(query));
-        let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "a query with no bindable dataset-subject variable must be rejected outright per \
-             PolicyFilterConfig::unscopeable_sparql_query_action's default (Reject), not \
-             silently run unfiltered against the whole store"
+        assert!(
+            values.iter().any(|v| v.contains("OPEN-DATASET")),
+            "the open dataset's triples must be returned. Got: {values:?}"
         );
     }
 
-    // --- SPARQL: query shapes the rewrite alone cannot scope -------------
+    // --- SPARQL: query shapes that do not bind a dataset variable -------
     //
-    // `sparql_rewrite` restricts only the variables it recognizes as a
-    // dataset subject (`?x a dcat:Dataset`). A sibling `UNION`/`OPTIONAL`
-    // branch that reads harvested triples through some *other* variable is
-    // not tied to that restriction at all, and `RunUnfiltered` skips the
-    // rewrite entirely. These tests pin down that a policy-gated dataset's
-    // triples stay hidden on those paths too.
+    // A sibling `UNION`/`OPTIONAL` branch, or a pattern on any variable
+    // other than a `?x a dcat:Dataset` subject, must not reach a gated
+    // dataset's triples either.
 
     /// Every binding value (IRI or literal) anywhere in a parsed
     /// `application/sparql-results+json` body.
@@ -3280,14 +3187,6 @@ mod tests {
         assert!(values.iter().any(|v| v.contains("OPEN-DATASET")));
     }
 
-    fn run_unfiltered() -> odrl_filter::PolicyFilterConfig {
-        odrl_filter::PolicyFilterConfig {
-            unscopeable_sparql_query_action:
-                odrl_filter::UnscopeableSparqlQueryAction::RunUnfiltered,
-            ..Default::default()
-        }
-    }
-
     /// The open + gated catalog, plus a data service only the gated
     /// dataset uses (its endpoint names the gated partner) and one no
     /// dataset uses.
@@ -3317,7 +3216,7 @@ mod tests {
         let values = unauthenticated_sparql_binding_values_over(
             catalog_with_a_gated_only_service(),
             "SELECT * WHERE { ?s ?p ?o }",
-            run_unfiltered(),
+            odrl_filter::PolicyFilterConfig::default(),
         )
         .await;
         assert!(
@@ -3420,19 +3319,6 @@ mod tests {
         assert!(
             !values.iter().any(|v| v.contains("TOP SECRET")),
             "an empty-id gated dataset must not leak. Got: {values:?}"
-        );
-        assert!(values.iter().any(|v| v.contains("OPEN-DATASET")));
-    }
-
-    #[tokio::test]
-    async fn sparql_run_unfiltered_still_hides_a_gated_datasets_triples() {
-        let values =
-            unauthenticated_sparql_binding_values("SELECT * WHERE { ?s ?p ?o }", run_unfiltered())
-                .await;
-        assert!(
-            !values.iter().any(|v| v.contains("GATED-DATASET")),
-            "RunUnfiltered skips the query rewrite, but a gated dataset's triples must still be \
-             hidden from a caller its policy does not entitle. Got: {values:?}"
         );
         assert!(values.iter().any(|v| v.contains("OPEN-DATASET")));
     }

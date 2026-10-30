@@ -3,8 +3,7 @@
 //! `catalog_core::Policy` data to `ds-odrl-engine-rs`'s evaluation engine
 //! (its `engine` crate, a pinned git dependency) to decide
 //! which harvested datasets a caller may see, across all three serving
-//! surfaces (`GET /catalog`, the management API, and SPARQL via real query
-//! rewriting).
+//! surfaces (`GET /catalog`, the management API, and SPARQL).
 //!
 //! **Status: closed on all three surfaces.** Every function below has its
 //! real entitlement/mapping logic (the original RED-phase commit had every
@@ -14,12 +13,9 @@
 //! `dataset_is_visible` (via its own `filter_catalogs_by_policy` helper)
 //! from both `GET /catalog` and `POST /api/management/v4/catalogs/request`,
 //! per that file's "ODRL policy-based dataset visibility filtering" test
-//! section, and via `visible_resource_iris` +
-//! `sparql_rewrite::restrict_to_visible_dataset_iris` from `sparql_route`,
-//! per that file's own "SPARQL ODRL policy-based filtering" test section -
-//! a real, if deliberately conservative (see `sparql_rewrite`'s own module
-//! doc for its documented residual gaps), query-rewriting filter, not a
-//! stub.
+//! section, and via `visible_resource_iris` from `sparql_route`, which
+//! evaluates every filtered query over only what the caller may see, per
+//! that file's own "SPARQL ODRL policy-based filtering" test section.
 //!
 //! ## Design: per-`(policy, action)` evaluation, OR'd across a dataset's
 //! own alternative offers
@@ -39,19 +35,15 @@
 //! the first policy that yields `WireDecision::Allow` makes the dataset
 //! visible, independent of what every other alternative offer says.
 //!
-//! ## The four conservative-by-default judgment calls this config makes
+//! ## The three conservative-by-default judgment calls this config makes
 //! explicit
 //!
 //! See [`PolicyFilterConfig`]'s own doc comment, and each of its fields',
 //! for the full reasoning behind [`UnmappableConstraintAction`]'s default
 //! ([`UnmappableConstraintAction::HideDataset`]),
 //! [`NoPolicyVisibility`]'s default ([`NoPolicyVisibility::Open`]),
-//! [`PolicyFilterConfig::filter_when_oauth2_disabled`]'s default (`true`,
-//! filtering still runs against an empty claims map), and
-//! [`UnscopeableSparqlQueryAction`]'s default
-//! ([`UnscopeableSparqlQueryAction::Reject`], for `GET`/`POST /sparql`'s
-//! own query-rewriting filtering - see `lib.rs`'s `sparql_route` doc
-//! comment for the current status of that surface).
+//! and [`PolicyFilterConfig::filter_when_oauth2_disabled`]'s default
+//! (`true`, filtering still runs against an empty claims map).
 
 use std::collections::BTreeSet;
 
@@ -138,47 +130,6 @@ pub enum NoPolicyVisibility {
     Closed,
 }
 
-/// What `GET`/`POST /sparql`'s query-rewriting filtering should do with a
-/// caller-supplied SPARQL query for which no *dataset-subject-shaped*
-/// variable can be found - i.e. no variable appears as the subject of a
-/// `?x a dcat:Dataset` triple pattern (or another dataset-shaped predicate
-/// this store recognizes) anywhere in the query, so there is nothing for
-/// the allow-list of visible dataset IRIs (the same computation
-/// `GET /catalog`'s own filtering already does per caller, via
-/// [`dataset_is_visible`]) to be injected onto - e.g. a `VALUES ?x { ... }`
-/// or `FILTER(?x IN (...))` restriction. Named graphs in the semantic
-/// cache are per-*participant*, not per-*dataset*, and ODRL policies are
-/// attached per-*dataset*, so there is no coarser scope
-/// (`GRAPH <participant>`) this filtering can fall back to either.
-///
-/// **Default: [`Self::Reject`]** - the same conservative-by-default
-/// posture as [`UnmappableConstraintAction::HideDataset`] and
-/// [`NoPolicyVisibility::Open`]'s own denial-on-the-restrictive-side
-/// framing: a query this broker cannot scope to an allow-list is exactly
-/// the situation where silently running it unfiltered risks returning a
-/// policy-gated dataset's triples to a caller not entitled to them -
-/// `docs/spikes/2026-08-27-edc-catalog-metadata-exposure-policy.md`'s own
-/// central finding (an unenforceable check that silently permits
-/// everything) applies here at the level of "this whole query", not just
-/// one constraint or one policy. `sparql_route` returns this rejection as
-/// a plain `400 Bad Request` with an explanation, the same status this
-/// route already uses for every other caller-query-is-the-problem case
-/// (parse/evaluation errors, `CONSTRUCT`/`DESCRIBE`) - see that
-/// function's own doc comment.
-///
-/// A deployment that would rather keep every caller-supplied query
-/// answered unfiltered whenever it cannot be scoped (effectively opting
-/// that query class out of ODRL enforcement entirely) can set
-/// `POLICY_FILTER_UNSCOPEABLE_SPARQL_QUERY_ACTION=run_unfiltered` - a
-/// real, if dangerous, escape hatch, not a silently-different production
-/// default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum UnscopeableSparqlQueryAction {
-    #[default]
-    Reject,
-    RunUnfiltered,
-}
-
 /// Explicit, env-var-driven runtime configuration for ODRL policy
 /// filtering (gap analysis §3.4) - the same "presence/value of an env var
 /// decides behavior" shape `OAuth2Config`/`load_oauth2_config` already use
@@ -217,12 +168,6 @@ pub struct PolicyFilterConfig {
     /// than that behavior falling out automatically merely from never
     /// having configured `OAUTH2_JWKS_URI`.
     pub filter_when_oauth2_disabled: bool,
-    /// What `GET`/`POST /sparql`'s query-rewriting filtering does with a
-    /// caller query it cannot scope to a per-caller allow-list of visible
-    /// dataset IRIs - see [`UnscopeableSparqlQueryAction`]'s own doc
-    /// comment for the full reasoning behind its default
-    /// ([`UnscopeableSparqlQueryAction::Reject`]).
-    pub unscopeable_sparql_query_action: UnscopeableSparqlQueryAction,
 }
 
 impl Default for PolicyFilterConfig {
@@ -231,7 +176,6 @@ impl Default for PolicyFilterConfig {
             unmappable_constraint_action: UnmappableConstraintAction::default(),
             no_policy_visibility: NoPolicyVisibility::default(),
             filter_when_oauth2_disabled: true,
-            unscopeable_sparql_query_action: UnscopeableSparqlQueryAction::default(),
         }
     }
 }
@@ -243,11 +187,9 @@ impl PolicyFilterConfig {
     /// (`false`/`0` disables filtering when OAuth2 is off; anything else,
     /// *including unset*, keeps it enabled - see that field's own doc
     /// comment for why "unset" and "explicitly true" are deliberately the
-    /// same value here, unlike the other settings' unset case), and
-    /// `POLICY_FILTER_UNSCOPEABLE_SPARQL_QUERY_ACTION` (`reject` |
-    /// `run_unfiltered`).
+    /// same value here, unlike the other settings' unset case).
     ///
-    /// An unset value for any of the first two (or fourth) settings falls
+    /// An unset value for either of the first two settings falls
     /// back to `Default::default()`'s value for that field silently, the
     /// same silent-default posture every other `env::var(...).ok()`-based
     /// config in this crate already has (see `main.rs`'s
@@ -300,29 +242,18 @@ impl PolicyFilterConfig {
             .map(|value| value != "false" && value != "0")
             .unwrap_or(default.filter_when_oauth2_disabled);
 
-        let unscopeable_sparql_query_action =
-            match std::env::var("POLICY_FILTER_UNSCOPEABLE_SPARQL_QUERY_ACTION")
-                .ok()
-                .as_deref()
-            {
-                None => default.unscopeable_sparql_query_action,
-                Some("reject") => UnscopeableSparqlQueryAction::Reject,
-                Some("run_unfiltered") => UnscopeableSparqlQueryAction::RunUnfiltered,
-                Some(other) => {
-                    tracing::warn!(
-                        value = other,
-                        "unrecognized POLICY_FILTER_UNSCOPEABLE_SPARQL_QUERY_ACTION (expected \
-                         'reject' or 'run_unfiltered'); falling back to the default (reject)"
-                    );
-                    default.unscopeable_sparql_query_action
-                }
-            };
+        if std::env::var_os("POLICY_FILTER_UNSCOPEABLE_SPARQL_QUERY_ACTION").is_some() {
+            tracing::warn!(
+                "POLICY_FILTER_UNSCOPEABLE_SPARQL_QUERY_ACTION is no longer read: every filtered \
+                 /sparql query now runs over only the data the caller may see, so no query is \
+                 rejected as unscopeable"
+            );
+        }
 
         Self {
             unmappable_constraint_action,
             no_policy_visibility,
             filter_when_oauth2_disabled,
-            unscopeable_sparql_query_action,
         }
     }
 }

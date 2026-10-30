@@ -126,9 +126,8 @@ entitlement under a harvested dataset's own ODRL policy, evaluated via
 (`crates/ds-catalog-broker-rs/src/odrl_filter.rs`), driven by an explicit,
 env-var-configured `PolicyFilterConfig` rather than a hardcoded judgment
 call (unmappable-constraint handling, default visibility for
-policy-free/empty-permissions datasets, and — for `GET`/`POST /sparql`
-specifically — what to do with a query that cannot be scoped to a
-per-caller allow-list at all).
+policy-free/empty-permissions datasets, and whether filtering runs when
+OAuth2 is disabled).
 
 `GET /catalog` and the management API filter directly. `GET`/`POST
 /sparql` evaluates every filtered query over a view of the store that
@@ -137,10 +136,7 @@ use, filtering each lookup as it happens rather than copying anything.
 Hidden datasets' triples, everything minted under their IRIs, the
 catalog's links to them, services only they use, and the internal
 position numbers that would reveal gaps are all absent, so no query shape
-can reach them. It also rewrites the query
-(`crates/ds-catalog-broker-rs/src/sparql_rewrite.rs`) to restrict
-recognized dataset-subject variables, and by default rejects a query with
-no such variable as unscopeable. `GET /catalog` likewise omits data
+can reach them, and every query shape is answered. `GET /catalog` likewise omits data
 services only hidden datasets use; the management API keeps them, since
 its offers are built around a catalog's service. See
 [`docs/gap-analysis-2026-08-27.md`](docs/gap-analysis-2026-08-27.md) §3.4
