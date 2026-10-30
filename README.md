@@ -115,11 +115,10 @@ decomposed into `dcat:Catalog`/`dcat:Dataset`/`dcat:Distribution`/
 as one `fcns:property/<key>` triple per entry, with no schema change
 needed for a new field. `crawler::collect_datasets_and_services` uses
 this to carry `title`/`description`/`version`/`creatorName`/`thumbnail`/
-`keywords` through to the management API. That mapping's own test only
-covers `InMemoryCatalogCache`; the live demo stack
-(`ds-labs-org/ds-dev-deployment`) exercises the real Oxigraph path and
-was checked manually, but no automated test yet proves the round trip
-end to end (see the "Known limitation" note in the module doc).
+`keywords` through to the management API. A test crawls a mock DSP
+participant into a real Oxigraph store and reads every one of them back
+through the management API with the real client type
+(`catalog_request_route_serves_crawled_dataset_descriptors_from_a_real_oxigraph_store`).
 
 ![Internal architecture of the semantic cache: crawler parses a crawled catalog into a domain value plus a generic properties bag, upserts both through the CatalogCache trait, OxigraphCatalogCache stores one named graph per origin node as real DCAT triples plus one triple per property, and the two serving surfaces (catalog cache API, management API) read the triples and the decoded properties back out via SPARQL](docs/diagrams/semantic-cache-architecture.svg)
 

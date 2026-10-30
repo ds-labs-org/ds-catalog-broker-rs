@@ -2321,6 +2321,90 @@ mod tests {
         );
     }
 
+    /// The whole chain the test above skips: the real crawler fetches a
+    /// DSP catalog carrying every optional descriptor from a mock
+    /// participant, upserts it into a real `OxigraphCatalogCache`, and the
+    /// management API reads it back out of that store into the real
+    /// client's `FederatedCatalogOffer`.
+    #[tokio::test]
+    async fn catalog_request_route_serves_crawled_dataset_descriptors_from_a_real_oxigraph_store() {
+        let dsp_catalog = serde_json::json!({
+            "@id": "cat-a",
+            "participantId": "did:example:node-a",
+            "dataset": [{
+                "@id": "DATASET-A",
+                "title": "Soil Moisture Readings",
+                "description": "Hourly soil moisture readings from field sensors.",
+                "version": "1.2.0",
+                "creatorName": "Acme Sensors Inc.",
+                "thumbnail": "https://example.org/thumbnails/soil-moisture.png",
+                "keywords": "soil, moisture ,sensors",
+                "distribution": [{"format": "application/json", "accessService": "svc-1"}]
+            }],
+            "service": [{"@id": "svc-1", "endpointURL": "https://node-a.example/dsp"}]
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let participant_app = Router::new().route(
+            "/dsp/catalog/request",
+            post(move || {
+                let dsp_catalog = dsp_catalog.clone();
+                async move { Json(dsp_catalog) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, participant_app).await });
+
+        let state = sparql_test_state();
+        let participants = [crawler::ParticipantEntry {
+            id: "node-a".to_string(),
+            name: "Node A".to_string(),
+            catalog_request_url: format!("http://{addr}/dsp/catalog/request"),
+            credential_protocol: crawler::CredentialProtocol::None,
+            provider_did: None,
+            oid4vp_response_uri: None,
+        }];
+        let summary =
+            crawler::crawl_once(&reqwest::Client::new(), &participants, None, &*state.cache).await;
+        assert_eq!(
+            summary.succeeded, 1,
+            "crawl failures: {:?}",
+            summary.failures
+        );
+
+        let app = build_router(state);
+        let response = app.oneshot(catalog_request(Body::empty())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let offers: Vec<FederatedCatalogOffer> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(offers.len(), 1);
+        let dataset = &offers[0].dataset[0];
+
+        assert_eq!(dataset.title.as_deref(), Some("Soil Moisture Readings"));
+        assert_eq!(
+            dataset.description.as_deref(),
+            Some("Hourly soil moisture readings from field sensors.")
+        );
+        assert_eq!(dataset.version.as_deref(), Some("1.2.0"));
+        let creator = dataset.creator.as_ref().expect("creator must be present");
+        assert_eq!(creator.name, "Acme Sensors Inc.");
+        assert_eq!(
+            dataset
+                .thumbnail
+                .as_ref()
+                .expect("thumbnail must be present")
+                .resource,
+            "https://example.org/thumbnails/soil-moisture.png"
+        );
+        assert_eq!(
+            dataset.keywords,
+            vec![
+                "soil".to_string(),
+                "moisture".to_string(),
+                "sensors".to_string()
+            ]
+        );
+    }
+
     /// The `datasets.id`/`=` `filterExpression` constraint - the exact
     /// shape `FederatedCatalogClient::get_offer_by_dataset_id` sends
     /// client-side - narrows the response down to only offers containing a
