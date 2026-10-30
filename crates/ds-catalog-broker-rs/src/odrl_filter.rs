@@ -45,6 +45,7 @@
 //! and [`PolicyFilterConfig::filter_when_oauth2_disabled`]'s default
 //! (`true`, filtering still runs against an empty claims map).
 
+use crate::config::{self, BrokerSettings};
 use std::collections::BTreeSet;
 
 use catalog_core::{
@@ -83,8 +84,8 @@ use engine::{
 /// *different*, more permissive alternative offer on the same dataset
 /// that happens to parse, when the harvested participant's actual intent
 /// may have been the opposite). Easily flipped per-deployment via
-/// `POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION` - see
-/// [`PolicyFilterConfig::from_env`].
+/// `broker:policyFilterUnmappableConstraintAction` - see
+/// [`PolicyFilterConfig::from_settings`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnmappableConstraintAction {
     /// Drop just the one unmappable constraint (its containing rule is
@@ -122,7 +123,7 @@ pub enum UnmappableConstraintAction {
 ///
 /// This is a judgment call, not a law of nature: a deployment whose
 /// upstream participants *do* mean "no permissions" as "nobody may use
-/// this" should set `POLICY_FILTER_NO_POLICY_VISIBILITY=closed`.
+/// this" should set `broker:policyFilterNoPolicyVisibility "closed"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NoPolicyVisibility {
     #[default]
@@ -130,10 +131,9 @@ pub enum NoPolicyVisibility {
     Closed,
 }
 
-/// Explicit, env-var-driven runtime configuration for ODRL policy
-/// filtering (gap analysis §3.4) - the same "presence/value of an env var
-/// decides behavior" shape `OAuth2Config`/`load_oauth2_config` already use
-/// in this crate (`src/oauth2.rs`, `src/main.rs`), not a new mechanism.
+/// Explicit runtime configuration for ODRL policy filtering (gap analysis
+/// §3.4), read from the broker's Turtle config like every other setting -
+/// see [`PolicyFilterConfig::from_settings`] and [`crate::config`].
 #[derive(Debug, Clone)]
 pub struct PolicyFilterConfig {
     pub unmappable_constraint_action: UnmappableConstraintAction,
@@ -164,9 +164,9 @@ pub struct PolicyFilterConfig {
     /// `docs/spikes/2026-08-27-edc-catalog-metadata-exposure-policy.md`
     /// documents. An operator who deliberately wants a fully-open catalog
     /// with no policy-based filtering at all can still get it by setting
-    /// `POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED=false` explicitly, rather
+    /// `broker:policyFilterRunWhenOauth2Disabled false` explicitly, rather
     /// than that behavior falling out automatically merely from never
-    /// having configured `OAUTH2_JWKS_URI`.
+    /// having configured `broker:oauth2JwksUri`.
     pub filter_when_oauth2_disabled: bool,
 }
 
@@ -181,47 +181,42 @@ impl Default for PolicyFilterConfig {
 }
 
 impl PolicyFilterConfig {
-    /// Reads `POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION` (`skip` |
-    /// `drop_policy` | `hide_dataset`), `POLICY_FILTER_NO_POLICY_VISIBILITY`
-    /// (`open` | `closed`), `POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED`
-    /// (`false`/`0` disables filtering when OAuth2 is off; anything else,
-    /// *including unset*, keeps it enabled - see that field's own doc
-    /// comment for why "unset" and "explicitly true" are deliberately the
-    /// same value here, unlike the other settings' unset case).
+    /// Reads `broker:policyFilterUnmappableConstraintAction` (`skip` | `drop_policy` |
+    /// `hide_dataset`), `broker:policyFilterNoPolicyVisibility` (`open` | `closed`) and
+    /// `broker:policyFilterRunWhenOauth2Disabled` (`false`/`0` disables filtering when OAuth2
+    /// is off; anything else, *including unset*, keeps it enabled - see that field's own doc
+    /// comment for why "unset" and "explicitly true" are deliberately the same value here,
+    /// unlike the other settings' unset case). See [`crate::config`].
     ///
-    /// An unset value for either of the first two settings falls
-    /// back to `Default::default()`'s value for that field silently, the
-    /// same silent-default posture every other `env::var(...).ok()`-based
-    /// config in this crate already has (see `main.rs`'s
-    /// `load_oauth2_config`). A *present but unrecognized* value also
-    /// falls back to the default, but logs a `tracing::warn!` first - a
-    /// typo'd env var should be visible in the logs, not merely silently
-    /// ignored the same way an absent one is.
-    pub fn from_env() -> Self {
+    /// An unset value for either of the first two settings falls back to
+    /// `Default::default()`'s value for that field silently. A *present but unrecognized*
+    /// value also falls back to the default, but logs a `tracing::warn!` first - a typo'd
+    /// setting should be visible in the logs, not merely silently ignored the same way an
+    /// absent one is.
+    pub fn from_settings(settings: &BrokerSettings) -> Self {
         let default = Self::default();
 
-        let unmappable_constraint_action =
-            match std::env::var("POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION")
-                .ok()
-                .as_deref()
-            {
-                None => default.unmappable_constraint_action,
-                Some("skip") => UnmappableConstraintAction::SkipConstraint,
-                Some("drop_policy") => UnmappableConstraintAction::DropPolicy,
-                Some("hide_dataset") => UnmappableConstraintAction::HideDataset,
-                Some(other) => {
-                    tracing::warn!(
-                        value = other,
-                        "unrecognized POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION (expected 'skip', \
+        let unmappable_constraint_action = match settings
+            .get(config::POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION)
+            .as_deref()
+        {
+            None => default.unmappable_constraint_action,
+            Some("skip") => UnmappableConstraintAction::SkipConstraint,
+            Some("drop_policy") => UnmappableConstraintAction::DropPolicy,
+            Some("hide_dataset") => UnmappableConstraintAction::HideDataset,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "unrecognized policyFilterUnmappableConstraintAction (expected 'skip', \
                      'drop_policy', or 'hide_dataset'); falling back to the default \
                      (hide_dataset)"
-                    );
-                    default.unmappable_constraint_action
-                }
-            };
+                );
+                default.unmappable_constraint_action
+            }
+        };
 
-        let no_policy_visibility = match std::env::var("POLICY_FILTER_NO_POLICY_VISIBILITY")
-            .ok()
+        let no_policy_visibility = match settings
+            .get(config::POLICY_FILTER_NO_POLICY_VISIBILITY)
             .as_deref()
         {
             None => default.no_policy_visibility,
@@ -230,25 +225,17 @@ impl PolicyFilterConfig {
             Some(other) => {
                 tracing::warn!(
                     value = other,
-                    "unrecognized POLICY_FILTER_NO_POLICY_VISIBILITY (expected 'open' or \
-                         'closed'); falling back to the default (open)"
+                    "unrecognized policyFilterNoPolicyVisibility (expected 'open' or \
+                     'closed'); falling back to the default (open)"
                 );
                 default.no_policy_visibility
             }
         };
 
-        let filter_when_oauth2_disabled = std::env::var("POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED")
-            .ok()
+        let filter_when_oauth2_disabled = settings
+            .get(config::POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED)
             .map(|value| value != "false" && value != "0")
             .unwrap_or(default.filter_when_oauth2_disabled);
-
-        if std::env::var_os("POLICY_FILTER_UNSCOPEABLE_SPARQL_QUERY_ACTION").is_some() {
-            tracing::warn!(
-                "POLICY_FILTER_UNSCOPEABLE_SPARQL_QUERY_ACTION is no longer read: every filtered \
-                 /sparql query now runs over only the data the caller may see, so no query is \
-                 rejected as unscopeable"
-            );
-        }
 
         Self {
             unmappable_constraint_action,
@@ -520,7 +507,7 @@ fn catalog_constraint_to_engine_constraint_at_depth(
                         left_operand = %atomic.left_operand,
                         operator = %atomic.operator,
                         "dropping unmappable ODRL constraint operator \
-                         (POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION=skip)"
+                         (policyFilterUnmappableConstraintAction=skip)"
                     );
                     Ok(None)
                 }
@@ -810,6 +797,52 @@ pub fn dataset_is_visible(
 mod tests {
     use super::*;
     use catalog_core::PolicyKind;
+
+    #[test]
+    fn policy_filter_config_reads_ttl_values() {
+        let settings = BrokerSettings::from_values([
+            (
+                "policyFilterUnmappableConstraintAction".to_string(),
+                "drop_policy".to_string(),
+            ),
+            (
+                "policyFilterRunWhenOauth2Disabled".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "policyFilterNoPolicyVisibility".to_string(),
+                "closed".to_string(),
+            ),
+        ]);
+        let config = PolicyFilterConfig::from_settings(&settings);
+        assert_eq!(
+            config.unmappable_constraint_action,
+            UnmappableConstraintAction::DropPolicy
+        );
+        assert_eq!(config.no_policy_visibility, NoPolicyVisibility::Closed);
+        assert!(!config.filter_when_oauth2_disabled);
+    }
+
+    #[test]
+    fn policy_filter_config_unrecognized_values_fall_back_to_defaults() {
+        let settings = BrokerSettings::from_values([
+            (
+                "policyFilterUnmappableConstraintAction".to_string(),
+                "nope".to_string(),
+            ),
+            (
+                "policyFilterNoPolicyVisibility".to_string(),
+                "ajar".to_string(),
+            ),
+        ]);
+        let config = PolicyFilterConfig::from_settings(&settings);
+        assert_eq!(
+            config.unmappable_constraint_action,
+            UnmappableConstraintAction::HideDataset
+        );
+        assert_eq!(config.no_policy_visibility, NoPolicyVisibility::Open);
+        assert!(config.filter_when_oauth2_disabled);
+    }
 
     fn dataset_with_policies(policies: Vec<CorePolicy>) -> Dataset {
         Dataset {
