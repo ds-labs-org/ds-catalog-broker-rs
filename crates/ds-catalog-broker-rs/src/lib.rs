@@ -128,6 +128,30 @@ impl SparqlLimitsConfig {
     }
 }
 
+/// Reads `broker:crawlTimeoutMs`, `broker:crawlConcurrency` and
+/// `broker:catalogMaxAgeSecs` (positive integers) from the broker config into
+/// the crawler's [`crawler::CrawlLimits`]. Unset falls back to the default
+/// silently; a value that is not a positive integer falls back to it with a
+/// warning.
+pub fn crawl_limits_from_settings(settings: &config::BrokerSettings) -> crawler::CrawlLimits {
+    let default = crawler::CrawlLimits::default();
+    crawler::CrawlLimits {
+        participant_timeout: settings
+            .positive_integer(config::CRAWL_TIMEOUT_MS)
+            .map_or(default.participant_timeout, |ms| {
+                Duration::from_millis(ms as u64)
+            }),
+        concurrency: settings
+            .positive_integer(config::CRAWL_CONCURRENCY)
+            .unwrap_or(default.concurrency),
+        max_catalog_age: settings
+            .positive_integer(config::CATALOG_MAX_AGE_SECS)
+            .map_or(default.max_catalog_age, |secs| {
+                Duration::from_secs(secs as u64)
+            }),
+    }
+}
+
 impl AppState {
     pub fn new(cache: Arc<dyn CatalogCache>) -> Self {
         Self {
@@ -1322,6 +1346,23 @@ mod tests {
         AppState::new(Arc::new(InMemoryCatalogCache::new()))
     }
 
+    #[test]
+    fn crawl_limits_come_from_the_broker_config() {
+        let settings = config::BrokerSettings::from_values([
+            ("crawlTimeoutMs".to_string(), "1500".to_string()),
+            ("crawlConcurrency".to_string(), "2".to_string()),
+            ("catalogMaxAgeSecs".to_string(), "0".to_string()),
+        ]);
+        let limits = crawl_limits_from_settings(&settings);
+        assert_eq!(limits.participant_timeout, Duration::from_millis(1500));
+        assert_eq!(limits.concurrency, 2);
+        assert_eq!(
+            limits.max_catalog_age,
+            crawler::CrawlLimits::default().max_catalog_age,
+            "a non-positive value falls back to the default"
+        );
+    }
+
     #[tokio::test]
     async fn health_returns_ok() {
         let app = build_router(test_state());
@@ -2363,8 +2404,14 @@ mod tests {
             provider_did: None,
             oid4vp_response_uri: None,
         }];
-        let summary =
-            crawler::crawl_once(&reqwest::Client::new(), &participants, None, &*state.cache).await;
+        let summary = crawler::crawl_once(
+            &reqwest::Client::new(),
+            &participants,
+            None,
+            &*state.cache,
+            &crawler::CrawlLimits::default(),
+        )
+        .await;
         assert_eq!(
             summary.succeeded, 1,
             "crawl failures: {:?}",

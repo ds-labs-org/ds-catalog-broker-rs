@@ -138,7 +138,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use catalog_core::{Catalog, Dataset, NodeId};
-use crawler::{CredentialProtocol, ParticipantEntry, crawl_once};
+use crawler::{CrawlLimits, CredentialProtocol, ParticipantEntry, crawl_once};
 use dcp_core::{
     DcpKeyPair, EXPECTED_CREDENTIAL_TYPE, HolderIdentity, PRESENTATION_QUERY_CONTEXT,
     PresentationQueryMessage, PresentationResponseMessage, decode_jws_unverified, did_web_to_url,
@@ -770,6 +770,7 @@ async fn crawl_once_pulls_open_and_dcp_gated_catalogs_with_real_per_caller_filte
         &participants,
         Some(holder_rig.holder.as_ref()),
         &cache,
+        &CrawlLimits::default(),
     )
     .await;
 
@@ -865,6 +866,7 @@ async fn crawl_once_records_a_failure_for_an_expired_dcp_credential_and_preserve
         &participants,
         Some(holder_rig.holder.as_ref()),
         &cache,
+        &CrawlLimits::default(),
     )
     .await;
 

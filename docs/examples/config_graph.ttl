@@ -12,6 +12,13 @@
     # from an in-memory cache, with no crawler and no /sparql.
     broker:crawlerConfigPath "/etc/ds-catalog-broker/participants.toml" ;
 
+    # Harvesting: how long one participant's crawl may take, how many
+    # participants are crawled at once, and how long a catalog stays cached
+    # after its participant's last successful crawl.
+    broker:crawlTimeoutMs 30000 ;
+    broker:crawlConcurrency 8 ;
+    broker:catalogMaxAgeSecs 86400 ;
+
     # OAuth2 Bearer gating of /catalog and /sparql. No defaults: an unset
     # oauth2JwksUri leaves both routes unauthenticated, and each of the other
     # three is checked only when set.

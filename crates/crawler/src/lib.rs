@@ -23,6 +23,7 @@ pub use config::{
     ConfigError, CredentialProtocol, HolderConfig, ParticipantEntry, ParticipantsConfig,
 };
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,8 +31,11 @@ use catalog_core::{
     Catalog, Constraint, DataService, Dataset, Distribution, NodeId, Policy, PolicyKind, Rule,
 };
 use dcp_core::HolderIdentity;
+use futures_util::future::BoxFuture;
+use futures_util::{FutureExt, StreamExt, stream};
 use rdf_store::CatalogCache;
 use serde_json::Value;
+use tokio::time::Instant;
 
 /// `@context` for the `CatalogRequestMessage` this crawler POSTs to each
 /// participant - matches what `ds-catalog-broker-rs`'s own `catalog_request` handler
@@ -51,6 +55,33 @@ const DSP_CONTEXT_URL: &str = "https://w3id.org/dspace/2025/1/context.jsonld";
 /// `compliance/crawler-edc-integration-test.md`.
 const OPEN_PARTICIPANT_PLACEHOLDER_AUTH: &str = "federated-catalog-rs-crawler-anonymous";
 
+/// Bounds on a crawl cycle. The broker reads each one from its
+/// `broker:` config (see `docs/configuration.md`); [`Default`] holds the
+/// same defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrawlLimits {
+    /// How long one participant's whole fetch may take, credential
+    /// presentation and response body included, before it counts as a
+    /// failure. Default: 30 seconds.
+    pub participant_timeout: Duration,
+    /// How many participants are crawled at the same time. Default: 8.
+    pub concurrency: usize,
+    /// A cached catalog whose participant has not been crawled
+    /// successfully for this long is removed from the cache, so a
+    /// participant that stays down stops being served. Default: 24 hours.
+    pub max_catalog_age: Duration,
+}
+
+impl Default for CrawlLimits {
+    fn default() -> Self {
+        Self {
+            participant_timeout: Duration::from_secs(30),
+            concurrency: 8,
+            max_catalog_age: Duration::from_secs(24 * 60 * 60),
+        }
+    }
+}
+
 /// The outcome of one [`crawl_once`] cycle. Callers (tests, the scheduler
 /// loop) get real counts and per-participant error messages rather than a
 /// bare pass/fail bool, since "3 of 5 participants failed, here's why" is
@@ -60,6 +91,9 @@ pub struct CrawlSummary {
     pub attempted: usize,
     pub succeeded: usize,
     pub failed: usize,
+    /// The id of every participant crawled and cached successfully this
+    /// cycle, in participant order.
+    pub succeeded_ids: Vec<String>,
     /// `(participant_id, error message)` for every participant that
     /// failed this cycle, in participant order.
     pub failures: Vec<(String, String)>,
@@ -68,31 +102,40 @@ pub struct CrawlSummary {
 /// Run one crawl cycle over every entry in `participants`, upserting each
 /// successful result into `cache`.
 ///
-/// A failure fetching or parsing one participant's catalog (network
-/// error, non-2xx response, malformed JSON) is recorded in the returned
-/// [`CrawlSummary`] and does not abort the rest of the cycle - one bad
-/// participant must never prevent the others from being crawled.
+/// Up to `limits.concurrency` participants are crawled at once, and each
+/// one gets `limits.participant_timeout` to answer. A failure fetching or
+/// parsing one participant's catalog (network error, timeout, non-2xx
+/// response, malformed JSON) is recorded in the returned [`CrawlSummary`]
+/// and does not abort the rest of the cycle - one bad participant must
+/// never prevent the others from being crawled.
 pub async fn crawl_once(
     http: &reqwest::Client,
     participants: &[ParticipantEntry],
     holder: Option<&HolderIdentity>,
     cache: &dyn CatalogCache,
+    limits: &CrawlLimits,
 ) -> CrawlSummary {
-    let mut summary = CrawlSummary::default();
+    // Boxed and collected up front rather than mapped lazily inside the
+    // stream: a closure in the stream's type makes the future returned here
+    // not provably `Send` for every lifetime, which `spawn_scheduler`'s
+    // `tokio::spawn` needs.
+    let crawls: Vec<BoxFuture<'_, Result<(), String>>> = participants
+        .iter()
+        .map(|participant| crawl_and_cache(http, participant, holder, cache, limits).boxed())
+        .collect();
+    let outcomes: Vec<Result<(), String>> = stream::iter(crawls)
+        .buffered(limits.concurrency.max(1))
+        .collect()
+        .await;
 
-    for participant in participants {
+    let mut summary = CrawlSummary::default();
+    for (participant, outcome) in participants.iter().zip(outcomes) {
         summary.attempted += 1;
-        match crawl_one(http, participant, holder).await {
-            Ok(catalog) => match cache.upsert(catalog).await {
-                Ok(()) => summary.succeeded += 1,
-                Err(err) => {
-                    summary.failed += 1;
-                    summary.failures.push((
-                        participant.id.clone(),
-                        format!("failed to cache crawl result: {err}"),
-                    ));
-                }
-            },
+        match outcome {
+            Ok(()) => {
+                summary.succeeded += 1;
+                summary.succeeded_ids.push(participant.id.clone());
+            }
             Err(err) => {
                 summary.failed += 1;
                 summary.failures.push((participant.id.clone(), err));
@@ -101,6 +144,109 @@ pub async fn crawl_once(
     }
 
     summary
+}
+
+/// Crawl one participant within `limits.participant_timeout` and cache the
+/// result.
+async fn crawl_and_cache(
+    http: &reqwest::Client,
+    participant: &ParticipantEntry,
+    holder: Option<&HolderIdentity>,
+    cache: &dyn CatalogCache,
+    limits: &CrawlLimits,
+) -> Result<(), String> {
+    let catalog = tokio::time::timeout(
+        limits.participant_timeout,
+        crawl_one(http, participant, holder),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "crawl of {} timed out after {:?}",
+            participant.catalog_request_url, limits.participant_timeout
+        ))
+    })?;
+    cache
+        .upsert(catalog)
+        .await
+        .map_err(|err| format!("failed to cache crawl result: {err}"))
+}
+
+/// Runs crawl cycles and removes catalogs that have gone stale. Holds the
+/// time each participant was last crawled successfully, which is what
+/// [`CrawlLimits::max_catalog_age`] is measured against.
+pub struct Harvester {
+    cache: Arc<dyn CatalogCache>,
+    participants: Vec<ParticipantEntry>,
+    http: reqwest::Client,
+    holder: Option<Arc<HolderIdentity>>,
+    limits: CrawlLimits,
+    last_success: HashMap<String, Instant>,
+}
+
+/// The outcome of one [`Harvester::run_cycle`].
+#[derive(Debug, Default, Clone)]
+pub struct CycleReport {
+    pub summary: CrawlSummary,
+    /// Participants whose cached catalog was removed this cycle because
+    /// their last successful crawl is older than
+    /// [`CrawlLimits::max_catalog_age`].
+    pub expired: Vec<String>,
+}
+
+impl Harvester {
+    pub fn new(
+        cache: Arc<dyn CatalogCache>,
+        participants: Vec<ParticipantEntry>,
+        http: reqwest::Client,
+        holder: Option<Arc<HolderIdentity>>,
+        limits: CrawlLimits,
+    ) -> Self {
+        Self {
+            cache,
+            participants,
+            http,
+            holder,
+            limits,
+            last_success: HashMap::new(),
+        }
+    }
+
+    /// Crawl every participant once, then remove the catalog of each
+    /// participant not crawled successfully within
+    /// [`CrawlLimits::max_catalog_age`]. A participant that has never
+    /// succeeded has nothing cached, so there is nothing to expire.
+    pub async fn run_cycle(&mut self) -> CycleReport {
+        let summary = crawl_once(
+            &self.http,
+            &self.participants,
+            self.holder.as_deref(),
+            &*self.cache,
+            &self.limits,
+        )
+        .await;
+
+        let now = Instant::now();
+        for id in &summary.succeeded_ids {
+            self.last_success.insert(id.clone(), now);
+        }
+
+        let mut expired: Vec<String> = self
+            .last_success
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) > self.limits.max_catalog_age)
+            .map(|(id, _)| id.clone())
+            .collect();
+        expired.sort();
+        for id in &expired {
+            self.last_success.remove(id);
+            if let Err(err) = self.cache.delete(&NodeId::new(id.clone())).await {
+                tracing::warn!(participant = %id, error = %err, "failed to remove a stale catalog");
+            }
+        }
+
+        CycleReport { summary, expired }
+    }
 }
 
 /// Fetch and parse one participant's catalog. Split out of [`crawl_once`]
@@ -636,25 +782,30 @@ fn parse_constraint(value: &Value, depth: usize) -> Option<Constraint> {
     None
 }
 
-/// Spawn a background task that runs [`crawl_once`] every
+/// Spawn a background task that runs [`Harvester::run_cycle`] every
 /// `config.interval_secs` seconds (starting immediately, per
 /// `tokio::time::interval`'s default first-tick behavior), logging each
-/// cycle's [`CrawlSummary`] via `tracing`.
+/// cycle's [`CrawlSummary`] and any expired catalogs via `tracing`.
 ///
 /// Runs for the lifetime of the returned `JoinHandle` (i.e. forever,
 /// unless the handle is aborted or the runtime shuts down) - there is no
-/// built-in stop condition, matching a long-lived server process.
+/// built-in stop condition, matching a long-lived server process. A cycle
+/// that outlasts the interval delays the next tick rather than overlapping
+/// it.
 pub fn spawn_scheduler(
     cache: Arc<dyn CatalogCache>,
     config: ParticipantsConfig,
     http: reqwest::Client,
     holder: Option<Arc<HolderIdentity>>,
+    limits: CrawlLimits,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(config.interval_secs.max(1)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut harvester = Harvester::new(cache, config.participants, http, holder, limits);
         loop {
             interval.tick().await;
-            let summary = crawl_once(&http, &config.participants, holder.as_deref(), &*cache).await;
+            let CycleReport { summary, expired } = harvester.run_cycle().await;
             if summary.failed > 0 {
                 tracing::warn!(
                     attempted = summary.attempted,
@@ -668,6 +819,12 @@ pub fn spawn_scheduler(
                     attempted = summary.attempted,
                     succeeded = summary.succeeded,
                     "crawl cycle completed"
+                );
+            }
+            if !expired.is_empty() {
+                tracing::warn!(
+                    participants = ?expired,
+                    "removed catalogs not crawled successfully within catalogMaxAgeSecs"
                 );
             }
         }
@@ -1262,7 +1419,7 @@ mod tests {
         let cache = InMemoryCatalogCache::new();
         let http = reqwest::Client::new();
 
-        let summary = crawl_once(&http, &participants, None, &cache).await;
+        let summary = crawl_once(&http, &participants, None, &cache, &CrawlLimits::default()).await;
 
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.succeeded, 0);
@@ -1421,7 +1578,14 @@ mod tests {
         let http = reqwest::Client::new();
         let cache = InMemoryCatalogCache::new();
 
-        let summary = crawl_once(&http, &participants, Some(&holder), &cache).await;
+        let summary = crawl_once(
+            &http,
+            &participants,
+            Some(&holder),
+            &cache,
+            &CrawlLimits::default(),
+        )
+        .await;
 
         assert_eq!(summary.attempted, 1, "summary: {summary:?}");
         assert_eq!(summary.failed, 0, "summary: {summary:?}");
@@ -1460,7 +1624,14 @@ mod tests {
         let http = reqwest::Client::new();
         let cache = InMemoryCatalogCache::new();
 
-        let summary = crawl_once(&http, &participants, Some(&holder), &cache).await;
+        let summary = crawl_once(
+            &http,
+            &participants,
+            Some(&holder),
+            &cache,
+            &CrawlLimits::default(),
+        )
+        .await;
 
         assert_eq!(summary.attempted, 1, "summary: {summary:?}");
         assert_eq!(summary.succeeded, 0, "summary: {summary:?}");
@@ -1471,6 +1642,173 @@ mod tests {
         assert!(
             stored.is_empty(),
             "a rejected presentation must not cache anything for this participant"
+        );
+    }
+
+    /// A catalog server that answers every request after `delay`, counting
+    /// how many requests it is serving at once. Returns its request URL and
+    /// the highest concurrency it saw.
+    async fn spawn_slow_catalog_server(
+        delay: Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (listener, addr) = bind_localhost().await;
+        let app = axum::Router::new().route(
+            "/dsp/catalog/request",
+            axum::routing::post({
+                let in_flight = in_flight.clone();
+                let peak = peak.clone();
+                move || async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    axum::Json(json!({"@id": "slow-catalog", "dataset": [], "service": []}))
+                }
+            }),
+        );
+        spawn_server(listener, app);
+        (format!("http://{addr}/dsp/catalog/request"), peak)
+    }
+
+    /// A catalog server that answers `200` while `up` is true and `503`
+    /// otherwise.
+    async fn spawn_switchable_catalog_server(up: Arc<std::sync::atomic::AtomicBool>) -> String {
+        let (listener, addr) = bind_localhost().await;
+        let app = axum::Router::new().route(
+            "/dsp/catalog/request",
+            axum::routing::post(move || async move {
+                if up.load(std::sync::atomic::Ordering::SeqCst) {
+                    axum::Json(json!({"@id": "switchable-catalog", "dataset": [], "service": []}))
+                        .into_response()
+                } else {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }),
+        );
+        spawn_server(listener, app);
+        format!("http://{addr}/dsp/catalog/request")
+    }
+
+    #[tokio::test]
+    async fn crawl_once_crawls_up_to_the_concurrency_limit_at_once() {
+        let (url, peak) = spawn_slow_catalog_server(Duration::from_millis(200)).await;
+        let participants: Vec<_> = (0..6)
+            .map(|i| {
+                let mut entry = participant(&format!("p{i}"));
+                entry.catalog_request_url = url.clone();
+                entry
+            })
+            .collect();
+        let limits = CrawlLimits {
+            concurrency: 3,
+            ..CrawlLimits::default()
+        };
+        let cache = InMemoryCatalogCache::new();
+
+        let summary = crawl_once(
+            &reqwest::Client::new(),
+            &participants,
+            None,
+            &cache,
+            &limits,
+        )
+        .await;
+
+        assert_eq!(summary.succeeded, 6, "summary: {summary:?}");
+        assert_eq!(
+            summary.succeeded_ids,
+            vec!["p0", "p1", "p2", "p3", "p4", "p5"],
+            "results stay in participant order"
+        );
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn crawl_once_fails_a_participant_that_outlasts_the_timeout_without_blocking_others() {
+        let (slow_url, _) = spawn_slow_catalog_server(Duration::from_secs(30)).await;
+        let (fast_url, _) = spawn_slow_catalog_server(Duration::ZERO).await;
+        let mut slow = participant("slow");
+        slow.catalog_request_url = slow_url;
+        let mut fast = participant("fast");
+        fast.catalog_request_url = fast_url;
+        let limits = CrawlLimits {
+            participant_timeout: Duration::from_millis(200),
+            ..CrawlLimits::default()
+        };
+        let cache = InMemoryCatalogCache::new();
+
+        let started = std::time::Instant::now();
+        let summary = crawl_once(
+            &reqwest::Client::new(),
+            &[slow, fast],
+            None,
+            &cache,
+            &limits,
+        )
+        .await;
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(summary.succeeded_ids, vec!["fast"]);
+        assert_eq!(summary.failures.len(), 1);
+        assert_eq!(summary.failures[0].0, "slow");
+        assert!(
+            summary.failures[0].1.contains("timed out"),
+            "unexpected error: {}",
+            summary.failures[0].1
+        );
+    }
+
+    #[tokio::test]
+    async fn harvester_keeps_a_failed_participants_catalog_until_it_is_older_than_the_max_age() {
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut entry = participant("flaky");
+        entry.catalog_request_url = spawn_switchable_catalog_server(up.clone()).await;
+        let cache: Arc<dyn CatalogCache> = Arc::new(InMemoryCatalogCache::new());
+        let limits = CrawlLimits {
+            max_catalog_age: Duration::from_millis(300),
+            ..CrawlLimits::default()
+        };
+        let mut harvester = Harvester::new(
+            cache.clone(),
+            vec![entry],
+            reqwest::Client::new(),
+            None,
+            limits,
+        );
+        let cached = || async {
+            cache
+                .query(CatalogQuery::for_node(NodeId::new("flaky")))
+                .await
+                .unwrap()
+                .len()
+        };
+
+        let report = harvester.run_cycle().await;
+        assert_eq!(report.summary.succeeded, 1);
+        assert_eq!(cached().await, 1);
+
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        let report = harvester.run_cycle().await;
+        assert_eq!(report.summary.failed, 1);
+        assert!(report.expired.is_empty());
+        assert_eq!(
+            cached().await,
+            1,
+            "a recent catalog survives a failed crawl"
+        );
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let report = harvester.run_cycle().await;
+        assert_eq!(report.expired, vec!["flaky"]);
+        assert_eq!(cached().await, 0, "a stale catalog is removed");
+
+        let report = harvester.run_cycle().await;
+        assert!(
+            report.expired.is_empty(),
+            "an expired catalog is removed once"
         );
     }
 }
