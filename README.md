@@ -33,7 +33,9 @@ Three serving surfaces, all non-DSP:
 - **`GET`/`POST /sparql`** — SPARQL 1.1 Protocol over the whole cache
   (all named graphs by default), read-only. See
   `rdf_store::oxigraph_backend::OxigraphCatalogCache::sparql_query_json`'s
-  doc comment for the full contract.
+  doc comment for the full contract. Each query is stopped with `503`
+  after `SPARQL_QUERY_TIMEOUT_MS` (default 10000), and a result over
+  `SPARQL_MAX_ROWS` rows (default 10000) is rejected with `400`.
 - **`POST /api/management/v4/catalogs/request`** — wire-compatible with
   real EDC Federated Catalog UI tooling
   (`edc-federated-catalog-client`'s `list_offers`/`get_offer_by_dataset_id`):

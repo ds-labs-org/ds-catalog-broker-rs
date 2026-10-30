@@ -651,8 +651,11 @@ pub mod oxigraph_backend {
         GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Quad,
         Term,
     };
+    pub use oxigraph::sparql::CancellationToken;
     use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
-    use oxigraph::sparql::{PreparedSparqlQuery, QueryResults, SparqlEvaluator};
+    use oxigraph::sparql::{
+        PreparedSparqlQuery, QueryEvaluationError, QueryResults, SparqlEvaluator,
+    };
     use oxigraph::store::StorageError;
     use spareval::{InternalQuad, QueryableDataset};
     use std::collections::{BTreeMap, BTreeSet};
@@ -729,6 +732,30 @@ pub mod oxigraph_backend {
         /// serializer/writer, not at the caller's query.
         #[error("failed to serialize SPARQL results: {0}")]
         Serialize(String),
+        /// [`SparqlLimits::cancellation`] was cancelled before evaluation
+        /// finished - `ds-catalog-broker-rs` cancels it when a query runs
+        /// past its time limit.
+        #[error("SPARQL query was cancelled before it finished")]
+        Cancelled,
+        /// The query produced more solutions than
+        /// [`SparqlLimits::max_rows`] allows. Evaluation stops at the first
+        /// row over the limit; nothing is returned rather than a silently
+        /// truncated result.
+        #[error("SPARQL query returned more than {0} rows - add a LIMIT or narrow the query")]
+        TooManyRows(usize),
+    }
+
+    /// Bounds on one [`OxigraphCatalogCache::sparql_query_json_limited`]
+    /// evaluation. The default bounds nothing.
+    #[derive(Clone, Default)]
+    pub struct SparqlLimits {
+        /// Checked by oxigraph on every triple-pattern lookup and result
+        /// row: once cancelled, evaluation stops with
+        /// [`SparqlError::Cancelled`] instead of running to completion.
+        pub cancellation: Option<CancellationToken>,
+        /// The most `SELECT` solutions a result may hold
+        /// ([`SparqlError::TooManyRows`] beyond it).
+        pub max_rows: Option<usize>,
     }
 
     pub type SparqlQueryResult<T> = Result<T, SparqlError>;
@@ -2036,12 +2063,7 @@ pub mod oxigraph_backend {
         /// - `CONSTRUCT`/`DESCRIBE` -> `Err(SparqlError::UnsupportedGraphResult)`,
         ///   see that variant's own doc comment.
         pub fn sparql_query_json(&self, query: &str) -> SparqlQueryResult<Vec<u8>> {
-            let prepared = Self::prepare_sparql(query)?;
-            let results = prepared
-                .on_store(self.store.inner())
-                .execute()
-                .map_err(|err| SparqlError::Evaluation(err.to_string()))?;
-            serialize_sparql_results(results)
+            self.sparql_query_json_limited(query, None, &SparqlLimits::default())
         }
 
         /// [`Self::sparql_query_json`], evaluated over only the part of the
@@ -2052,14 +2074,12 @@ pub mod oxigraph_backend {
         ///
         /// ## Why hide at the data level, not only in the query
         ///
-        /// Per-caller ODRL filtering of `/sparql` (in
-        /// `ds-catalog-broker-rs`) also rewrites the caller's query, but a
-        /// rewrite can only restrict the variables it recognizes as a
-        /// dataset subject: a sibling `UNION`/`OPTIONAL` branch, or any
-        /// triple pattern on another variable, can still read a hidden
-        /// dataset's triples. Filtering the data the query runs over is
-        /// sound for every query shape, because no pattern can match a
-        /// triple that is not there.
+        /// Rewriting the caller's query can only restrict the variables
+        /// it recognizes as a dataset subject: a sibling `UNION`/`OPTIONAL`
+        /// branch, or any triple pattern on another variable, can still
+        /// read a hidden dataset's triples. Filtering the data the query
+        /// runs over is sound for every query shape, because no pattern
+        /// can match a triple that is not there.
         ///
         /// ## What is hidden
         ///
@@ -2106,22 +2126,48 @@ pub mod oxigraph_backend {
             query: &str,
             visible_resource_iris: &BTreeSet<String>,
         ) -> SparqlQueryResult<Vec<u8>> {
-            let prepared = Self::prepare_sparql(query)?;
-            let results = prepared
-                .on_queryable_dataset(VisibleDataset {
-                    store: self.store.inner(),
-                    visible_resource_iris,
-                })
-                .execute()
-                .map_err(|err| SparqlError::Evaluation(err.to_string()))?;
-            serialize_sparql_results(results)
+            self.sparql_query_json_limited(
+                query,
+                Some(visible_resource_iris),
+                &SparqlLimits::default(),
+            )
+        }
+
+        /// [`Self::sparql_query_json`] (`visible_resource_iris: None`) or
+        /// [`Self::sparql_query_json_restricted`] (`Some`), bounded by
+        /// `limits` - see [`SparqlLimits`].
+        pub fn sparql_query_json_limited(
+            &self,
+            query: &str,
+            visible_resource_iris: Option<&BTreeSet<String>>,
+            limits: &SparqlLimits,
+        ) -> SparqlQueryResult<Vec<u8>> {
+            let prepared = Self::prepare_sparql(query, limits.cancellation.clone())?;
+            let results = match visible_resource_iris {
+                None => prepared.on_store(self.store.inner()).execute(),
+                Some(visible_resource_iris) => prepared
+                    .on_queryable_dataset(VisibleDataset {
+                        store: self.store.inner(),
+                        visible_resource_iris,
+                    })
+                    .execute(),
+            }
+            .map_err(evaluation_error)?;
+            serialize_sparql_results(results, limits.max_rows)
         }
 
         /// Parses `query` (Query grammar only - see "Why this is inherently
         /// read-only" on [`Self::sparql_query_json`]) and defaults its
         /// dataset to the union of every named graph.
-        fn prepare_sparql(query: &str) -> SparqlQueryResult<PreparedSparqlQuery> {
-            let mut prepared = SparqlEvaluator::new()
+        fn prepare_sparql(
+            query: &str,
+            cancellation: Option<CancellationToken>,
+        ) -> SparqlQueryResult<PreparedSparqlQuery> {
+            let mut evaluator = SparqlEvaluator::new();
+            if let Some(token) = cancellation {
+                evaluator = evaluator.with_cancellation_token(token);
+            }
+            let mut prepared = evaluator
                 .parse_query(query)
                 .map_err(|err| SparqlError::Parse(err.to_string()))?;
 
@@ -2132,7 +2178,17 @@ pub mod oxigraph_backend {
         }
     }
 
-    fn serialize_sparql_results(results: QueryResults<'_>) -> SparqlQueryResult<Vec<u8>> {
+    fn evaluation_error(err: QueryEvaluationError) -> SparqlError {
+        match err {
+            QueryEvaluationError::Cancelled => SparqlError::Cancelled,
+            err => SparqlError::Evaluation(err.to_string()),
+        }
+    }
+
+    fn serialize_sparql_results(
+        results: QueryResults<'_>,
+        max_rows: Option<usize>,
+    ) -> SparqlQueryResult<Vec<u8>> {
         let serializer = QueryResultsSerializer::from_format(QueryResultsFormat::Json);
         match results {
             QueryResults::Boolean(value) => serializer
@@ -2143,9 +2199,13 @@ pub mod oxigraph_backend {
                 let mut writer = serializer
                     .serialize_solutions_to_writer(Vec::new(), variables)
                     .map_err(|err| SparqlError::Serialize(err.to_string()))?;
-                for solution in solutions {
-                    let solution =
-                        solution.map_err(|err| SparqlError::Evaluation(err.to_string()))?;
+                for (row, solution) in solutions.enumerate() {
+                    if let Some(max_rows) = max_rows
+                        && row >= max_rows
+                    {
+                        return Err(SparqlError::TooManyRows(max_rows));
+                    }
+                    let solution = solution.map_err(evaluation_error)?;
                     writer
                         .serialize(&solution)
                         .map_err(|err| SparqlError::Serialize(err.to_string()))?;
@@ -3183,6 +3243,67 @@ pub mod oxigraph_backend {
             let cache = cache();
             let outcome = cache.sparql_query_json("this is not sparql at all");
             assert!(matches!(outcome, Err(SparqlError::Parse(_))));
+        }
+
+        // --- `sparql_query_json_limited` --------------------------------------
+
+        #[tokio::test]
+        async fn sparql_query_json_limited_stops_once_cancelled() {
+            let cache = cache();
+            cache
+                .upsert(sample_catalog("node-1", "cat-1"))
+                .await
+                .unwrap();
+            let token = CancellationToken::new();
+            token.cancel();
+            let limits = SparqlLimits {
+                cancellation: Some(token),
+                max_rows: None,
+            };
+            let visible = BTreeSet::new();
+            for visible in [None, Some(&visible)] {
+                let outcome = cache.sparql_query_json_limited(
+                    "SELECT * WHERE { ?a ?b ?c . ?d ?e ?f }",
+                    visible,
+                    &limits,
+                );
+                assert!(
+                    matches!(outcome, Err(SparqlError::Cancelled)),
+                    "got {outcome:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn sparql_query_json_limited_rejects_more_rows_than_max_rows() {
+            let cache = cache();
+            cache
+                .upsert(sample_catalog("node-a", "cat-a"))
+                .await
+                .unwrap();
+            cache
+                .upsert(sample_catalog("node-b", "cat-b"))
+                .await
+                .unwrap();
+            let query = format!(
+                "PREFIX dcat: <{DCAT_NS}> SELECT ?catalog WHERE {{ ?catalog a dcat:Catalog }}"
+            );
+            let limited = |max_rows| SparqlLimits {
+                cancellation: None,
+                max_rows: Some(max_rows),
+            };
+
+            let outcome = cache.sparql_query_json_limited(&query, None, &limited(1));
+            assert!(
+                matches!(outcome, Err(SparqlError::TooManyRows(1))),
+                "got {outcome:?}"
+            );
+
+            let bytes = cache
+                .sparql_query_json_limited(&query, None, &limited(2))
+                .expect("exactly max_rows rows is within the limit");
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(parsed["results"]["bindings"].as_array().unwrap().len(), 2);
         }
 
         // --- `sparql_query_json_restricted` -----------------------------------
