@@ -10,9 +10,14 @@ vendored [`contreforts-config`](../vendor/contreforts-config) crate's
 
 | Value | Read as |
 |---|---|
-| `/etc/broker` or `file:///etc/broker` (a directory) | A `contreforts-config` datadir, opened with `ConfigStore::open`, which loads `<dir>/config_graph.ttl`. |
+| `/etc/broker` or `file:///etc/broker` (a directory) | A `contreforts-config` datadir: `<dir>/config_graph.ttl` is read. |
 | `/etc/broker/broker.ttl` or `file:///etc/broker/broker.ttl` (a file) | That Turtle document. |
 | `https://config.example.org/broker.ttl` (or `http://`) | A Turtle document fetched once at startup with `Accept: text/turtle`. Relative IRIs in it resolve against the URL. |
+
+The broker never writes to its configuration. A datadir is read directly,
+not through `ConfigStore::open`, so a missing directory is not created and a
+corrupt `config_graph.ttl` is not repaired from its `.bak.N` backups; both
+stop the broker instead.
 
 Any other URL scheme, a `file://` URL with a host, a path that can't be
 read, a non-2xx HTTP answer, or Turtle that doesn't parse stops the broker

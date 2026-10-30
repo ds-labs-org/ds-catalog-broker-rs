@@ -8,8 +8,8 @@
 //! graph ([`CONFIG_GRAPH`]). `CONFIG_STORE_PATH` - the only environment variable in the
 //! configuration path, since something has to say where the Turtle is - names it as one of:
 //!
-//! - **a plain path or a `file:///` URL to a directory**: a `contreforts-config` datadir,
-//!   opened with [`ConfigStore::open`], which loads `<dir>/config_graph.ttl`;
+//! - **a plain path or a `file:///` URL to a directory**: a `contreforts-config` datadir, of
+//!   which only `<dir>/config_graph.ttl` is read;
 //! - **a plain path or a `file:///` URL to a file**: that Turtle document itself;
 //! - **an `http://` or `https://` URL**: a Turtle document fetched once at startup. A non-2xx
 //!   answer is an error, not an empty config. Relative IRIs in it resolve against the URL.
@@ -21,8 +21,15 @@
 //!
 //! When `CONFIG_STORE_PATH` is unset and the per-user default datadir holds no
 //! `config_graph.ttl`, the broker starts with every setting unset (built-in defaults) - without
-//! creating that directory, which `ConfigStore::open` would otherwise do. An explicit
-//! `CONFIG_STORE_PATH` that cannot be read *is* an error: the operator asked for that file.
+//! creating that directory. An explicit `CONFIG_STORE_PATH` that cannot be read *is* an error:
+//! the operator asked for that file.
+//!
+//! # Read-only
+//!
+//! The broker never writes to its configuration. A datadir is read directly rather than
+//! through [`ConfigStore::open`], which would create a missing directory and repair a corrupt
+//! `config_graph.ttl` from its `.bak.N` backups - both writes - see
+//! [`BrokerSettings::from_location`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -37,6 +44,9 @@ use reqwest::Url;
 
 /// This broker's configuration vocabulary. Every [`Setting::property`] is a local name in it.
 pub const BROKER_NS: &str = "https://catalog-broker.ds-labs.org/ontologies/config#";
+
+/// The file a `contreforts-config` datadir keeps its config graph in.
+pub const CONFIG_GRAPH_FILE: &str = "config_graph.ttl";
 
 /// `contreforts-config`'s own datadir override (private to that crate, so spelled again here).
 pub const CONFIG_STORE_PATH_ENV: &str = "CONFIG_STORE_PATH";
@@ -176,7 +186,7 @@ impl BrokerSettings {
         let location = match raw {
             Some(raw) => ConfigLocation::parse(&raw)?,
             None => match ConfigStoreConfig::per_user_default() {
-                Ok(path) if path.join("config_graph.ttl").is_file() => ConfigLocation::Local(path),
+                Ok(path) if path.join(CONFIG_GRAPH_FILE).is_file() => ConfigLocation::Local(path),
                 Ok(path) => {
                     tracing::info!(
                         path = %path.display(),
@@ -206,26 +216,35 @@ impl BrokerSettings {
         Ok(settings)
     }
 
-    /// Read the config at `location`: a datadir through [`ConfigStore::open`], a local Turtle
-    /// file, or a remote Turtle document.
+    /// Read the config at `location`: `<dir>/config_graph.ttl` for a datadir, a local Turtle
+    /// file, or a remote Turtle document. Read-only in every case: a datadir is deliberately
+    /// *not* opened with [`ConfigStore::open`], which creates a missing directory and rewrites a
+    /// corrupt `config_graph.ttl` from its `.bak.N` backups. A missing or unparsable file is an
+    /// error instead.
     pub async fn from_location(
         location: &ConfigLocation,
         http: &reqwest::Client,
     ) -> Result<Self, BrokerConfigError> {
         match location {
-            ConfigLocation::Local(path) if path.is_file() => {
-                let turtle = std::fs::read(path).map_err(|source| BrokerConfigError::Read {
-                    location: location.to_string(),
+            ConfigLocation::Local(path) => {
+                let file = if path.is_dir() {
+                    path.join(CONFIG_GRAPH_FILE)
+                } else {
+                    path.clone()
+                };
+                let turtle = std::fs::read(&file).map_err(|source| BrokerConfigError::Read {
+                    location: file.display().to_string(),
                     source,
                 })?;
-                let base = Url::from_file_path(path).ok();
+                let base = std::path::absolute(&file)
+                    .ok()
+                    .and_then(|abs| Url::from_file_path(abs).ok());
                 Self::from_turtle(
                     &turtle,
                     base.as_ref().map(Url::as_str),
-                    &location.to_string(),
+                    &file.display().to_string(),
                 )
             }
-            ConfigLocation::Local(path) => Self::from_store(&ConfigStore::open(path)?),
             ConfigLocation::Remote(url) => {
                 let fetch = |source| BrokerConfigError::Fetch {
                     location: location.to_string(),
@@ -570,5 +589,31 @@ mod tests {
             BrokerSettings::from_location(&location, &reqwest::Client::new()).await,
             Err(BrokerConfigError::Fetch { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_missing_datadir_is_an_error_and_is_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let location = ConfigLocation::Local(missing.clone());
+        assert!(matches!(
+            BrokerSettings::from_location(&location, &reqwest::Client::new()).await,
+            Err(BrokerConfigError::Read { .. })
+        ));
+        assert!(!missing.exists());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_datadir_file_is_an_error_and_is_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(CONFIG_GRAPH_FILE);
+        std::fs::write(&file, "not turtle").unwrap();
+        std::fs::write(dir.path().join("config_graph.ttl.bak.1"), ONE_SETTING).unwrap();
+        let location = ConfigLocation::Local(dir.path().to_path_buf());
+        assert!(matches!(
+            BrokerSettings::from_location(&location, &reqwest::Client::new()).await,
+            Err(BrokerConfigError::Parse { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "not turtle");
     }
 }
