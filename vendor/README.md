@@ -64,17 +64,16 @@ values `edition = "2024"`, `license = "MIT"`,
 `authors = ["Deepthought Solutions"]`. Making them members of this
 workspace instead means they inherit **this** repo's `[workspace.package]`
 values. `edition` and `authors` were matched deliberately (see the root
-`Cargo.toml`'s comments) so nothing actually changes for them. `license`
-was not: this project is genuinely Apache-2.0 (matching upstream Eclipse
-EDC, see the top-level README), so `contreforts-core`/`contreforts-config`
-report `Apache-2.0` as members of this workspace even though their real,
-upstream license is MIT. This is a `cargo metadata`-visible inaccuracy,
-not a functional one (these crates are never published, and nothing here
-redistributes their source), but it's worth knowing rather than
-discovering by surprise. Cargo has no per-member override for a
-`{ workspace = true }` field short of editing the vendored `Cargo.toml`
-itself, which isn't something this repo should do to someone else's
-upstream file.
+`Cargo.toml`'s comments) so nothing actually changes for them. So was
+`license`: the root `[workspace.package]` declares `license = "MIT"` only
+for `contreforts-config`'s benefit, while this project's own crates
+(`crates/*`, GPL-3.0-or-later) set their `license` field directly instead
+of inheriting it. `contreforts-core` and `contreforts-kg` declare no
+`license` field at all in their vendored `Cargo.toml`, so `cargo metadata`
+reports none for them; their real, upstream license is MIT. Cargo has no
+per-member override for a `{ workspace = true }` field short of editing
+the vendored `Cargo.toml` itself, which isn't something this repo should
+do to someone else's upstream file.
 
 ## Pin status
 

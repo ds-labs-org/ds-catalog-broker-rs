@@ -2,7 +2,7 @@
 name = "crawler"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 repository.workspace = true
 description = "The Federated Catalog Semantic Harvester's crawl engine: polls a local-config participant registry's DSP catalog endpoints (with optional DCP holder support), playing the DSP Consumer role, and upserts results into rdf-store's semantic (Oxigraph-backed) CatalogCache."
 
