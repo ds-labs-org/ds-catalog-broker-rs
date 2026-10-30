@@ -29,7 +29,9 @@ use axum::{
 use catalog_core::{Catalog, DataService, Dataset, Distribution, NodeId, Policy, PolicyKind, Rule};
 pub use dcp_core::HolderIdentity;
 pub use oauth2::{OAuth2Config, OAuth2Verifier, VerifyError};
-use rdf_store::oxigraph_backend::{OxigraphCatalogCache, SparqlError};
+use rdf_store::oxigraph_backend::{
+    CancellationToken, OxigraphCatalogCache, SparqlError, SparqlLimits,
+};
 use rdf_store::{CatalogCache, CatalogQuery, StoreResult};
 use serde::{Deserialize, Serialize};
 
@@ -111,8 +113,30 @@ impl SparqlLimitsConfig {
     /// integers). Unset falls back to the default silently; a value that
     /// is not a positive integer falls back to it with a warning.
     pub fn from_env() -> Self {
-        let _ = Self::default();
-        todo!()
+        let default = Self::default();
+        let timeout_ms = positive_env_var("SPARQL_QUERY_TIMEOUT_MS")
+            .unwrap_or(default.timeout.as_millis() as usize);
+        Self {
+            timeout: Duration::from_millis(timeout_ms as u64),
+            max_rows: positive_env_var("SPARQL_MAX_ROWS").unwrap_or(default.max_rows),
+        }
+    }
+}
+
+/// `name`'s value as a positive integer; `None` when unset, or (with a
+/// warning) when it is not one.
+fn positive_env_var(name: &str) -> Option<usize> {
+    let value = std::env::var(name).ok()?;
+    match value.trim().parse::<usize>() {
+        Ok(parsed) if parsed > 0 => Some(parsed),
+        _ => {
+            tracing::warn!(
+                name,
+                value,
+                "expected a positive integer; falling back to the default"
+            );
+            None
+        }
     }
 }
 
@@ -1171,6 +1195,9 @@ fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 ///   `DESCRIBE` (unsupported result shape - see `SparqlError`'s own doc
 ///   comments): 400 Bad Request with a plain-text explanation - these are
 ///   all the caller's own query's fault.
+/// - Evaluation runs on the blocking pool under [`SparqlLimitsConfig`]:
+///   past `timeout` it is cancelled and the caller gets 503 Service
+///   Unavailable; a result over `max_rows` rows is 400 Bad Request.
 /// - Otherwise: 200 with an `application/sparql-results+json` body.
 ///
 /// Checked first, ahead of all of the above: the OAuth2 Bearer gate (see
@@ -1236,9 +1263,32 @@ async fn sparql_route(
         None
     };
 
-    let result = match &visible_resources {
-        Some(visible) => sparql.sparql_query_json_restricted(&query, visible),
-        None => sparql.sparql_query_json(&query),
+    // Evaluation is synchronous and can be slow, so it runs on the
+    // blocking pool, never on an async worker. On timeout the token makes
+    // oxigraph stop at its next lookup or row instead of running on.
+    let cancellation = CancellationToken::new();
+    let limits = SparqlLimits {
+        cancellation: Some(cancellation.clone()),
+        max_rows: Some(state.sparql_limits.max_rows),
+    };
+    let sparql = Arc::clone(sparql);
+    let evaluation = tokio::task::spawn_blocking(move || {
+        sparql.sparql_query_json_limited(&query, visible_resources.as_ref(), &limits)
+    });
+    let result = match tokio::time::timeout(state.sparql_limits.timeout, evaluation).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_error)) => {
+            tracing::error!(error = %join_error, "SPARQL evaluation task failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SPARQL evaluation failed".to_string(),
+            )
+                .into_response();
+        }
+        Err(_elapsed) => {
+            cancellation.cancel();
+            Err(SparqlError::Cancelled)
+        }
     };
     match result {
         Ok(body) => (
@@ -1252,7 +1302,18 @@ async fn sparql_route(
             | SparqlError::Evaluation(_)
             | SparqlError::UnsupportedGraphResult),
         ) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-        Err(err @ (SparqlError::Cancelled | SparqlError::TooManyRows(_))) => todo!("{err}"),
+        Err(SparqlError::Cancelled) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "SPARQL query ran past the {} ms time limit and was stopped - add a LIMIT or \
+                 narrow the query",
+                state.sparql_limits.timeout.as_millis()
+            ),
+        )
+            .into_response(),
+        Err(err @ SparqlError::TooManyRows(_)) => {
+            (StatusCode::BAD_REQUEST, err.to_string()).into_response()
+        }
         Err(err @ SparqlError::Serialize(_)) => {
             tracing::error!(error = %err, "failed to serialize SPARQL results");
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()

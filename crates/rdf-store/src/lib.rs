@@ -2063,12 +2063,7 @@ pub mod oxigraph_backend {
         /// - `CONSTRUCT`/`DESCRIBE` -> `Err(SparqlError::UnsupportedGraphResult)`,
         ///   see that variant's own doc comment.
         pub fn sparql_query_json(&self, query: &str) -> SparqlQueryResult<Vec<u8>> {
-            let prepared = Self::prepare_sparql(query)?;
-            let results = prepared
-                .on_store(self.store.inner())
-                .execute()
-                .map_err(|err| SparqlError::Evaluation(err.to_string()))?;
-            serialize_sparql_results(results)
+            self.sparql_query_json_limited(query, None, &SparqlLimits::default())
         }
 
         /// [`Self::sparql_query_json`], evaluated over only the part of the
@@ -2079,14 +2074,12 @@ pub mod oxigraph_backend {
         ///
         /// ## Why hide at the data level, not only in the query
         ///
-        /// Per-caller ODRL filtering of `/sparql` (in
-        /// `ds-catalog-broker-rs`) also rewrites the caller's query, but a
-        /// rewrite can only restrict the variables it recognizes as a
-        /// dataset subject: a sibling `UNION`/`OPTIONAL` branch, or any
-        /// triple pattern on another variable, can still read a hidden
-        /// dataset's triples. Filtering the data the query runs over is
-        /// sound for every query shape, because no pattern can match a
-        /// triple that is not there.
+        /// Rewriting the caller's query can only restrict the variables
+        /// it recognizes as a dataset subject: a sibling `UNION`/`OPTIONAL`
+        /// branch, or any triple pattern on another variable, can still
+        /// read a hidden dataset's triples. Filtering the data the query
+        /// runs over is sound for every query shape, because no pattern
+        /// can match a triple that is not there.
         ///
         /// ## What is hidden
         ///
@@ -2133,15 +2126,11 @@ pub mod oxigraph_backend {
             query: &str,
             visible_resource_iris: &BTreeSet<String>,
         ) -> SparqlQueryResult<Vec<u8>> {
-            let prepared = Self::prepare_sparql(query)?;
-            let results = prepared
-                .on_queryable_dataset(VisibleDataset {
-                    store: self.store.inner(),
-                    visible_resource_iris,
-                })
-                .execute()
-                .map_err(|err| SparqlError::Evaluation(err.to_string()))?;
-            serialize_sparql_results(results)
+            self.sparql_query_json_limited(
+                query,
+                Some(visible_resource_iris),
+                &SparqlLimits::default(),
+            )
         }
 
         /// [`Self::sparql_query_json`] (`visible_resource_iris: None`) or
@@ -2153,15 +2142,32 @@ pub mod oxigraph_backend {
             visible_resource_iris: Option<&BTreeSet<String>>,
             limits: &SparqlLimits,
         ) -> SparqlQueryResult<Vec<u8>> {
-            let _ = (query, visible_resource_iris, limits);
-            todo!()
+            let prepared = Self::prepare_sparql(query, limits.cancellation.clone())?;
+            let results = match visible_resource_iris {
+                None => prepared.on_store(self.store.inner()).execute(),
+                Some(visible_resource_iris) => prepared
+                    .on_queryable_dataset(VisibleDataset {
+                        store: self.store.inner(),
+                        visible_resource_iris,
+                    })
+                    .execute(),
+            }
+            .map_err(evaluation_error)?;
+            serialize_sparql_results(results, limits.max_rows)
         }
 
         /// Parses `query` (Query grammar only - see "Why this is inherently
         /// read-only" on [`Self::sparql_query_json`]) and defaults its
         /// dataset to the union of every named graph.
-        fn prepare_sparql(query: &str) -> SparqlQueryResult<PreparedSparqlQuery> {
-            let mut prepared = SparqlEvaluator::new()
+        fn prepare_sparql(
+            query: &str,
+            cancellation: Option<CancellationToken>,
+        ) -> SparqlQueryResult<PreparedSparqlQuery> {
+            let mut evaluator = SparqlEvaluator::new();
+            if let Some(token) = cancellation {
+                evaluator = evaluator.with_cancellation_token(token);
+            }
+            let mut prepared = evaluator
                 .parse_query(query)
                 .map_err(|err| SparqlError::Parse(err.to_string()))?;
 
@@ -2172,7 +2178,17 @@ pub mod oxigraph_backend {
         }
     }
 
-    fn serialize_sparql_results(results: QueryResults<'_>) -> SparqlQueryResult<Vec<u8>> {
+    fn evaluation_error(err: QueryEvaluationError) -> SparqlError {
+        match err {
+            QueryEvaluationError::Cancelled => SparqlError::Cancelled,
+            err => SparqlError::Evaluation(err.to_string()),
+        }
+    }
+
+    fn serialize_sparql_results(
+        results: QueryResults<'_>,
+        max_rows: Option<usize>,
+    ) -> SparqlQueryResult<Vec<u8>> {
         let serializer = QueryResultsSerializer::from_format(QueryResultsFormat::Json);
         match results {
             QueryResults::Boolean(value) => serializer
@@ -2183,9 +2199,13 @@ pub mod oxigraph_backend {
                 let mut writer = serializer
                     .serialize_solutions_to_writer(Vec::new(), variables)
                     .map_err(|err| SparqlError::Serialize(err.to_string()))?;
-                for solution in solutions {
-                    let solution =
-                        solution.map_err(|err| SparqlError::Evaluation(err.to_string()))?;
+                for (row, solution) in solutions.enumerate() {
+                    if let Some(max_rows) = max_rows
+                        && row >= max_rows
+                    {
+                        return Err(SparqlError::TooManyRows(max_rows));
+                    }
+                    let solution = solution.map_err(evaluation_error)?;
                     writer
                         .serialize(&solution)
                         .map_err(|err| SparqlError::Serialize(err.to_string()))?;
