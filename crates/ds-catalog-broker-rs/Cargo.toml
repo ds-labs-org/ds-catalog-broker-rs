@@ -2,7 +2,7 @@
 name = "ds-catalog-broker-rs"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 repository.workspace = true
 description = "Axum HTTP server for the DSP Catalog Broker: harvests 1..N upstream DSP Catalog Services into a unified semantic (RDF) cache and serves it locally as a dataset-list-per-participant view and a SPARQL endpoint - it does not itself answer incoming DSP CatalogRequestMessages."
 

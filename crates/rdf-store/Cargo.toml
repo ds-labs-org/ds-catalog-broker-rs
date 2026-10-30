@@ -2,7 +2,7 @@
 name = "rdf-store"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 repository.workspace = true
 description = "The Federated Catalog Semantic Harvester's cache: a storage-agnostic async trait, an in-memory reference implementation, and an Oxigraph-backed (RDF/semantic) implementation."
 

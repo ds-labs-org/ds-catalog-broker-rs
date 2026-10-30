@@ -27,7 +27,12 @@ version = "0.1.0"
 # their authors wrote them against 2024 - lowering it back to 2021 for them
 # would be the actual behavior change, not raising ours.
 edition = "2024"
-license = "Apache-2.0"
+# MIT, not this project's own license: only the vendored contreforts-config
+# inherits `license.workspace = true` from here, and MIT is its real
+# upstream license. This project's own crates (crates/*) declare
+# `license = "GPL-3.0-or-later"` directly rather than inheriting, so that
+# relicensing them doesn't also mislabel someone else's vendored crate.
+license = "MIT"
 # contreforts-core/contreforts-config inherit `authors.workspace = true`;
 # matches the author string their own (unvendored) Cargo.toml used.
 authors = ["Deepthought Solutions"]

@@ -2,7 +2,7 @@
 name = "dcp-core"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 repository.workspace = true
 description = "Role-agnostic Decentralized Claims Protocol (DCP) primitives shared by a verifier (relying party) and a holder (credential presenter): compact-JWS sign/verify, did:web resolution, and the PresentationQueryMessage/PresentationResponseMessage wire shapes."
 

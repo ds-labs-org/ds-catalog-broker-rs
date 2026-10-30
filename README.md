@@ -204,4 +204,9 @@ keeps a real build of this product free of that dependency.
 
 ## License
 
-Apache-2.0, matching upstream Eclipse EDC. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+The vendored `contreforts-*` crates under `vendor/` keep their own
+upstream MIT license, and third-party files that carry their own license
+header (such as the Gradle wrapper scripts under `compliance/`) keep
+theirs.
