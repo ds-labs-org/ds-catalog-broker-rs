@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crawler::ParticipantsConfig;
 use dcp_core::HolderIdentity;
 use ds_catalog_broker_rs::oauth2::{OAuth2Config, OAuth2Verifier};
-use ds_catalog_broker_rs::{AppState, build_router, seed_sample_catalog};
+use ds_catalog_broker_rs::{AppState, SparqlLimitsConfig, build_router, seed_sample_catalog};
 use rdf_store::CatalogCache;
 use rdf_store::memory::InMemoryCatalogCache;
 
@@ -140,7 +140,8 @@ async fn main() {
     let mut state = AppState::new(cache)
         .with_holder(holder)
         .with_sparql(sparql)
-        .with_oauth2(oauth2_verifier);
+        .with_oauth2(oauth2_verifier)
+        .with_sparql_limits(SparqlLimitsConfig::from_env());
     state.http = http_client;
     let app = build_router(state);
 

@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub mod oauth2;
 pub mod odrl_filter;
@@ -77,6 +78,42 @@ pub struct AppState {
     /// see this file's own `tests` module (the "ODRL policy-based dataset
     /// visibility filtering" section) for the behavior this drives.
     pub policy_filter: odrl_filter::PolicyFilterConfig,
+    /// Time and size bounds on every `/sparql` evaluation - see
+    /// [`SparqlLimitsConfig`]. Defaults to `SparqlLimitsConfig::default()`.
+    pub sparql_limits: SparqlLimitsConfig,
+}
+
+/// Bounds on one `GET`/`POST /sparql` evaluation, so a caller-supplied
+/// query (every query shape is accepted, unauthenticated by default)
+/// cannot hold a worker thread or build an unbounded response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparqlLimitsConfig {
+    /// How long evaluation may run before it is cancelled and the caller
+    /// gets `503 Service Unavailable`. Default: 10 seconds.
+    pub timeout: Duration,
+    /// The most `SELECT` rows one response may hold; a larger result is
+    /// rejected with `400 Bad Request` rather than truncated. Default:
+    /// 10,000.
+    pub max_rows: usize,
+}
+
+impl Default for SparqlLimitsConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(10),
+            max_rows: 10_000,
+        }
+    }
+}
+
+impl SparqlLimitsConfig {
+    /// Reads `SPARQL_QUERY_TIMEOUT_MS` and `SPARQL_MAX_ROWS` (positive
+    /// integers). Unset falls back to the default silently; a value that
+    /// is not a positive integer falls back to it with a warning.
+    pub fn from_env() -> Self {
+        let _ = Self::default();
+        todo!()
+    }
 }
 
 impl AppState {
@@ -88,6 +125,7 @@ impl AppState {
             sparql: None,
             oauth2: None,
             policy_filter: odrl_filter::PolicyFilterConfig::default(),
+            sparql_limits: SparqlLimitsConfig::default(),
         }
     }
 
@@ -116,6 +154,13 @@ impl AppState {
     /// `policy_filter` field's doc comment.
     pub fn with_policy_filter(mut self, policy_filter: odrl_filter::PolicyFilterConfig) -> Self {
         self.policy_filter = policy_filter;
+        self
+    }
+
+    /// Builder-style setter for the `/sparql` limits. See the
+    /// `sparql_limits` field's doc comment.
+    pub fn with_sparql_limits(mut self, sparql_limits: SparqlLimitsConfig) -> Self {
+        self.sparql_limits = sparql_limits;
         self
     }
 }
@@ -1207,6 +1252,7 @@ async fn sparql_route(
             | SparqlError::Evaluation(_)
             | SparqlError::UnsupportedGraphResult),
         ) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        Err(err @ (SparqlError::Cancelled | SparqlError::TooManyRows(_))) => todo!("{err}"),
         Err(err @ SparqlError::Serialize(_)) => {
             tracing::error!(error = %err, "failed to serialize SPARQL results");
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
@@ -3321,5 +3367,72 @@ mod tests {
             "an empty-id gated dataset must not leak. Got: {values:?}"
         );
         assert!(values.iter().any(|v| v.contains("OPEN-DATASET")));
+    }
+
+    // --- SPARQL time and size limits ---------------------------------------
+
+    /// Runs `query` unauthenticated against the open + gated catalog with
+    /// `limits` applied, returning the status and body.
+    async fn sparql_with_limits(query: &str, limits: SparqlLimitsConfig) -> (StatusCode, String) {
+        let state = sparql_test_state().with_sparql_limits(limits);
+        state
+            .cache
+            .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))
+            .await
+            .unwrap();
+        let app = build_router(state);
+        let uri = format!("/sparql?query={}", urlencoding::encode(query));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn sparql_cancels_a_query_that_runs_past_its_time_limit_with_503() {
+        let started = std::time::Instant::now();
+        let (status, body) = sparql_with_limits(
+            "SELECT * WHERE { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i . ?j ?k ?l }",
+            SparqlLimitsConfig {
+                timeout: Duration::from_millis(50),
+                max_rows: usize::MAX,
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the response must not wait for the runaway query to finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparql_rejects_a_result_over_the_row_cap_with_400() {
+        let (status, body) = sparql_with_limits(
+            "SELECT * WHERE { ?s ?p ?o }",
+            SparqlLimitsConfig {
+                max_rows: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("LIMIT"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn sparql_answers_a_result_within_the_row_cap() {
+        let (status, body) = sparql_with_limits(
+            "SELECT * WHERE { ?s ?p ?o } LIMIT 3",
+            SparqlLimitsConfig {
+                max_rows: 3,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
     }
 }
