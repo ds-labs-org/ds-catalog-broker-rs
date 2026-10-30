@@ -9,11 +9,10 @@
 //! real entitlement/mapping logic (the original RED-phase commit had every
 //! one of them `todo!()`, with only the real, final signatures in place -
 //! see that commit's own message for the design this fills in). This
-//! module's own `#[cfg(test)] mod tests` passes end to end. `lib.rs` calls
-//! `dataset_is_visible` (via its own `filter_catalogs_by_policy` helper)
+//! module's own `#[cfg(test)] mod tests` passes end to end. `routes::policy`
+//! calls `dataset_is_visible` (via its `filter_catalogs_by_policy` helper)
 //! from both `GET /catalog` and `POST /api/management/v4/catalogs/request`,
-//! per that file's "ODRL policy-based dataset visibility filtering" test
-//! section, and via `visible_resource_iris` from `sparql_route`, which
+//! per `src/tests/policy.rs`, and via `visible_resource_iris` from `sparql_route`, which
 //! evaluates every filtered query over only what the caller may see, per
 //! that file's own "SPARQL ODRL policy-based filtering" test section.
 //!
