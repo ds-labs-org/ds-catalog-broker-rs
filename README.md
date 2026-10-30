@@ -34,8 +34,8 @@ Three serving surfaces, all non-DSP:
   (all named graphs by default), read-only. See
   `rdf_store::oxigraph_backend::OxigraphCatalogCache::sparql_query_json`'s
   doc comment for the full contract. Each query is stopped with `503`
-  after `SPARQL_QUERY_TIMEOUT_MS` (default 10000), and a result over
-  `SPARQL_MAX_ROWS` rows (default 10000) is rejected with `400`.
+  after `broker:sparqlQueryTimeoutMs` (default 10000), and a result over
+  `broker:sparqlMaxRows` rows (default 10000) is rejected with `400`.
 - **`POST /api/management/v4/catalogs/request`** — wire-compatible with
   real EDC Federated Catalog UI tooling
   (`edc-federated-catalog-client`'s `list_offers`/`get_offer_by_dataset_id`):
@@ -48,12 +48,19 @@ Three serving surfaces, all non-DSP:
   harvested dataset's own ODRL policy — see "Known gaps".
 
 All three can be gated behind an **OAuth2 Bearer** resource-server check
-(JWT + JWKS) — opt-in via `OAUTH2_JWKS_URI`, unauthenticated by default,
+(JWT + JWKS) — opt-in via `broker:oauth2JwksUri`, unauthenticated by default,
 independent of DCP (which stays scoped to the crawler's holder role
 below). See
 [`docs/oauth2-bearer-gating-2026-08-28.md`](docs/oauth2-bearer-gating-2026-08-28.md).
 
 ![This product implements the DSP spec's own Catalog Broker role: a Consumer with trusted access to 1..N Catalog Services, harvesting them into a semantic cache, served only via a dataset list, SPARQL, and a management API - never a DSP catalog-serving endpoint](docs/diagrams/harvester-deployment.svg)
+
+## Configuration
+
+Runtime settings come from a Turtle file (`config_graph.ttl`) loaded
+through the vendored `contreforts-config` store, located by
+`CONFIG_STORE_PATH`: a local path, a `file:///` URL, or an `http(s)://` URL. See [`docs/configuration.md`](docs/configuration.md)
+and [`docs/examples/config_graph.ttl`](docs/examples/config_graph.ttl).
 
 ## Crates
 

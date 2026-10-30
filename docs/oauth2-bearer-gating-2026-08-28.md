@@ -43,15 +43,19 @@ protected by their own DCP-based check, unrelated to this one).
 
 ## Config (opt-in, mirrors the `sparql`/`holder` pattern)
 
-| Env var | Required to enable | Meaning |
+Set as properties of the broker's Turtle config (see
+[configuration.md](configuration.md)); these were `OAUTH2_*` env vars when
+this document was written.
+
+| Property | Required to enable | Meaning |
 |---|---|---|
-| `OAUTH2_JWKS_URI` | yes | JWKS endpoint of the authorization server. Unset → gating stays off, both routes behave exactly as before. |
-| `OAUTH2_ISSUER` | no | Expected `iss` claim; checked only if set. |
-| `OAUTH2_AUDIENCE` | no | Expected `aud` claim; checked only if set. |
-| `OAUTH2_REQUIRED_SCOPE` | no | One scope that must appear in the token's space-delimited `scope` claim; checked only if set. |
+| `broker:oauth2JwksUri` | yes | JWKS endpoint of the authorization server. Unset → gating stays off, both routes behave exactly as before. |
+| `broker:oauth2Issuer` | no | Expected `iss` claim; checked only if set. |
+| `broker:oauth2Audience` | no | Expected `aud` claim; checked only if set. |
+| `broker:oauth2RequiredScope` | no | One scope that must appear in the token's space-delimited `scope` claim; checked only if set. |
 
 The JWKS is fetched once, eagerly, at startup (same failure posture as
-`CRAWLER_CONFIG_PATH`: a bad `OAUTH2_JWKS_URI` panics on boot rather than
+`broker:crawlerConfigPath`: a bad `broker:oauth2JwksUri` panics on boot rather than
 silently starting unauthenticated). **Known limitation, flagged rather than
 silently glossed over:** no background refresh or key-rotation handling
 yet — a JWKS rotated after startup requires a restart. Revisit if/when this
@@ -131,7 +135,7 @@ router can answer `403` instead of `401`.
 `with_oauth2` builder (mirrors `with_sparql`/`with_holder`).
 `check_oauth2_bearer` gates `GET /catalog` and `GET`/`POST /sparql` only;
 `/health` and the two `/dsp/holder/*` routes are untouched. `main.rs`'s
-`load_oauth2_config` reads the four `OAUTH2_*` env vars from the config
+`load_oauth2_config` reads the four `broker:oauth2*` settings from the config
 table above and fetches the verifier eagerly, before `AppState` is built;
 a configured-but-bad JWKS panics at boot with a clear message (same
 posture as `CRAWLER_CONFIG_PATH`).

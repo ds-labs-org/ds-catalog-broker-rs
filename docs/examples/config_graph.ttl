@@ -1,0 +1,30 @@
+# Example broker configuration - copy to <config store datadir>/config_graph.ttl.
+# Every setting is optional; the values below are the built-in defaults, except
+# where a comment says the setting has none. See docs/configuration.md.
+@prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:ds-catalog-broker:config> a broker:BrokerConfig ;
+    # Address the HTTP API listens on.
+    broker:httpApiAddr "127.0.0.1:8080" ;
+
+    # Participant registry (TOML). No default: unset serves one sample catalog
+    # from an in-memory cache, with no crawler and no /sparql.
+    broker:crawlerConfigPath "/etc/ds-catalog-broker/participants.toml" ;
+
+    # OAuth2 Bearer gating of /catalog and /sparql. No defaults: an unset
+    # oauth2JwksUri leaves both routes unauthenticated, and each of the other
+    # three is checked only when set.
+    broker:oauth2JwksUri "https://auth.example.org/.well-known/jwks.json" ;
+    broker:oauth2Issuer "https://auth.example.org" ;
+    broker:oauth2Audience "ds-catalog-broker" ;
+    broker:oauth2RequiredScope "catalog:read" ;
+
+    # Bounds on one /sparql evaluation.
+    broker:sparqlQueryTimeoutMs 10000 ;
+    broker:sparqlMaxRows 10000 ;
+
+    # ODRL policy-based dataset visibility filtering.
+    broker:policyFilterUnmappableConstraintAction "hide_dataset" ; # skip | drop_policy | hide_dataset
+    broker:policyFilterNoPolicyVisibility "open" ;                 # open | closed
+    broker:policyFilterRunWhenOauth2Disabled true .

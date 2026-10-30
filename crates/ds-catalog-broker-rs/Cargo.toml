@@ -42,8 +42,18 @@ engine = { git = "https://github.com/ds-labs-org/ds-odrl-engine-rs", rev = "9abe
 # from the current wall-clock time, mirroring `ds-sql-dps-rs`'s own
 # `dataplane/src/public.rs::get_file` pattern exactly.
 chrono = { workspace = true }
+# The broker's runtime configuration: a Turtle file loaded through
+# contreforts-config's ConfigStore - see src/config.rs and
+# docs/configuration.md. contreforts-core only for its CONFIG_GRAPH IRI;
+# oxigraph to read a standalone (local file or http(s)://) Turtle config
+# without a contreforts-config datadir.
+contreforts-config = { workspace = true }
+contreforts-core = { workspace = true }
+oxigraph = { workspace = true }
 
 [dev-dependencies]
+# A throwaway config store datadir per test in src/config.rs.
+tempfile = "3"
 tower = { workspace = true }
 http-body-util = "0.1"
 urlencoding = { workspace = true }

@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod config;
 pub mod oauth2;
 pub mod odrl_filter;
 
@@ -56,7 +57,7 @@ pub struct AppState {
     /// reach `OxigraphCatalogCache::sparql_query_json` - a capability that
     /// exists on that concrete type, not on the `CatalogCache` trait (see
     /// that method's own doc comment for why). `Some` exactly when `cache`
-    /// is backed by Oxigraph (i.e. `CRAWLER_CONFIG_PATH` was set, see
+    /// is backed by Oxigraph (i.e. `broker:crawlerConfigPath` was set, see
     /// `main.rs`); `None` when it's the plain in-memory backend, in which
     /// case `/sparql` answers 501 rather than pretending to support a
     /// query language that backend doesn't implement.
@@ -64,7 +65,7 @@ pub struct AppState {
     /// The OAuth2 Bearer resource-server gate for `GET /catalog` and
     /// `GET`/`POST /sparql` - see `oauth2`'s module doc and
     /// `docs/oauth2-bearer-gating-2026-08-28.md`. `Some` means gating is
-    /// active (set only when `OAUTH2_JWKS_URI` was configured, see
+    /// active (set only when `broker:oauth2JwksUri` was configured, see
     /// `main.rs`); `None` (the default) leaves both routes exactly as
     /// unauthenticated as before this feature existed. Never gates
     /// `/health` or the two `/dsp/holder/*` routes - those are unaffected
@@ -109,33 +110,20 @@ impl Default for SparqlLimitsConfig {
 }
 
 impl SparqlLimitsConfig {
-    /// Reads `SPARQL_QUERY_TIMEOUT_MS` and `SPARQL_MAX_ROWS` (positive
-    /// integers). Unset falls back to the default silently; a value that
-    /// is not a positive integer falls back to it with a warning.
-    pub fn from_env() -> Self {
+    /// Reads `broker:sparqlQueryTimeoutMs` and `broker:sparqlMaxRows` (positive
+    /// integers) from the broker config. Unset falls back
+    /// to the default silently; a value that is not a positive integer falls back to it with a
+    /// warning.
+    pub fn from_settings(settings: &config::BrokerSettings) -> Self {
         let default = Self::default();
-        let timeout_ms = positive_env_var("SPARQL_QUERY_TIMEOUT_MS")
+        let timeout_ms = settings
+            .positive_integer(config::SPARQL_QUERY_TIMEOUT_MS)
             .unwrap_or(default.timeout.as_millis() as usize);
         Self {
             timeout: Duration::from_millis(timeout_ms as u64),
-            max_rows: positive_env_var("SPARQL_MAX_ROWS").unwrap_or(default.max_rows),
-        }
-    }
-}
-
-/// `name`'s value as a positive integer; `None` when unset, or (with a
-/// warning) when it is not one.
-fn positive_env_var(name: &str) -> Option<usize> {
-    let value = std::env::var(name).ok()?;
-    match value.trim().parse::<usize>() {
-        Ok(parsed) if parsed > 0 => Some(parsed),
-        _ => {
-            tracing::warn!(
-                name,
-                value,
-                "expected a positive integer; falling back to the default"
-            );
-            None
+            max_rows: settings
+                .positive_integer(config::SPARQL_MAX_ROWS)
+                .unwrap_or(default.max_rows),
         }
     }
 }
@@ -1219,7 +1207,7 @@ async fn sparql_route(
         return (
             StatusCode::NOT_IMPLEMENTED,
             "this instance is running the in-memory catalog cache, which has no SPARQL \
-             (Oxigraph) backend - set CRAWLER_CONFIG_PATH to enable the SPARQL endpoint"
+             (Oxigraph) backend - set broker:crawlerConfigPath to enable the SPARQL endpoint"
                 .to_string(),
         )
             .into_response();

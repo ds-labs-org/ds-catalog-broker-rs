@@ -37,7 +37,13 @@ A minimal harness for running the official
 #    dsp-tck container can reach it (127.0.0.1 alone is not reachable
 #    from inside the container).
 cargo build --release -p http-api
-HTTP_API_ADDR=0.0.0.0:18080 ./target/release/http-api &
+mkdir -p /tmp/broker-config
+cat > /tmp/broker-config/config_graph.ttl <<'TTL'
+@prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .
+<urn:ds-catalog-broker:config> a broker:BrokerConfig ;
+    broker:httpApiAddr "0.0.0.0:18080" .
+TTL
+CONFIG_STORE_PATH=/tmp/broker-config ./target/release/http-api &
 
 # 2. Run the TCK against it.
 cd compliance
@@ -45,7 +51,7 @@ docker compose up --abort-on-container-exit
 ```
 
 (Port 18080, not 8080: some environments already have something bound to
-8080 — adjust both `HTTP_API_ADDR` and `tck.properties`' URLs together if
+8080 — adjust both `broker:httpApiAddr` and `tck.properties`' URLs together if
 you change it.)
 
 ## Result of the first baseline run (2026-08-27)

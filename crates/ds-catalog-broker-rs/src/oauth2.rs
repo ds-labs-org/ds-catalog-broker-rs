@@ -34,7 +34,7 @@ use thiserror::Error;
 
 /// Opt-in configuration for the OAuth2 Bearer gate - see the module doc
 /// and `docs/oauth2-bearer-gating-2026-08-28.md`'s config table for what
-/// each field means and how `main.rs` populates it from env vars.
+/// each field means and how `main.rs` populates it from the broker config.
 #[derive(Debug, Clone)]
 pub struct OAuth2Config {
     pub jwks_uri: String,
@@ -46,7 +46,7 @@ pub struct OAuth2Config {
 /// Failure fetching or parsing the JWKS at [`OAuth2Config::jwks_uri`] -
 /// returned by [`OAuth2Verifier::fetch`]. `main.rs` panics on any of
 /// these at startup, the same failure posture as a bad
-/// `CRAWLER_CONFIG_PATH` - see the design doc's config table.
+/// `broker:crawlerConfigPath` - see the design doc's config table.
 #[derive(Debug, Error)]
 pub enum JwksError {
     #[error("failed to fetch JWKS from {uri}: {source}")]

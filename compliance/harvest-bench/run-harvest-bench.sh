@@ -151,7 +151,15 @@ cp "$FEDCAT_DIR/logs/fedcat-crawler.log" "$RESULTS_DIR/edc-fedcat-crawler.log" 2
 
 # =========================== PHASE 2: this project's crates/crawler + ds-catalog-broker-rs ===
 log "=== PHASE 2: ds-catalog-broker-rs (crates/crawler + ds-catalog-broker-rs) ==="
-( cd "$REPO_ROOT" && HTTP_API_ADDR="$RUST_ADDR" CRAWLER_CONFIG_PATH="$SCRIPT_DIR/participants.toml" \
+RUST_CONFIG_DIR="$RESULTS_DIR/broker-config"
+mkdir -p "$RUST_CONFIG_DIR"
+cat > "$RUST_CONFIG_DIR/config_graph.ttl" <<TTL
+@prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .
+<urn:ds-catalog-broker:config> a broker:BrokerConfig ;
+    broker:httpApiAddr "$RUST_ADDR" ;
+    broker:crawlerConfigPath "$SCRIPT_DIR/participants.toml" .
+TTL
+( cd "$REPO_ROOT" && CONFIG_STORE_PATH="$RUST_CONFIG_DIR" \
     nohup ./target/release/ds-catalog-broker-rs > "$RESULTS_DIR/rust-http-api.log" 2>&1 & )
 
 sleep 5
