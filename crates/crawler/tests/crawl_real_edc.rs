@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use crawler::{ParticipantsConfig, crawl_once};
+use crawler::{CrawlLimits, ParticipantsConfig, crawl_once};
 use rdf_store::memory::InMemoryCatalogCache;
 use rdf_store::{CatalogCache, CatalogQuery};
 
@@ -45,7 +45,14 @@ async fn crawls_three_real_edc_instances_and_aggregates_all_seeded_datasets() {
     let cache = InMemoryCatalogCache::new();
     let http = reqwest::Client::new();
 
-    let summary = crawl_once(&http, &config.participants, None, &cache).await;
+    let summary = crawl_once(
+        &http,
+        &config.participants,
+        None,
+        &cache,
+        &CrawlLimits::default(),
+    )
+    .await;
 
     assert_eq!(
         summary.attempted, 3,

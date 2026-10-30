@@ -57,6 +57,9 @@ Every setting is optional.
 |---|---|---|---|
 | `broker:httpApiAddr` | `127.0.0.1:8080` | Address the HTTP API listens on. | `HTTP_API_ADDR` |
 | `broker:crawlerConfigPath` | unset | Path to the participant registry TOML. Unset serves one sample catalog from an in-memory cache, with no crawler and `/sparql` answering 501. | `CRAWLER_CONFIG_PATH` |
+| `broker:crawlTimeoutMs` | `30000` | How long one participant's crawl may take, credential presentation and response body included, before it counts as failed. Positive integer. | |
+| `broker:crawlConcurrency` | `8` | How many participants are crawled at the same time. Positive integer. | |
+| `broker:catalogMaxAgeSecs` | `86400` | A participant's cached catalog is removed once its last successful crawl is older than this, so a participant that stays down stops being served. A failed crawl keeps the previous catalog until then. Positive integer. | |
 | `broker:oauth2JwksUri` | unset | JWKS endpoint for OAuth2 Bearer gating of `/catalog` and `/sparql`. Unset leaves both unauthenticated. See [oauth2-bearer-gating-2026-08-28.md](oauth2-bearer-gating-2026-08-28.md). | `OAUTH2_JWKS_URI` |
 | `broker:oauth2Issuer` | unset | Expected `iss` claim; checked only if set. | `OAUTH2_ISSUER` |
 | `broker:oauth2Audience` | unset | Expected `aud` claim; checked only if set. | `OAUTH2_AUDIENCE` |

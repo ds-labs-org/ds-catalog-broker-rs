@@ -26,6 +26,10 @@ issues `CatalogRequestMessage`s to upstream Catalog Services and manages
 the results, but never becomes a Catalog Service itself. `crawl_once`
 issues one separate `POST .../catalog/request` per participant; DSP has
 no combined "give me everyone's catalog" request.
+Participants are crawled concurrently (`broker:crawlConcurrency`), each
+under a timeout (`broker:crawlTimeoutMs`). A failed crawl keeps the
+previous catalog until it is older than `broker:catalogMaxAgeSecs`, then
+it is removed.
 
 Three serving surfaces, all non-DSP:
 

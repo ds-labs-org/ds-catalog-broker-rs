@@ -70,6 +70,9 @@ impl Setting {
 
 pub const HTTP_API_ADDR: Setting = Setting::new("httpApiAddr");
 pub const CRAWLER_CONFIG_PATH: Setting = Setting::new("crawlerConfigPath");
+pub const CRAWL_TIMEOUT_MS: Setting = Setting::new("crawlTimeoutMs");
+pub const CRAWL_CONCURRENCY: Setting = Setting::new("crawlConcurrency");
+pub const CATALOG_MAX_AGE_SECS: Setting = Setting::new("catalogMaxAgeSecs");
 pub const OAUTH2_JWKS_URI: Setting = Setting::new("oauth2JwksUri");
 pub const OAUTH2_ISSUER: Setting = Setting::new("oauth2Issuer");
 pub const OAUTH2_AUDIENCE: Setting = Setting::new("oauth2Audience");
@@ -87,6 +90,9 @@ pub const POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED: Setting =
 pub const ALL_SETTINGS: &[Setting] = &[
     HTTP_API_ADDR,
     CRAWLER_CONFIG_PATH,
+    CRAWL_TIMEOUT_MS,
+    CRAWL_CONCURRENCY,
+    CATALOG_MAX_AGE_SECS,
     OAUTH2_JWKS_URI,
     OAUTH2_ISSUER,
     OAUTH2_AUDIENCE,
@@ -426,6 +432,7 @@ mod tests {
             Some("127.0.0.1:8080")
         );
         assert_eq!(settings.positive_integer(SPARQL_MAX_ROWS), Some(10_000));
+        assert_eq!(settings.positive_integer(CRAWL_CONCURRENCY), Some(8));
         assert_eq!(
             settings
                 .get(POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED)

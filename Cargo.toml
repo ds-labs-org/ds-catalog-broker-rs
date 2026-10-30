@@ -46,6 +46,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
+# Used by crawler's crawl_once to crawl participants concurrently with a
+# bound (`StreamExt::buffered`). Already in the graph through reqwest/axum.
+futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Below: added only because vendored contreforts-* members inherit these via

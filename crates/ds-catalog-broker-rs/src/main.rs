@@ -5,7 +5,9 @@ use dcp_core::HolderIdentity;
 use ds_catalog_broker_rs::config::{self, BrokerSettings};
 use ds_catalog_broker_rs::oauth2::{OAuth2Config, OAuth2Verifier};
 use ds_catalog_broker_rs::odrl_filter::PolicyFilterConfig;
-use ds_catalog_broker_rs::{AppState, SparqlLimitsConfig, build_router, seed_sample_catalog};
+use ds_catalog_broker_rs::{
+    AppState, SparqlLimitsConfig, build_router, crawl_limits_from_settings, seed_sample_catalog,
+};
 use rdf_store::CatalogCache;
 use rdf_store::memory::InMemoryCatalogCache;
 
@@ -125,13 +127,23 @@ async fn main() {
             );
             let cache: Arc<dyn CatalogCache> = store.clone();
             let holder = build_holder(&config);
+            let limits = crawl_limits_from_settings(&settings);
             tracing::info!(
                 participants = config.participants.len(),
                 interval_secs = config.interval_secs,
                 holder_configured = holder.is_some(),
+                timeout_ms = limits.participant_timeout.as_millis() as u64,
+                concurrency = limits.concurrency,
+                max_catalog_age_secs = limits.max_catalog_age.as_secs(),
                 "starting scheduled catalog crawler (crawlerConfigPath set); serving from an in-memory Oxigraph store, with /sparql enabled"
             );
-            crawler::spawn_scheduler(cache.clone(), config, http_client.clone(), holder.clone());
+            crawler::spawn_scheduler(
+                cache.clone(),
+                config,
+                http_client.clone(),
+                holder.clone(),
+                limits,
+            );
             (cache, holder, Some(store))
         }
         None => {
