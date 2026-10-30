@@ -602,22 +602,14 @@ pub mod memory {
 /// collide with today either way. Flagged rather than defended against,
 /// since nothing produces a colliding key today.
 ///
-/// **Test-coverage gap, not a functional one**: this crate's own tests
-/// prove the generic-properties round trip through a real
-/// `OxigraphCatalogCache` (write, then read back) with synthetic keys
-/// (e.g. `assetType`), and `ds_catalog_broker_rs`'s own tests prove
-/// `title`/`description`/etc. flow correctly from `Dataset.properties`
-/// into a real client-deserialized response - but against an
-/// `InMemoryCatalogCache`, bypassing this store entirely (see that
-/// crate's own `catalog_request_route_response_carries_optional_dataset_descriptors_through_to_the_real_client_type`
-/// test). No single automated test currently exercises the full chain -
-/// crawler parses a real DSP dataset's `title`/`description`/etc, upserts
-/// through *this* store, queries it back out - end to end. The live demo
-/// stack (`ds-labs-org/ds-dev-deployment`) does exercise exactly that
-/// chain, confirmed manually (real `title`/`description`/`thumbnail`/
-/// `keywords` observed in the served response), but that is not a
-/// repeatable, CI-enforced proof. Worth closing with a real test, not
-/// silently assumed to be covered because the pieces on either side are.
+/// **Test coverage**: this crate's own tests prove the generic-properties
+/// round trip through a real `OxigraphCatalogCache` (write, then read
+/// back) with synthetic keys (e.g. `assetType`), and
+/// `ds_catalog_broker_rs`'s
+/// `catalog_request_route_serves_crawled_dataset_descriptors_from_a_real_oxigraph_store`
+/// covers the full chain: the crawler parses a DSP dataset's
+/// `title`/`description`/etc., upserts it into *this* store, and the
+/// management API reads it back out.
 ///
 /// ### Ordering (`fcns:sequenceIndex`)
 ///

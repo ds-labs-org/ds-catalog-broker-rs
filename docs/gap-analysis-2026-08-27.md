@@ -1,8 +1,13 @@
 # Gap analysis: realigning to the Catalog Broker scope
 
 **Date:** 2026-08-27
-**Status:** analysis only — nothing in this document has been implemented yet. It exists
-to lead a later, separate corrective implementation pass.
+**Status:** implemented. Every item below has landed: the DSP-serving surface and its
+`dsp-tck` harness are gone (the harness is kept under `compliance/historical/`),
+`GET /catalog` stays the dataset-list surface, the Oxigraph cache stores real DCAT/ODRL
+triples, `/sparql` is live, harvested ODRL policies are preserved and enforced on all
+three serving surfaces (§3.4), the DCP-gated crawl test has its own mock provider, and
+the harvest benchmark was re-run against `GET /catalog`. The sections below are the
+original punch list, kept as the record of the scope correction.
 
 ## Why this document exists
 
