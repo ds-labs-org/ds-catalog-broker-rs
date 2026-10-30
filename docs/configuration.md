@@ -6,16 +6,28 @@ vendored [`contreforts-config`](../vendor/contreforts-config) crate's
 
 ## Where the file lives
 
-`ConfigStore` loads `<datadir>/config_graph.ttl` into its config graph
-(`https://contreforts.ds-labs.org/data/graph/config`). The datadir is
-resolved the way `contreforts-config` resolves it:
+`CONFIG_STORE_PATH` names the config, in one of these forms:
 
-1. `CONFIG_STORE_PATH`, when set and non-empty. A file there that cannot be
-   read or parsed stops the broker at startup.
-2. Otherwise `<os-data-dir>/config_store` (for example
-   `~/.local/share/config_store` on Linux), but only when that directory
-   already holds a `config_graph.ttl`. With no file there, the broker starts
-   with every setting at its default and does not create the directory.
+| Value | Read as |
+|---|---|
+| `/etc/broker` or `file:///etc/broker` (a directory) | A `contreforts-config` datadir, opened with `ConfigStore::open`, which loads `<dir>/config_graph.ttl`. |
+| `/etc/broker/broker.ttl` or `file:///etc/broker/broker.ttl` (a file) | That Turtle document. |
+| `https://config.example.org/broker.ttl` (or `http://`) | A Turtle document fetched once at startup with `Accept: text/turtle`. Relative IRIs in it resolve against the URL. |
+
+Any other URL scheme, a `file://` URL with a host, a path that can't be
+read, a non-2xx HTTP answer, or Turtle that doesn't parse stops the broker
+at startup. The config is read once at startup; restart the broker to pick
+up a change. Fetches go through the standard `HTTP(S)_PROXY` variables, as
+reqwest does by default.
+
+With `CONFIG_STORE_PATH` unset, the location is `contreforts-config`'s
+per-user default, `<os-data-dir>/config_store` (for example
+`~/.local/share/config_store` on Linux). It is used only when it already
+holds a `config_graph.ttl`. Otherwise the broker starts with every setting
+at its default and does not create the directory.
+
+Whichever form you use, the document's triples are read as the config
+graph (`https://contreforts.ds-labs.org/data/graph/config`).
 
 `CONFIG_STORE_PATH` is the only environment variable in the configuration
 path. `RUST_LOG` still controls log filtering.

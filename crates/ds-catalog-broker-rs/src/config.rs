@@ -5,24 +5,35 @@
 //! # Where the settings live
 //!
 //! Every setting is one property on a single `broker:BrokerConfig` resource in the config
-//! store's [`CONFIG_GRAPH`], which `ConfigStore::open` loads from `<datadir>/config_graph.ttl`.
-//! The datadir is the one `contreforts-config` itself resolves: `CONFIG_STORE_PATH` when set
-//! (the only environment variable in the configuration path - something has to say where the
-//! Turtle file is), otherwise `<os-data-dir>/config_store`. No setting is read from the
-//! environment.
+//! graph ([`CONFIG_GRAPH`]). `CONFIG_STORE_PATH` - the only environment variable in the
+//! configuration path, since something has to say where the Turtle is - names it as one of:
+//!
+//! - **a plain path or a `file:///` URL to a directory**: a `contreforts-config` datadir,
+//!   opened with [`ConfigStore::open`], which loads `<dir>/config_graph.ttl`;
+//! - **a plain path or a `file:///` URL to a file**: that Turtle document itself;
+//! - **an `http://` or `https://` URL**: a Turtle document fetched once at startup. A non-2xx
+//!   answer is an error, not an empty config. Relative IRIs in it resolve against the URL.
+//!
+//! Unset, the location is `contreforts-config`'s per-user default, `<os-data-dir>/config_store`.
+//! No setting is read from the environment.
 //!
 //! # No config store at all is not an error
 //!
 //! When `CONFIG_STORE_PATH` is unset and the per-user default datadir holds no
 //! `config_graph.ttl`, the broker starts with every setting unset (built-in defaults) - without
 //! creating that directory, which `ConfigStore::open` would otherwise do. An explicit
-//! `CONFIG_STORE_PATH` that cannot be opened *is* an error: the operator asked for that file.
+//! `CONFIG_STORE_PATH` that cannot be read *is* an error: the operator asked for that file.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use contreforts_config::{ConfigStore, ConfigStoreConfig, ConfigStoreError};
 use contreforts_core::namespaces::CONFIG_GRAPH;
+use oxigraph::io::{RdfFormat, RdfParser};
+use oxigraph::model::{GraphName, NamedNode, Term};
+use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::store::Store;
+use reqwest::Url;
 
 /// This broker's configuration vocabulary. Every [`Setting::property`] is a local name in it.
 pub const BROKER_NS: &str = "https://catalog-broker.ds-labs.org/ontologies/config#";
@@ -87,26 +98,85 @@ pub enum BrokerConfigError {
         "broker:{property} has {count} values on the broker:BrokerConfig resource; expected one"
     )]
     MultipleValues { property: String, count: usize },
+    #[error("{CONFIG_STORE_PATH_ENV}={0:?} is not a valid URL: {1}")]
+    InvalidUrl(String, String),
+    #[error(
+        "{CONFIG_STORE_PATH_ENV}={0:?} uses an unsupported URL scheme (expected file, http or https)"
+    )]
+    UnsupportedScheme(String),
+    #[error("failed to read {location}: {source}")]
+    Read {
+        location: String,
+        source: std::io::Error,
+    },
+    #[error("failed to fetch {location}: {source}")]
+    Fetch {
+        location: String,
+        source: reqwest::Error,
+    },
+    #[error("failed to parse the Turtle at {location}: {reason}")]
+    Parse { location: String, reason: String },
+    #[error("failed to query the config graph: {0}")]
+    Query(String),
+}
+
+/// Where `CONFIG_STORE_PATH` points - see the module doc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigLocation {
+    /// A local directory (a `contreforts-config` datadir) or Turtle file.
+    Local(PathBuf),
+    /// An `http(s)://` Turtle document.
+    Remote(Url),
+}
+
+impl ConfigLocation {
+    /// Parse a `CONFIG_STORE_PATH` value. Anything without `://` is a plain path; `file://`
+    /// URLs become paths; `http`/`https` stay URLs; any other scheme is rejected.
+    pub fn parse(raw: &str) -> Result<Self, BrokerConfigError> {
+        if !raw.contains("://") {
+            return Ok(Self::Local(PathBuf::from(raw)));
+        }
+        let url = Url::parse(raw)
+            .map_err(|err| BrokerConfigError::InvalidUrl(raw.to_string(), err.to_string()))?;
+        match url.scheme() {
+            "http" | "https" => Ok(Self::Remote(url)),
+            "file" => url.to_file_path().map(Self::Local).map_err(|()| {
+                BrokerConfigError::InvalidUrl(raw.to_string(), "not a local file path".to_string())
+            }),
+            _ => Err(BrokerConfigError::UnsupportedScheme(raw.to_string())),
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(path) => write!(f, "{}", path.display()),
+            Self::Remote(url) => write!(f, "{url}"),
+        }
+    }
 }
 
 /// The settings read from the Turtle file, keyed by [`Setting::property`].
 #[derive(Debug, Clone, Default)]
 pub struct BrokerSettings {
     values: HashMap<String, String>,
-    /// The config store directory the values came from. `None` when no store was opened.
-    source: Option<PathBuf>,
+    /// Where the values came from. `None` when no config was read.
+    source: Option<ConfigLocation>,
 }
 
 impl BrokerSettings {
-    /// Resolve the config store's datadir (see the module doc) and read it, if there is one.
-    pub fn load() -> Result<Self, BrokerConfigError> {
-        let explicit = std::env::var_os(CONFIG_STORE_PATH_ENV).is_some_and(|v| !v.is_empty());
+    /// Resolve `CONFIG_STORE_PATH` (see the module doc) and read the config it names, if
+    /// there is one. `http` is used only for an `http(s)://` location.
+    pub async fn load(http: &reqwest::Client) -> Result<Self, BrokerConfigError> {
+        let raw = std::env::var(CONFIG_STORE_PATH_ENV)
+            .ok()
+            .filter(|v| !v.is_empty());
 
-        let path = if explicit {
-            PathBuf::from(ConfigStoreConfig::from_env()?.config_store_path)
-        } else {
-            match ConfigStoreConfig::per_user_default() {
-                Ok(path) if path.join("config_graph.ttl").is_file() => path,
+        let location = match raw {
+            Some(raw) => ConfigLocation::parse(&raw)?,
+            None => match ConfigStoreConfig::per_user_default() {
+                Ok(path) if path.join("config_graph.ttl").is_file() => ConfigLocation::Local(path),
                 Ok(path) => {
                     tracing::info!(
                         path = %path.display(),
@@ -123,43 +193,127 @@ impl BrokerSettings {
                     );
                     return Ok(Self::default());
                 }
-            }
+            },
         };
 
-        let store = ConfigStore::open(&path)?;
-        let mut settings = Self::from_store(&store)?;
+        let mut settings = Self::from_location(&location, http).await?;
         tracing::info!(
-            path = %path.display(),
+            location = %location,
             settings = settings.values.len(),
-            "loaded broker configuration from the config store"
+            "loaded broker configuration"
         );
-        settings.source = Some(path);
+        settings.source = Some(location);
         Ok(settings)
     }
 
-    /// Read the `broker:BrokerConfig` resource from `store`'s [`CONFIG_GRAPH`].
+    /// Read the config at `location`: a datadir through [`ConfigStore::open`], a local Turtle
+    /// file, or a remote Turtle document.
+    pub async fn from_location(
+        location: &ConfigLocation,
+        http: &reqwest::Client,
+    ) -> Result<Self, BrokerConfigError> {
+        match location {
+            ConfigLocation::Local(path) if path.is_file() => {
+                let turtle = std::fs::read(path).map_err(|source| BrokerConfigError::Read {
+                    location: location.to_string(),
+                    source,
+                })?;
+                let base = Url::from_file_path(path).ok();
+                Self::from_turtle(
+                    &turtle,
+                    base.as_ref().map(Url::as_str),
+                    &location.to_string(),
+                )
+            }
+            ConfigLocation::Local(path) => Self::from_store(&ConfigStore::open(path)?),
+            ConfigLocation::Remote(url) => {
+                let fetch = |source| BrokerConfigError::Fetch {
+                    location: location.to_string(),
+                    source,
+                };
+                let turtle = http
+                    .get(url.clone())
+                    .header(reqwest::header::ACCEPT, "text/turtle")
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(fetch)?
+                    .bytes()
+                    .await
+                    .map_err(fetch)?;
+                Self::from_turtle(&turtle, Some(url.as_str()), &location.to_string())
+            }
+        }
+    }
+
+    /// Read a standalone Turtle document as the config graph.
+    pub fn from_turtle(
+        turtle: &[u8],
+        base_iri: Option<&str>,
+        location: &str,
+    ) -> Result<Self, BrokerConfigError> {
+        let parse = |reason: String| BrokerConfigError::Parse {
+            location: location.to_string(),
+            reason,
+        };
+        let store = Store::new().map_err(|err| parse(err.to_string()))?;
+        let graph = NamedNode::new(CONFIG_GRAPH).expect("CONFIG_GRAPH is a valid IRI");
+        let mut parser = RdfParser::from_format(RdfFormat::Turtle)
+            .with_default_graph(GraphName::NamedNode(graph));
+        if let Some(base) = base_iri {
+            parser = parser
+                .with_base_iri(base)
+                .map_err(|err| parse(err.to_string()))?;
+        }
+        store
+            .load_from_slice(parser, turtle)
+            .map_err(|err| parse(err.to_string()))?;
+        Self::from_graph(&store)
+    }
+
+    /// Read the `broker:BrokerConfig` resource from a `contreforts-config` store.
     pub fn from_store(store: &ConfigStore) -> Result<Self, BrokerConfigError> {
+        Self::from_graph(store.inner())
+    }
+
+    /// Read the `broker:BrokerConfig` resource from `store`'s [`CONFIG_GRAPH`].
+    fn from_graph(store: &Store) -> Result<Self, BrokerConfigError> {
+        let query_err = |err: &dyn std::fmt::Display| BrokerConfigError::Query(err.to_string());
         let sparql = format!(
             "SELECT ?s ?p ?o WHERE {{ GRAPH <{CONFIG_GRAPH}> {{ \
              ?s a <{BROKER_NS}BrokerConfig> ; ?p ?o \
              FILTER(STRSTARTS(STR(?p), \"{BROKER_NS}\")) }} }}"
         );
+        let prepared = SparqlEvaluator::new()
+            .parse_query(&sparql)
+            .map_err(|err| query_err(&err))?;
+        let QueryResults::Solutions(solutions) = prepared
+            .on_store(store)
+            .execute()
+            .map_err(|err| query_err(&err))?
+        else {
+            return Err(BrokerConfigError::Query("expected solutions".to_string()));
+        };
+
         let mut subjects = BTreeSet::new();
         let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for row in store.select(&sparql)? {
-            let field = |name: &str| {
-                row.iter()
-                    .find(|(var, _)| var == name)
-                    .map(|(_, value)| value.clone())
-            };
-            let (Some(s), Some(p), Some(o)) = (field("s"), field("p"), field("o")) else {
+        for solution in solutions {
+            let solution = solution.map_err(|err| query_err(&err))?;
+            let (Some(s), Some(Term::NamedNode(p)), Some(o)) =
+                (solution.get("s"), solution.get("p"), solution.get("o"))
+            else {
                 continue;
             };
-            subjects.insert(s);
+            let value = match o {
+                Term::Literal(literal) => literal.value().to_string(),
+                Term::NamedNode(node) => node.as_str().to_string(),
+                other => other.to_string(),
+            };
+            subjects.insert(s.to_string());
             found
-                .entry(p[BROKER_NS.len()..].to_string())
+                .entry(p.as_str()[BROKER_NS.len()..].to_string())
                 .or_default()
-                .push(o);
+                .push(value);
         }
         if subjects.len() > 1 {
             return Err(BrokerConfigError::MultipleConfigResources(subjects.len()));
@@ -219,9 +373,9 @@ impl BrokerSettings {
         }
     }
 
-    /// The config store directory the values were read from, if any.
-    pub fn source(&self) -> Option<&Path> {
-        self.source.as_deref()
+    /// Where the values were read from, if anywhere.
+    pub fn source(&self) -> Option<&ConfigLocation> {
+        self.source.as_ref()
     }
 }
 
@@ -323,5 +477,98 @@ mod tests {
         ]);
         assert_eq!(settings.positive_integer(SPARQL_MAX_ROWS), None);
         assert_eq!(settings.positive_integer(SPARQL_QUERY_TIMEOUT_MS), None);
+    }
+
+    const ONE_SETTING: &str = "@prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .\n\
+         <urn:broker> a broker:BrokerConfig ; broker:httpApiAddr \"0.0.0.0:9000\" .\n";
+
+    #[test]
+    fn parses_paths_and_urls() {
+        assert_eq!(
+            ConfigLocation::parse("/etc/broker").unwrap(),
+            ConfigLocation::Local(PathBuf::from("/etc/broker"))
+        );
+        assert_eq!(
+            ConfigLocation::parse("file:///etc/broker/config.ttl").unwrap(),
+            ConfigLocation::Local(PathBuf::from("/etc/broker/config.ttl"))
+        );
+        assert!(matches!(
+            ConfigLocation::parse("https://config.example.org/broker.ttl").unwrap(),
+            ConfigLocation::Remote(url) if url.as_str() == "https://config.example.org/broker.ttl"
+        ));
+        assert!(matches!(
+            ConfigLocation::parse("ftp://config.example.org/broker.ttl"),
+            Err(BrokerConfigError::UnsupportedScheme(_))
+        ));
+        assert!(matches!(
+            ConfigLocation::parse("file://remote-host/broker.ttl"),
+            Err(BrokerConfigError::InvalidUrl(..))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reads_a_datadir_via_a_file_url() {
+        let (dir, _store) = store_with(ONE_SETTING);
+        let url = Url::from_directory_path(dir.path()).unwrap();
+        let location = ConfigLocation::parse(url.as_str()).unwrap();
+        let settings = BrokerSettings::from_location(&location, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(settings.get(HTTP_API_ADDR).as_deref(), Some("0.0.0.0:9000"));
+    }
+
+    #[tokio::test]
+    async fn reads_a_standalone_turtle_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("broker.ttl");
+        std::fs::write(&file, ONE_SETTING).unwrap();
+        for raw in [
+            file.to_str().unwrap().to_string(),
+            Url::from_file_path(&file).unwrap().to_string(),
+        ] {
+            let location = ConfigLocation::parse(&raw).unwrap();
+            let settings = BrokerSettings::from_location(&location, &reqwest::Client::new())
+                .await
+                .unwrap();
+            assert_eq!(settings.get(HTTP_API_ADDR).as_deref(), Some("0.0.0.0:9000"));
+        }
+    }
+
+    #[test]
+    fn malformed_turtle_is_an_error() {
+        assert!(matches!(
+            BrokerSettings::from_turtle(b"this is not turtle", None, "test"),
+            Err(BrokerConfigError::Parse { .. })
+        ));
+    }
+
+    /// Serves `ONE_SETTING` at `/broker.ttl` and 404 everywhere else.
+    async fn serve_turtle() -> String {
+        use axum::{Router, routing::get};
+        let app = Router::new().route("/broker.ttl", get(|| async { ONE_SETTING }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn fetches_turtle_over_http() {
+        let base = serve_turtle().await;
+        let location = ConfigLocation::parse(&format!("{base}/broker.ttl")).unwrap();
+        let settings = BrokerSettings::from_location(&location, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(settings.get(HTTP_API_ADDR).as_deref(), Some("0.0.0.0:9000"));
+    }
+
+    #[tokio::test]
+    async fn an_http_error_status_is_an_error() {
+        let base = serve_turtle().await;
+        let location = ConfigLocation::parse(&format!("{base}/missing.ttl")).unwrap();
+        assert!(matches!(
+            BrokerSettings::from_location(&location, &reqwest::Client::new()).await,
+            Err(BrokerConfigError::Fetch { .. })
+        ));
     }
 }

@@ -57,17 +57,18 @@ fn build_holder(config: &ParticipantsConfig) -> Option<Arc<HolderIdentity>> {
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let http_client = reqwest::Client::new();
+
     // The Turtle config (see `ds_catalog_broker_rs::config`'s module doc).
-    // An explicit `CONFIG_STORE_PATH` that cannot be read panics on boot,
+    // An explicit `CONFIG_STORE_PATH` (path or URL) that cannot be read panics on boot,
     // the same failure posture as a bad crawler config below.
-    let settings = BrokerSettings::load()
+    let settings = BrokerSettings::load(&http_client)
+        .await
         .unwrap_or_else(|err| panic!("failed to load the broker configuration: {err}"));
 
     let addr = settings
         .get(config::HTTP_API_ADDR)
         .unwrap_or_else(|| DEFAULT_ADDR.to_string());
-
-    let http_client = reqwest::Client::new();
 
     // broker:oauth2JwksUri unset: `oauth2_verifier` stays `None` and both gated
     // routes are byte-identical to before this feature existed (see

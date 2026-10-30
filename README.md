@@ -59,7 +59,7 @@ below). See
 
 Runtime settings come from a Turtle file (`config_graph.ttl`) loaded
 through the vendored `contreforts-config` store, located by
-`CONFIG_STORE_PATH`. See [`docs/configuration.md`](docs/configuration.md)
+`CONFIG_STORE_PATH`: a local path, a `file:///` URL, or an `http(s)://` URL. See [`docs/configuration.md`](docs/configuration.md)
 and [`docs/examples/config_graph.ttl`](docs/examples/config_graph.ttl).
 
 ## Crates
