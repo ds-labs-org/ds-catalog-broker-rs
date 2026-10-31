@@ -297,8 +297,8 @@ pub(crate) mod test_support {
     //! ES256 signer built directly from `p256`, so the production
     //! `OAuth2Verifier` this exercises is proven against a signer sharing
     //! no code with either. `pub(crate)` (not private to this module) so
-    //! `lib.rs`'s own router-level integration tests can reuse it - see
-    //! that file's `oauth2` test section.
+    //! the crate's router-level tests can reuse it - see
+    //! `src/tests/bearer_gate.rs`.
 
     use axum::routing::get;
     use axum::{Json, Router};
@@ -313,7 +313,7 @@ pub(crate) mod test_support {
     /// this workspace already uses - see
     /// `crates/crawler/tests/multi_participant_crawl.rs`) serving `jwks`
     /// at `/jwks.json`, and returns that URL. Shared by this module's own
-    /// unit tests and by `lib.rs`'s router-level integration tests, so
+    /// unit tests and by the crate's router-level tests (`src/tests/`), so
     /// both prove the real fetch path (not just verification of an
     /// already-parsed key) against the same, one implementation of "spin
     /// up a mock JWKS endpoint".
