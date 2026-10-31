@@ -31,7 +31,7 @@ impl OxigraphCatalogCache {
     /// ## Why the whole store, not one named graph, by default
     ///
     /// A crawled catalog's triples live in a per-origin-node named
-    /// graph (this module's own "Named graph" mapping above), not the
+    /// graph (the "Named graph" mapping in [`super`]'s module doc), not the
     /// default graph - so a plain `SELECT * WHERE { ?s ?p ?o }` with no
     /// `GRAPH` clause would, under SPARQL's normal rules, match only
     /// the (always-empty) default graph and never see any harvested
@@ -49,7 +49,7 @@ impl OxigraphCatalogCache {
     /// A caller that wants to scope to one participant still can,
     /// without any bespoke query-param feature, via SPARQL's own
     /// `GRAPH <iri>` clause (the exact graph IRI scheme is documented
-    /// above, under "Resource IRIs") - or via the query's own
+    /// in [`super`]'s module doc, under "Resource IRIs") - or via the query's own
     /// `FROM`/`FROM NAMED`, which this method leaves untouched when
     /// present (`is_default_dataset()` is only true when the query
     /// didn't specify one itself). That satisfies the gap analysis's
@@ -68,7 +68,7 @@ impl OxigraphCatalogCache {
     /// Query - it is not reachable through this method at all, not
     /// merely rejected after being recognized. See
     /// `sparql_update_operation_is_rejected_not_silently_ignored`
-    /// below for a test proving this.
+    /// in `tests/sparql.rs` for a test proving this.
     ///
     /// ## Result shape
     ///

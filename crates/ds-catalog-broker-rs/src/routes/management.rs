@@ -14,9 +14,10 @@
 //! against that crate's `src/models/federated_catalog_offer.rs`,
 //! `dataset.rs`, `service.rs`, and `participant_id.rs` - not derived from
 //! them, since production code here doesn't depend on that crate at all
-//! (only this crate's tests do, in `src/tests/management.rs`) - but proven wire-identical by those
-//! same tests, which deserialize a real response body from this route with
-//! the real client crate's own `FederatedCatalogOffer` type.
+//! (only this crate's tests do, in `src/tests/management.rs`) - but
+//! proven wire-identical by those same tests, which deserialize a real
+//! response body from this route with the real client crate's own
+//! `FederatedCatalogOffer` type.
 
 use axum::{
     Json,

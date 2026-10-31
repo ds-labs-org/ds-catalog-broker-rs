@@ -44,8 +44,8 @@ use super::*;
 //    `#[serde(skip_serializing_if = "Vec::is_empty")]` already treats
 //    "no datasets" as an ordinary, representable state (see
 //    `catalog_request_route_response_serves_has_policy_as_an_empty_array_when_dataset_has_no_policies`
-//    in `management.rs` for the same "empty, not omitted" convention already used
-//    elsewhere in these tests) - a participant a caller has zero
+//    in `management.rs` for the same "empty, not omitted" convention
+//    already used elsewhere in these tests) - a participant a caller has zero
 //    entitlement into still gets to be *known about*, just with
 //    nothing they may see inside it.
 

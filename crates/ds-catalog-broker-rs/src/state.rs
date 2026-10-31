@@ -24,7 +24,7 @@ pub struct AppState {
     /// This connector's own DCP *holder* identity - set only when a
     /// crawler config with a `[holder]` section was loaded (see `main.rs`).
     /// `None` means this connector presents no credential of its own and
-    /// the two `/dsp/holder/*` routes below 404.
+    /// the two `/dsp/holder/*` routes (`routes::holder`) 404.
     pub holder: Option<Arc<HolderIdentity>>,
     /// The concrete Oxigraph-backed cache, held *in addition to* the
     /// type-erased `cache` field above, purely so `GET`/`POST /sparql` can

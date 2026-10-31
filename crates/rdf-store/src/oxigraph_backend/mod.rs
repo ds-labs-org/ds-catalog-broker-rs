@@ -1,7 +1,7 @@
 //! A real, Oxigraph-backed [`CatalogCache`], built on `contreforts-kg`'s
 //! `GraphStore` rather than the bare `oxigraph` crate's `Store` directly.
 //!
-//! See this module's own doc comment above ("Implemented backend") for why
+//! See the crate's own doc comment ("Implemented backend") for why
 //! `contreforts-kg` rather than raw `oxigraph`.
 //!
 //! ## Quad mapping (real RDF decomposition - gap analysis §3.2)
