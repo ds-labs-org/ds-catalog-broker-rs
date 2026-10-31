@@ -17,7 +17,7 @@ use super::*;
 // the failure mode that matters, not a loud error), every "hidden"
 // assertion below checks a policy-gated dataset's actual *absence*
 // from the parsed SPARQL JSON results, mirroring the REST-surface
-// negative-test discipline above - not merely that the response still
+// negative-test discipline in `policy.rs` - not merely that the response still
 // parses.
 
 /// Same idea as `oauth2_sparql_state`, but seeded with a caller-
@@ -46,9 +46,9 @@ async fn oauth2_sparql_state_with_catalog(
 
 /// `SELECT ?dataset WHERE { ?dataset a dcat:Dataset }` - the same
 /// bindable-dataset-IRI query shape `sparql_get_select_finds_datasets_from_both_seeded_participants`
-/// already uses above, run here against a catalog that mixes an open
+/// already uses in `sparql.rs`, run here against a catalog that mixes an open
 /// and a policy-gated dataset (`catalog_with_open_and_gated_datasets`,
-/// from the REST-surface filtering section above).
+/// from the REST-surface filtering tests in `policy.rs`).
 fn dataset_iri_query() -> String {
     "PREFIX dcat: <http://www.w3.org/ns/dcat#> \
      SELECT ?dataset WHERE { ?dataset a dcat:Dataset }"

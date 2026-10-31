@@ -31,8 +31,8 @@ pub(super) fn dataset_iri(node_base: &str, dataset_id: &str) -> NamedNode {
 
 /// The stable resource IRI a harvested dataset is stored under in this
 /// store's semantic cache - the exact string a `?x a dcat:Dataset`
-/// SPARQL binding for that dataset resolves to (see this module's own
-/// doc comment, "Resource IRIs"). Exposed publicly (unlike the private
+/// SPARQL binding for that dataset resolves to (see the `oxigraph_backend`
+/// module doc, "Resource IRIs"). Exposed publicly (unlike the private
 /// [`dataset_iri`] this wraps) so a caller layering per-caller ODRL
 /// policy filtering on top of
 /// [`OxigraphCatalogCache::sparql_query_json_restricted`] (gap analysis

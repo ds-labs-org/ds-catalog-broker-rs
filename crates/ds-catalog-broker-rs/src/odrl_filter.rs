@@ -12,9 +12,9 @@
 //! module's own `#[cfg(test)] mod tests` passes end to end. `routes::policy`
 //! calls `dataset_is_visible` (via its `filter_catalogs_by_policy` helper)
 //! from both `GET /catalog` and `POST /api/management/v4/catalogs/request`,
-//! per `src/tests/policy.rs`, and via `visible_resource_iris` from `sparql_route`, which
-//! evaluates every filtered query over only what the caller may see, per
-//! that file's own "SPARQL ODRL policy-based filtering" test section.
+//! per `src/tests/policy.rs`, and via `visible_resource_iris` from
+//! `sparql_route`, which evaluates every filtered query over only what the
+//! caller may see, per `src/tests/sparql_policy.rs`.
 //!
 //! ## Design: per-`(policy, action)` evaluation, OR'd across a dataset's
 //! own alternative offers

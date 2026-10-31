@@ -18,7 +18,7 @@ use crate::AppState;
 /// Optional filter for `GET /catalog`: `?node_id=...` narrows to the
 /// catalog crawled from a single origin node.
 #[derive(Debug, Deserialize)]
-pub(crate) struct CatalogParams {
+pub(super) struct CatalogParams {
     node_id: Option<String>,
 }
 

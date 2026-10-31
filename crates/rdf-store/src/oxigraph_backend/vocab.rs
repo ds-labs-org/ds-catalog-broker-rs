@@ -168,7 +168,7 @@ pub(super) fn odrl_assignee_pred() -> NamedNode {
     odrl("assignee")
 }
 
-/// `Policy.id`'s literal home - see the module doc's "Triples emitted"
+/// `Policy.id`'s literal home - see the `oxigraph_backend` module doc's "Triples emitted"
 /// section (policy resource bullets) for why this is a fallback
 /// `fcns:` term rather than an ODRL one.
 pub(super) fn policy_id_pred() -> NamedNode {
@@ -202,7 +202,7 @@ pub(super) fn policy_kind_from_class(class: &NamedNode) -> StoreResult<PolicyKin
 }
 
 /// The key/value-property fallback predicate for a key that isn't
-/// already an absolute IRI - see the module doc's "Generic properties".
+/// already an absolute IRI - see the `oxigraph_backend` module doc's "Generic properties".
 pub(super) fn property_predicate(key: &str) -> NamedNode {
     if let Ok(existing) = NamedNode::new(key) {
         existing

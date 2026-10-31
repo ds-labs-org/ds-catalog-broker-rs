@@ -81,7 +81,7 @@ async fn sparql_query_json_graph_clause_scopes_to_one_participant() {
 
 /// A real `ASK` query, through the same HTTP-facing method,
 /// against real harvested-looking data (the "rich" catalog fixture
-/// used elsewhere in this module).
+/// in `tests/mod.rs`).
 #[tokio::test]
 async fn sparql_query_json_ask_returns_the_spec_shaped_boolean_result() {
     let cache = cache();

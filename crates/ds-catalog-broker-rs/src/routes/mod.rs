@@ -56,13 +56,13 @@ pub(crate) struct HealthResponse {
     pub(crate) status: String,
 }
 
-pub(crate) async fn health() -> Json<HealthResponse> {
+async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
     })
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct ErrorResponse {
+struct ErrorResponse {
     error: String,
 }

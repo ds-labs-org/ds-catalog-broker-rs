@@ -3,8 +3,8 @@
 use super::*;
 
 impl OxigraphCatalogCache {
-    /// Write every triple for `catalog` into `graph` - see this
-    /// module's own doc comment for the exact mapping.
+    /// Write every triple for `catalog` into `graph` - see the
+    /// `oxigraph_backend` module doc for the exact mapping.
     pub(super) fn write_catalog(&self, catalog: &Catalog, graph: &NamedNode) -> StoreResult<()> {
         let base = node_base(&catalog.origin_node);
         let catalog_node = catalog_iri(&base, &catalog.id);
@@ -151,7 +151,7 @@ impl OxigraphCatalogCache {
     }
 
     /// Write every triple for one harvested `policy` into `policy_node`.
-    /// See the module doc's "Triples emitted" section (policy resource
+    /// See the `oxigraph_backend` module doc's "Triples emitted" section (policy resource
     /// bullets) for the exact mapping.
     pub(super) fn write_policy(
         &self,
@@ -286,13 +286,13 @@ impl OxigraphCatalogCache {
     /// rule's own top-level `constraint` list (0 for a top-level
     /// entry - see [`write_rule`]). `rightOperand` is always written as
     /// a plain literal, never through [`iri_or_literal_term`] - see the
-    /// module doc's "Triples emitted" section (constraint resource
+    /// `oxigraph_backend` module doc's "Triples emitted" section (constraint resource
     /// bullets) for why.
     ///
     /// A [`Constraint::Logical`] writes one `odrl:and`/`odrl:or`/
     /// `odrl:xone`/`odrl:andSequence` link triple per child (matching
     /// the combinator), then recurses into [`write_constraint`] for
-    /// each child at `depth + 1` - see the module doc's "Logical
+    /// each child at `depth + 1` - see the `oxigraph_backend` module doc's "Logical
     /// constraint groups" note. Bounded by [`MAX_CONSTRAINT_DEPTH`]: a
     /// child that would be written past the bound is skipped entirely,
     /// including its link triple, so no dangling/incomplete constraint

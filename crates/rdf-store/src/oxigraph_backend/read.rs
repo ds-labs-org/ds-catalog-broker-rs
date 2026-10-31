@@ -273,7 +273,7 @@ impl OxigraphCatalogCache {
     /// means logical, with that predicate's linked children loaded
     /// recursively (sorted by their own `fcns:sequenceIndex`, the same
     /// ordering bookkeeping every other list in this store uses - see
-    /// the module doc's "Ordering" section) and re-wrapped in the
+    /// the `oxigraph_backend` module doc's "Ordering" section) and re-wrapped in the
     /// matching combinator.
     pub(super) fn load_constraint(
         &self,
