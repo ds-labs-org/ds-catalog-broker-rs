@@ -467,6 +467,11 @@ async fn crawl_one(
 /// entry from a crawled participant degrades gracefully instead of taking
 /// down the whole crawl cycle.
 ///
+/// Datasets are deduplicated by id within one response, as services are:
+/// the first occurrence wins and later ones are skipped with a
+/// `tracing::warn!`. rdf-store derives resource IRIs from the dataset id,
+/// so keeping both would merge their triples into one mixed policy.
+///
 /// Also tolerates a "federation of federations" response - one where the
 /// crawled participant is itself a multi-participant aggregator (e.g.
 /// another instance of this workspace's own `ds-catalog-broker-rs`, once it has 2+
@@ -495,9 +500,18 @@ fn parse_catalog_response(value: &Value, participant: &ParticipantEntry) -> Cata
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    collect_datasets_and_services(value, &mut catalog);
+    collect_datasets_and_services(value, &mut catalog, &mut SeenIds::default());
 
     catalog
+}
+
+/// Ids already collected from one response, across all nesting levels.
+/// Sets keep the dedup linear; scanning the `Catalog` vectors per entry
+/// is quadratic on a large hostile body.
+#[derive(Default)]
+struct SeenIds {
+    datasets: std::collections::HashSet<String>,
+    services: std::collections::HashSet<String>,
 }
 
 /// Extract `value`'s own `service`/`dataset` entries into `catalog`, then
@@ -505,14 +519,14 @@ fn parse_catalog_response(value: &Value, participant: &ParticipantEntry) -> Cata
 /// `parse_catalog_response`'s doc comment for why. `value` is either the
 /// top-level response body or one nested `catalog[]` entry; both share the
 /// same `service`/`dataset`/`catalog` shape.
-fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog) {
+fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog, seen: &mut SeenIds) {
     // `service` entries first, so a dataset's nested `accessService`
     // object (parsed below) can be folded in without duplicating one
     // already listed here.
     if let Some(services) = value.get("service").and_then(Value::as_array) {
         for service_value in services {
             if let Some(service) = parse_data_service(service_value)
-                && !catalog.data_services.iter().any(|s| s.id == service.id)
+                && seen.services.insert(service.id.clone())
             {
                 catalog.data_services.push(service);
             }
@@ -528,6 +542,17 @@ fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog) {
             else {
                 continue;
             };
+
+            // The store derives resource IRIs from the dataset id, so two
+            // datasets with one id would merge their triples into a mixed
+            // policy. Keep the first, as for services.
+            if !seen.datasets.insert(dataset_id.to_string()) {
+                tracing::warn!(
+                    dataset_id,
+                    "skipping a crawled dataset whose id was already seen in this response (first one wins)"
+                );
+                continue;
+            }
 
             let mut dataset = Dataset {
                 id: dataset_id.to_string(),
@@ -578,7 +603,7 @@ fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog) {
                                 .unwrap_or_default()
                                 .to_string();
                             if let Some(service) = parse_data_service(access_service_value)
-                                && !catalog.data_services.iter().any(|s| s.id == service.id)
+                                && seen.services.insert(service.id.clone())
                             {
                                 catalog.data_services.push(service);
                             }
@@ -600,7 +625,7 @@ fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog) {
 
     if let Some(nested_catalogs) = value.get("catalog").and_then(Value::as_array) {
         for nested_value in nested_catalogs {
-            collect_datasets_and_services(nested_value, catalog);
+            collect_datasets_and_services(nested_value, catalog, seen);
         }
     }
 }
@@ -1061,6 +1086,69 @@ mod tests {
         let catalog = parse_catalog_response(&body, &participant);
         assert_eq!(catalog.datasets.len(), 1);
         assert_eq!(catalog.datasets[0].id, "CAT0102");
+    }
+
+    /// Two sub-catalogs advertise the same dataset id with opposite
+    /// policies. Both would land under the same store IRIs and merge into
+    /// one mixed policy, so only the first is kept (as with services), and
+    /// the dropped duplicate's nested access service is not folded in.
+    #[test]
+    fn duplicate_dataset_ids_keep_the_first_and_drop_the_rest() {
+        let policy = |op: &str| {
+            json!([{"permission": [{"action": "use", "constraint": [
+                {"leftOperand": "role", "operator": op, "rightOperand": "admin"}
+            ]}]}])
+        };
+        let body = json!({
+            "@id": "urn:uuid:outer",
+            "catalog": [
+                {"dataset": [{
+                    "@id": "ds-1", "title": "first", "hasPolicy": policy("eq"),
+                    "distribution": [{"format": "json", "accessService": "svc-a"}]
+                }], "service": [{"@id": "svc-a", "endpointURL": "https://a.example.org"}]},
+                {"dataset": [{
+                    "@id": "ds-1", "title": "second", "hasPolicy": policy("neq"),
+                    "distribution": [{"format": "json", "accessService": {"@id": "svc-b", "endpointURL": "https://b.example.org"}}]
+                }]}
+            ]
+        });
+        let catalog = parse_catalog_response(&body, &participant("agg"));
+        assert_eq!(catalog.datasets.len(), 1);
+        let ds = &catalog.datasets[0];
+        assert_eq!(
+            ds.properties.get("title").map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(ds.distributions.len(), 1);
+        assert_eq!(ds.distributions[0].access_service, "svc-a");
+        assert_eq!(
+            ds.policies[0].permissions[0].constraints,
+            vec![Constraint::atomic("role", "eq", "admin")]
+        );
+        assert!(catalog.data_services.iter().all(|s| s.id != "svc-b"));
+    }
+
+    /// Dedup must stay linear in the number of entries: a crawled body of a
+    /// few MB with unique ids is parsed synchronously inside the async task,
+    /// where the per-participant timeout cannot interrupt it. A quadratic
+    /// scan took tens of seconds at this size in a debug build.
+    #[test]
+    fn parsing_many_unique_datasets_and_services_stays_linear() {
+        let n = 60_000;
+        let datasets: Vec<Value> = (0..n).map(|i| json!({"@id": format!("ds-{i}")})).collect();
+        let services: Vec<Value> = (0..n)
+            .map(|i| json!({"@id": format!("svc-{i}"), "endpointURL": "https://x.example.org"}))
+            .collect();
+        let body = json!({"dataset": datasets, "service": services});
+        let start = std::time::Instant::now();
+        let catalog = parse_catalog_response(&body, &participant("big"));
+        let elapsed = start.elapsed();
+        assert_eq!(catalog.datasets.len(), n);
+        assert_eq!(catalog.data_services.len(), n);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "parsing {n} datasets and services took {elapsed:?}, expected linear time"
+        );
     }
 
     /// "Federation of federations": the crawled participant is itself a
