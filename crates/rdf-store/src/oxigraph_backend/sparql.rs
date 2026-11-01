@@ -7,6 +7,11 @@ use super::*;
 /// runs a query before giving up because the store keeps changing.
 pub const POLICY_FILTERED_ATTEMPTS: usize = 5;
 
+/// Longest a policy-filtered query waits for one in-progress write to
+/// commit before returning [`SparqlError::StoreBusy`]. Waiting does not
+/// use up an attempt.
+const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl OxigraphCatalogCache {
     /// Evaluate an arbitrary, caller-supplied SPARQL query and return
     /// the result serialized as
@@ -157,6 +162,10 @@ impl OxigraphCatalogCache {
     /// allow-list included, runs again. After [`POLICY_FILTERED_ATTEMPTS`]
     /// attempts the call returns [`SparqlError::StoreBusy`].
     ///
+    /// Waiting for a write that is still committing does not use up an
+    /// attempt; it is bounded by `WRITE_WAIT` and by the caller's
+    /// cancellation token.
+    ///
     /// Writers are never blocked. A crawl that commits rarely sees one
     /// retry; one that commits continuously can starve a long query,
     /// which then ends in `StoreBusy` (or the caller's time limit).
@@ -173,15 +182,29 @@ impl OxigraphCatalogCache {
         limits: &SparqlLimits,
     ) -> SparqlQueryResult<Vec<u8>> {
         for _ in 0..POLICY_FILTERED_ATTEMPTS {
-            let before = self.write_sequence.load(Ordering::SeqCst);
-            if before % 2 == 1 {
-                // A write is committing; it is short, so wait it out.
+            // A write is committing: wait it out, bounded by `WRITE_WAIT`,
+            // without using up an attempt.
+            let waiting_since = std::time::Instant::now();
+            let before = loop {
+                let sequence = self.write_sequence.load(Ordering::SeqCst);
+                if sequence.is_multiple_of(2) {
+                    break sequence;
+                }
+                if limits
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+                {
+                    return Err(SparqlError::Cancelled);
+                }
+                if waiting_since.elapsed() >= WRITE_WAIT {
+                    return Err(SparqlError::StoreBusy);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(2));
-                continue;
-            }
+            };
             let catalogs = self
                 .catalogs(CatalogQuery::all())
-                .map_err(|err| SparqlError::Evaluation(err.to_string()))?;
+                .map_err(|err| SparqlError::Store(err.to_string()))?;
             let visible = allow_list(&catalogs);
             drop(catalogs);
             let result = self.sparql_query_json_limited(query, Some(&visible), limits);

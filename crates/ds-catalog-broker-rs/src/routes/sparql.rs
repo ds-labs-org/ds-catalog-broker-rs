@@ -256,6 +256,10 @@ pub(super) async fn sparql_route(
             | SparqlError::Evaluation(_)
             | SparqlError::UnsupportedGraphResult),
         ) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        Err(SparqlError::Store(err)) => {
+            tracing::error!(error = %err, "catalog store read failed during SPARQL query");
+            internal_error("SPARQL evaluation failed")
+        }
         Err(SparqlError::StoreBusy) => (
             StatusCode::SERVICE_UNAVAILABLE,
             SparqlError::StoreBusy.to_string(),

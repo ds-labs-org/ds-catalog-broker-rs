@@ -416,6 +416,11 @@ pub enum SparqlError {
     /// error in a `FILTER` expression).
     #[error("SPARQL query evaluation failed: {0}")]
     Evaluation(String),
+    /// Reading the store itself failed (for example a stored catalog no
+    /// longer decodes). This is a server fault, not a problem with the
+    /// caller's query.
+    #[error("catalog store read failed: {0}")]
+    Store(String),
     /// The query was a well-formed `CONSTRUCT`/`DESCRIBE` - this
     /// method only serializes `SELECT`/`ASK` results (the gap
     /// analysis's stated minimum), since a graph result needs a

@@ -687,3 +687,56 @@ fn policy_filtered_query_gives_up_when_the_store_keeps_changing() {
     assert!(matches!(result, Err(SparqlError::StoreBusy)), "{result:?}");
     assert_eq!(calls, POLICY_FILTERED_ATTEMPTS);
 }
+
+/// Waiting for one slow write is not a retry: it does not use up an
+/// attempt, however long the write takes (within the wait bound).
+#[test]
+fn policy_filtered_query_waits_out_a_slow_write_without_using_attempts() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    // Odd sequence: a write is in progress. It commits after far longer
+    // than POLICY_FILTERED_ATTEMPTS sleeps of 2 ms.
+    let sequence = cache.write_sequence.clone();
+    sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let mut calls = 0;
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            "SELECT ?o WHERE { ?s ?p ?o }",
+            |catalogs| {
+                calls += 1;
+                public_only(catalogs)
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    writer.join().unwrap();
+    assert_eq!(calls, 1);
+    assert!(binding_values(&body).iter().any(|v| v == "title-v1"));
+}
+
+/// A cancelled query stops waiting for a write.
+#[test]
+fn policy_filtered_query_stops_waiting_when_cancelled() {
+    let cache = cache();
+    cache
+        .write_sequence
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let token = CancellationToken::new();
+    token.cancel();
+    let limits = SparqlLimits {
+        cancellation: Some(token),
+        ..SparqlLimits::default()
+    };
+    let result = cache.sparql_query_json_policy_filtered(
+        "SELECT ?o WHERE { ?s ?p ?o }",
+        public_only,
+        &limits,
+    );
+    assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+}
