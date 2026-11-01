@@ -141,6 +141,8 @@ pub const CRAWL_INTERVAL_SECS: Setting =
 pub const CRAWL_TIMEOUT_MS: Setting = Setting::new("crawlTimeoutMs", SettingKind::PositiveInteger);
 pub const CRAWL_CONCURRENCY: Setting =
     Setting::new("crawlConcurrency", SettingKind::PositiveInteger);
+pub const CRAWL_MAX_RESPONSE_BYTES: Setting =
+    Setting::new("crawlMaxResponseBytes", SettingKind::PositiveInteger);
 pub const CATALOG_MAX_AGE_SECS: Setting =
     Setting::new("catalogMaxAgeSecs", SettingKind::PositiveInteger);
 pub const OAUTH2_JWKS_URI: Setting = Setting::new("oauth2JwksUri", SettingKind::Text);
@@ -171,6 +173,7 @@ pub const ALL_SETTINGS: &[Setting] = &[
     CRAWL_INTERVAL_SECS,
     CRAWL_TIMEOUT_MS,
     CRAWL_CONCURRENCY,
+    CRAWL_MAX_RESPONSE_BYTES,
     CATALOG_MAX_AGE_SECS,
     OAUTH2_JWKS_URI,
     OAUTH2_ISSUER,
@@ -190,6 +193,7 @@ const CRAWLER_SETTINGS: &[Setting] = &[
     CRAWL_INTERVAL_SECS,
     CRAWL_TIMEOUT_MS,
     CRAWL_CONCURRENCY,
+    CRAWL_MAX_RESPONSE_BYTES,
     CATALOG_MAX_AGE_SECS,
 ];
 
@@ -349,16 +353,7 @@ impl ConfigLocation {
 /// `localhost`, is not trusted as loopback: where it goes is up to the
 /// resolver.
 fn remote_allowed(url: &Url) -> bool {
-    match url.scheme() {
-        "https" => true,
-        "http" => url.host_str().is_some_and(|host| {
-            host.trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-        }),
-        _ => false,
-    }
+    crawler::remote_allowed(url)
 }
 
 /// The client that fetches a remote config: it follows a redirect only to a

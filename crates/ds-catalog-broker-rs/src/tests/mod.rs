@@ -69,6 +69,25 @@ fn sparql_limits_come_from_the_broker_config() {
 }
 
 #[test]
+fn crawl_max_response_bytes_comes_from_the_broker_config() {
+    let settings = config::BrokerSettings::from_values([(
+        "crawlMaxResponseBytes".to_string(),
+        "4096".to_string(),
+    )])
+    .unwrap();
+    assert_eq!(
+        crawl_limits_from_settings(&settings).max_response_bytes,
+        4096
+    );
+
+    let unset = config::BrokerSettings::from_values(std::iter::empty()).unwrap();
+    assert_eq!(
+        crawl_limits_from_settings(&unset).max_response_bytes,
+        crawler::DEFAULT_MAX_RESPONSE_BYTES
+    );
+}
+
+#[test]
 fn crawl_limits_come_from_the_broker_config() {
     let settings = config::BrokerSettings::from_values([
         ("crawlTimeoutMs".to_string(), "1500".to_string()),

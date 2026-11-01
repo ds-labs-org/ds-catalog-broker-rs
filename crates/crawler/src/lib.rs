@@ -76,7 +76,13 @@ pub struct CrawlLimits {
     /// successfully for this long is removed from the cache, so a
     /// participant that stays down stops being served. Default: 24 hours.
     pub max_catalog_age: Duration,
+    /// The most bytes of one participant's catalog response the crawler
+    /// reads before it gives up on that participant. Default: 16 MiB.
+    pub max_response_bytes: usize,
 }
+
+/// The default of [`CrawlLimits::max_response_bytes`].
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 impl Default for CrawlLimits {
     fn default() -> Self {
@@ -84,8 +90,90 @@ impl Default for CrawlLimits {
             participant_timeout: Duration::from_secs(30),
             concurrency: 8,
             max_catalog_age: Duration::from_secs(24 * 60 * 60),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
+}
+
+/// Whether a credential may be sent to, or a remote document fetched from,
+/// `url`: over https, or over plain http to a loopback address. A host
+/// name, even `localhost`, is not trusted as loopback: where it goes is up
+/// to the resolver.
+pub fn remote_allowed(url: &reqwest::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host_str().is_some_and(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
+/// The HTTP client for every outbound request the broker makes with a
+/// credential (catalog requests, OID4VP presentations) or that decides
+/// whom to trust (the JWKS fetch). It follows a redirect only to the same
+/// origin (scheme, host, port) as the request that was redirected, and at
+/// most ten redirects. Every first request goes to a URL the config
+/// checked (gated endpoints against [`remote_allowed`]), so a same-origin
+/// redirect stays within what was checked, and a redirect cannot carry a
+/// bearer token or a `vp_token` to another host, port or scheme. An
+/// ungated participant on a plain-http named host can redirect within
+/// its own origin.
+pub fn outbound_client() -> reqwest::Result<reqwest::Client> {
+    let redirects = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > 10 {
+            return attempt.error("too many redirects");
+        }
+        let target = attempt.url().clone();
+        let same_origin = attempt
+            .previous()
+            .last()
+            .is_some_and(|from| from.origin() == target.origin());
+        if same_origin {
+            attempt.follow()
+        } else {
+            attempt.error(format!(
+                "refused a redirect to {}: a redirect must stay on the same origin",
+                target.origin().ascii_serialization()
+            ))
+        }
+    });
+    reqwest::Client::builder().redirect(redirects).build()
+}
+
+/// Why [`read_body_limited`] gave up.
+#[derive(Debug, thiserror::Error)]
+pub enum BodyError {
+    #[error("{0}")]
+    Transport(#[from] reqwest::Error),
+    #[error("response body is larger than the limit of {limit} bytes")]
+    TooLarge { limit: usize },
+}
+
+/// Read a response body in chunks, stopping with [`BodyError::TooLarge`]
+/// as soon as it exceeds `limit` bytes (a larger `Content-Length` fails
+/// before any byte is read).
+pub async fn read_body_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, BodyError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > limit as u64)
+    {
+        return Err(BodyError::TooLarge { limit });
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > limit {
+            return Err(BodyError::TooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// The outcome of one [`crawl_once`] cycle. Callers (tests, the scheduler
@@ -197,7 +285,7 @@ async fn crawl_and_cache(
 ) -> Result<(), String> {
     let catalog = tokio::time::timeout(
         limits.participant_timeout,
-        crawl_one(http, participant, holder),
+        crawl_one(http, participant, holder, limits.max_response_bytes),
     )
     .await
     .unwrap_or_else(|_| {
@@ -349,6 +437,7 @@ async fn crawl_one(
     http: &reqwest::Client,
     participant: &ParticipantEntry,
     holder: Option<&HolderIdentity>,
+    max_response_bytes: usize,
 ) -> Result<Catalog, String> {
     let request_body = serde_json::json!({
         "@context": [DSP_CONTEXT_URL],
@@ -413,15 +502,20 @@ async fn crawl_one(
                     participant.id
                 )
             })?;
-            let access_token =
-                oid4vp::present(http, &holder.key_pair, &holder.credential_jws, response_uri)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "participant '{}' OID4VP presentation to {response_uri} failed: {e}",
-                            participant.id
-                        )
-                    })?;
+            let access_token = oid4vp::present(
+                http,
+                &holder.key_pair,
+                &holder.credential_jws,
+                response_uri,
+                max_response_bytes,
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "participant '{}' OID4VP presentation to {response_uri} failed: {e}",
+                    participant.id
+                )
+            })?;
             request = request.bearer_auth(access_token);
         }
     }
@@ -439,7 +533,15 @@ async fn crawl_one(
         ));
     }
 
-    let body: Value = response.json().await.map_err(|e| {
+    let bytes = read_body_limited(response, max_response_bytes)
+        .await
+        .map_err(|e| {
+            format!(
+                "reading the response from {} failed: {e}",
+                participant.catalog_request_url
+            )
+        })?;
+    let body: Value = serde_json::from_slice(&bytes).map_err(|e| {
         format!(
             "malformed JSON response from {}: {e}",
             participant.catalog_request_url
@@ -511,7 +613,7 @@ fn participant_id_mismatch(participant: &ParticipantEntry, declared: &str) -> bo
 /// marker rule is added to the policy), a rule-level `assignee`, `target` or
 /// `duty`, an action node with keys beyond `@id`/`@type`, and a policy node
 /// with no rule key. An unreadable `assigner` is ignored, as it
-/// scopes nothing. One limit remains: `response.json()` stops at
+/// scopes nothing. One limit remains: `serde_json::from_slice` stops at
 /// serde_json's 128-level recursion limit, so a body nested deeper than
 /// that fails the whole catalog fetch (the previous cache entry is kept
 /// until it expires) rather than being marked per entry.
@@ -1917,7 +2019,7 @@ mod tests {
         gated.provider_did = Some("did:web:localhost%3A19002:dsp".to_string());
         let http = reqwest::Client::new();
 
-        let err = crawl_one(&http, &gated, None)
+        let err = crawl_one(&http, &gated, None, DEFAULT_MAX_RESPONSE_BYTES)
             .await
             .expect_err("should fail without a holder");
         assert!(
@@ -1933,7 +2035,7 @@ mod tests {
         gated.oid4vp_response_uri = Some("http://127.0.0.1:0/oid4vp/response".to_string());
         let http = reqwest::Client::new();
 
-        let err = crawl_one(&http, &gated, None)
+        let err = crawl_one(&http, &gated, None, DEFAULT_MAX_RESPONSE_BYTES)
             .await
             .expect_err("should fail without a holder, not panic");
         assert!(
@@ -2849,6 +2951,307 @@ mod tests {
         );
     }
 
+    // --- outbound hardening (#42) ---
+
+    /// A server that counts the requests to `/hit` and answers `/start` with
+    /// a `307` to `location`.
+    async fn spawn_redirecting_server(location: String) -> String {
+        let (listener, addr) = bind_localhost().await;
+        let app = axum::Router::new().route(
+            "/start",
+            axum::routing::post(move || {
+                let location = location.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, location)],
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        spawn_server(listener, app);
+        format!("http://{addr}/start")
+    }
+
+    async fn spawn_hit_counter() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (listener, addr) = bind_localhost().await;
+        let app = axum::Router::new().route(
+            "/hit",
+            axum::routing::post({
+                let hits = hits.clone();
+                move |body: String| async move {
+                    let _ = body;
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "ok"
+                }
+            }),
+        );
+        spawn_server(listener, app);
+        (format!("http://{addr}/hit"), hits)
+    }
+
+    #[tokio::test]
+    async fn outbound_client_does_not_repost_a_body_to_another_origin() {
+        let (target, hits) = spawn_hit_counter().await;
+        let start = spawn_redirecting_server(target).await;
+
+        let result = outbound_client()
+            .unwrap()
+            .post(&start)
+            .body("vp_token=secret")
+            .send()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the redirect to another origin was followed"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn outbound_client_refuses_a_redirect_to_a_host_remote_allowed_rejects() {
+        let start = spawn_redirecting_server("http://attacker.example/x".to_string()).await;
+
+        let err = outbound_client()
+            .unwrap()
+            .post(&start)
+            .send()
+            .await
+            .expect_err("a redirect to plain http on a named host");
+
+        assert!(format!("{err:?}").contains("refused a redirect"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn outbound_client_follows_a_redirect_within_the_same_origin() {
+        let (listener, addr) = bind_localhost().await;
+        let app = axum::Router::new()
+            .route(
+                "/start",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, "/hit")],
+                    )
+                        .into_response()
+                }),
+            )
+            .route("/hit", axum::routing::post(|| async { "ok" }));
+        spawn_server(listener, app);
+
+        let response = outbound_client()
+            .unwrap()
+            .post(format!("http://{addr}/start"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    /// The named host `localhost` is not trusted by `remote_allowed`, but a
+    /// redirect that stays on the same origin was never a downgrade: the
+    /// origin passed config validation before the first request.
+    #[tokio::test]
+    async fn outbound_client_follows_a_same_origin_redirect_on_a_named_http_host() {
+        let (listener, addr) = bind_localhost().await;
+        let app = axum::Router::new()
+            .route(
+                "/catalog",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, "/catalog/")],
+                    )
+                        .into_response()
+                }),
+            )
+            .route("/catalog/", axum::routing::post(|| async { "ok" }));
+        spawn_server(listener, app);
+        let url = format!("http://localhost:{}/catalog", addr.port());
+        assert!(!remote_allowed(&reqwest::Url::parse(&url).unwrap()));
+
+        let response = outbound_client().unwrap().post(&url).send().await.unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    async fn assert_redirect_refused(start_url: &str, location: &str) {
+        let (listener, addr) = bind_localhost().await;
+        let location = location.replace("{port}", &addr.port().to_string());
+        let app = axum::Router::new().route(
+            "/start",
+            axum::routing::post(move || {
+                let location = location.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, location)],
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        spawn_server(listener, app);
+        let start = start_url.replace("{port}", &addr.port().to_string());
+
+        let err = outbound_client()
+            .unwrap()
+            .post(&start)
+            .send()
+            .await
+            .expect_err("the redirect was followed");
+
+        assert!(format!("{err:?}").contains("refused a redirect"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn outbound_client_refuses_a_scheme_change_on_the_same_host_and_port() {
+        // https on the same loopback address and port: the bearer token
+        // must not leave an origin it was sent to, in either direction.
+        assert_redirect_refused("http://127.0.0.1:{port}/start", "https://127.0.0.1/x").await;
+        assert_redirect_refused(
+            "http://localhost:{port}/start",
+            "https://localhost:{port}/x",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn outbound_client_refuses_a_redirect_to_another_port() {
+        assert_redirect_refused("http://127.0.0.1:{port}/start", "http://127.0.0.1:1/x").await;
+    }
+
+    #[tokio::test]
+    async fn outbound_client_refuses_a_redirect_from_a_named_host_to_loopback() {
+        assert_redirect_refused("http://localhost:{port}/start", "http://127.0.0.1:{port}/x").await;
+    }
+
+    /// A server answering `/hop/N` with a redirect to `/hop/N+1` until `N`
+    /// reaches `redirects`, which answers `200`.
+    async fn spawn_redirect_chain(redirects: usize) -> String {
+        let (listener, addr) = bind_localhost().await;
+        let app = axum::Router::new().route(
+            "/hop/{n}",
+            axum::routing::get(
+                move |axum::extract::Path(n): axum::extract::Path<usize>| async move {
+                    if n >= redirects {
+                        "ok".into_response()
+                    } else {
+                        (
+                            axum::http::StatusCode::FOUND,
+                            [(axum::http::header::LOCATION, format!("/hop/{}", n + 1))],
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        spawn_server(listener, app);
+        format!("http://{addr}/hop/0")
+    }
+
+    #[tokio::test]
+    async fn outbound_client_follows_ten_redirects_and_refuses_the_eleventh() {
+        let client = outbound_client().unwrap();
+
+        let ten = client.get(spawn_redirect_chain(10).await).send().await;
+        assert_eq!(ten.expect("ten redirects").status(), 200);
+
+        let eleven = client.get(spawn_redirect_chain(11).await).send().await;
+        let err = eleven.expect_err("an eleventh redirect was followed");
+        assert!(format!("{err:?}").contains("too many redirects"), "{err:?}");
+    }
+
+    /// Serve one raw HTTP response, bytes exactly as given.
+    async fn spawn_raw_response(raw: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (listener, addr) = bind_localhost().await;
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let raw = raw.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(&raw).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/x")
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_refuses_a_declared_length_over_the_limit() {
+        // Declared 1 MiB, only a few bytes sent: refused on the header.
+        let raw = b"HTTP/1.1 200 OK\r\ncontent-length: 1048576\r\n\r\nabc".to_vec();
+        let response = reqwest::get(spawn_raw_response(raw).await).await.unwrap();
+
+        let err = read_body_limited(response, 1024).await.unwrap_err();
+
+        assert!(
+            matches!(err, BodyError::TooLarge { limit: 1024 }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_allowed_accepts_https_and_loopback_http_only() {
+        let allowed = |u: &str| remote_allowed(&reqwest::Url::parse(u).unwrap());
+        assert!(allowed("https://host.example/x"));
+        assert!(allowed("http://127.0.0.1:8080/x"));
+        assert!(allowed("http://[::1]/x"));
+        assert!(!allowed("http://host.example/x"));
+        assert!(!allowed("http://localhost/x"));
+        assert!(!allowed("ftp://127.0.0.1/x"));
+    }
+
+    /// A catalog server streaming `total` bytes of JSON string, with no
+    /// `Content-Length`.
+    async fn spawn_streaming_catalog_server(total: usize) -> String {
+        let (listener, addr) = bind_localhost().await;
+        let app = axum::Router::new().route(
+            "/dsp/catalog/request",
+            axum::routing::post(move || async move {
+                let chunks = (0..total / 1024).map(|i| {
+                    let chunk: &'static [u8] = if i == 0 { b"[\"" } else { &[b'a'; 1024] };
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(chunk))
+                });
+                axum::body::Body::from_stream(futures_util::stream::iter(chunks))
+            }),
+        );
+        spawn_server(listener, app);
+        format!("http://{addr}/dsp/catalog/request")
+    }
+
+    #[tokio::test]
+    async fn crawl_once_fails_a_participant_whose_response_exceeds_the_byte_limit() {
+        let mut entry = participant("big");
+        entry.catalog_request_url = spawn_streaming_catalog_server(64 * 1024).await;
+        let limits = CrawlLimits {
+            max_response_bytes: 4 * 1024,
+            ..CrawlLimits::default()
+        };
+        let cache = OxigraphCatalogCache::in_memory().unwrap();
+
+        let summary = crawl_once(&reqwest::Client::new(), &[entry], None, &cache, &limits).await;
+
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert!(
+            summary.failures[0]
+                .1
+                .contains("larger than the limit of 4096 bytes"),
+            "{:?}",
+            summary.failures
+        );
+    }
+
     #[test]
     fn policy_node_with_no_recognised_policy_key_is_marked() {
         let policy = parse_one_policy(json!({"@id": "p", "unexpected": true}));
@@ -2898,5 +3301,10 @@ mod tests {
             catalog_core::UNMAPPABLE_EXCERPT_MAX
         );
         assert!(raw.to_string().starts_with(&excerpt));
+    }
+
+    #[test]
+    fn default_response_limit_is_16_mib() {
+        assert_eq!(CrawlLimits::default().max_response_bytes, 16 * 1024 * 1024);
     }
 }

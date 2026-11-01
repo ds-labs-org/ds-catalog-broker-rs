@@ -124,7 +124,8 @@ impl SparqlLimitsConfig {
     }
 }
 
-/// Reads `broker:crawlTimeoutMs`, `broker:crawlConcurrency` and
+/// Reads `broker:crawlTimeoutMs`, `broker:crawlConcurrency`,
+/// `broker:crawlMaxResponseBytes` and
 /// `broker:catalogMaxAgeSecs` (positive integers) from the broker config into
 /// the crawler's [`crawler::CrawlLimits`]. Unset is the default; any other
 /// value was checked when the config was read.
@@ -139,6 +140,9 @@ pub fn crawl_limits_from_settings(settings: &config::BrokerSettings) -> crawler:
         concurrency: settings
             .positive_integer(config::CRAWL_CONCURRENCY)
             .unwrap_or(default.concurrency),
+        max_response_bytes: settings
+            .positive_integer(config::CRAWL_MAX_RESPONSE_BYTES)
+            .unwrap_or(default.max_response_bytes),
         max_catalog_age: settings
             .positive_integer(config::CATALOG_MAX_AGE_SECS)
             .map_or(default.max_catalog_age, |secs| {

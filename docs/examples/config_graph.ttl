@@ -24,6 +24,7 @@
     broker:crawlIntervalSecs 300 ;
     broker:crawlTimeoutMs 30000 ;
     broker:crawlConcurrency 8 ;
+    broker:crawlMaxResponseBytes 16777216 ;
     broker:catalogMaxAgeSecs 86400 ;
 
     # OAuth2 Bearer gating of /catalog and /sparql. No defaults: an unset

@@ -34,7 +34,7 @@ fn load_oauth2_config(settings: &BrokerSettings) -> Option<OAuth2Config> {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let http_client = reqwest::Client::new();
+    let http_client = crawler::outbound_client().expect("failed to build the outbound HTTP client");
 
     // The Turtle config (see `ds_catalog_broker_rs::config`'s module doc).
     // An explicit `CONFIG_STORE_PATH` (path or URL) that cannot be read panics on boot,
