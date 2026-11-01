@@ -785,10 +785,15 @@ fn get_field(value: &Value, name: &str) -> Field {
     }
 }
 
+/// The raw value as logged next to a marker.
+fn log_excerpt(value: &Value) -> String {
+    value.to_string()
+}
+
 /// A rule that carries only an unmappable marker, standing in for policy
 /// content that could not be read (see [`Constraint::unmappable`]).
 fn unmappable_rule(raw: &Value) -> Rule {
-    tracing::warn!(entry = %raw, "keeping unreadable crawled ODRL content as an unmappable marker");
+    tracing::warn!(entry = %log_excerpt(raw), "keeping unreadable crawled ODRL content as an unmappable marker");
     Rule {
         action: UNMAPPABLE_ACTION.to_string(),
         constraints: vec![Constraint::unmappable(raw.to_string())],
@@ -897,7 +902,7 @@ fn parse_rule(value: &Value) -> Rule {
         Field::Value(action) => action,
         Field::Absent | Field::Unreadable => {
             tracing::warn!(
-                entry = %value,
+                entry = %log_excerpt(value),
                 "crawled ODRL rule has no readable 'action'; keeping it as an unmappable marker"
             );
             constraints.push(Constraint::unmappable(value.to_string()));
@@ -990,7 +995,7 @@ fn parse_constraint(value: &Value, depth: usize) -> Constraint {
         .collect();
     if logical_present.len() > 1 || (has_atomic_key && !logical_present.is_empty()) {
         tracing::warn!(
-            entry = %value,
+            entry = %log_excerpt(value),
             "crawled ODRL constraint mixes atomic and logical keys or several logical keys; \
              keeping it as an unmappable marker"
         );
@@ -1024,7 +1029,7 @@ fn parse_constraint(value: &Value, depth: usize) -> Constraint {
     }
 
     tracing::warn!(
-        entry = %value,
+        entry = %log_excerpt(value),
         "crawled ODRL constraint is neither a complete atomic triple nor a recognized logical \
          group; keeping it as an unmappable marker"
     );
@@ -2610,5 +2615,133 @@ mod tests {
             .chain(&policy.obligations)
             .any(|r| r.constraints.iter().any(is_marker));
         assert!(marked, "{policy:?}");
+    }
+
+    // --- #40 audit follow-ups ---
+
+    #[test]
+    fn action_node_with_a_refinement_is_not_read_through_its_id_alone() {
+        let policy = parse_one_policy(json!({"permission": [{"action": {
+            "@id": "odrl:use",
+            "refinement": [{"leftOperand": "count", "operator": "lt", "rightOperand": "5"}]
+        }}]}));
+        let rule = &policy.permissions[0];
+        assert_eq!(rule.action, UNMAPPABLE_ACTION, "{rule:?}");
+        assert!(rule.constraints.iter().any(is_marker), "{rule:?}");
+    }
+
+    #[test]
+    fn action_node_with_only_id_and_type_is_still_read() {
+        let policy = parse_one_policy(json!({"permission": [{"action": {
+            "@id": "odrl:use", "@type": "odrl:Action"
+        }}]}));
+        assert_eq!(policy.permissions[0].action, "odrl:use");
+        assert!(policy.permissions[0].constraints.is_empty());
+    }
+
+    #[test]
+    fn rule_level_assignee_target_or_duty_adds_a_marker() {
+        for extra in [
+            json!({"assignee": "did:web:x"}),
+            json!({"odrl:assignee": {"@id": "did:web:x"}}),
+            json!({"target": "urn:other-asset"}),
+            json!({"duty": [{"action": "delete"}]}),
+        ] {
+            let mut rule = json!({"action": "use"});
+            rule.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            for key in ["permission", "prohibition"] {
+                let policy = parse_one_policy(json!({ key: [rule.clone()] }));
+                let rules = if key == "permission" {
+                    &policy.permissions
+                } else {
+                    &policy.prohibitions
+                };
+                assert_eq!(rules[0].action, "use", "{extra}");
+                assert!(
+                    rules[0].constraints.iter().any(is_marker),
+                    "{extra}: {rules:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn has_policy_in_list_or_set_syntax_is_unwrapped() {
+        for wrapper in ["@list", "@set"] {
+            let body = json!({"@id": "c", "dataset": [{"@id": "D", "hasPolicy": {
+                wrapper: [{"prohibition": [{"action": "use"}]}]
+            }}]});
+            let catalog = parse_catalog_response(&body, &participant("p40"));
+            let policies = &catalog.datasets[0].policies;
+            assert_eq!(policies.len(), 1, "{wrapper}");
+            assert_eq!(policies[0].prohibitions.len(), 1, "{wrapper}: {policies:?}");
+        }
+    }
+
+    #[test]
+    fn rules_in_list_syntax_are_unwrapped() {
+        let policy = parse_one_policy(json!({"prohibition": {"@list": [
+            {"action": "use"}, {"action": "distribute"}
+        ]}}));
+        assert_eq!(policy.prohibitions.len(), 2, "{policy:?}");
+        assert!(
+            policy
+                .prohibitions
+                .iter()
+                .all(|r| !r.constraints.iter().any(is_marker))
+        );
+    }
+
+    #[test]
+    fn policy_node_with_no_recognised_policy_key_is_marked() {
+        let policy = parse_one_policy(json!({"@id": "p", "unexpected": true}));
+        let marked = policy
+            .permissions
+            .iter()
+            .chain(&policy.prohibitions)
+            .chain(&policy.obligations)
+            .any(|r| r.constraints.iter().any(is_marker));
+        assert!(marked, "{policy:?}");
+    }
+
+    #[test]
+    fn policy_with_an_empty_rule_list_is_not_marked() {
+        let policy = parse_one_policy(json!({"@type": "Set", "permission": []}));
+        assert!(policy.permissions.is_empty() && policy.obligations.is_empty());
+    }
+
+    #[test]
+    fn integral_floats_render_as_integers() {
+        let policy = parse_one_policy(json!({"prohibition": [{
+            "action": "use",
+            "constraint": [
+                {"leftOperand": "n", "operator": "eq", "rightOperand": 10.0},
+                {"leftOperand": "n", "operator": "eq", "rightOperand": 1e3},
+                {"leftOperand": "n", "operator": "eq", "rightOperand": {"@value": 2.0}},
+                {"leftOperand": "n", "operator": "eq", "rightOperand": 2.5}
+            ]
+        }]}));
+        assert_eq!(
+            policy.prohibitions[0].constraints,
+            vec![
+                Constraint::atomic("n", "eq", "10"),
+                Constraint::atomic("n", "eq", "1000"),
+                Constraint::atomic("n", "eq", "2"),
+                Constraint::atomic("n", "eq", "2.5"),
+            ]
+        );
+    }
+
+    #[test]
+    fn logged_excerpt_is_truncated_on_a_character_boundary() {
+        let raw = json!({"k": "\u{e9}".repeat(1000)});
+        let excerpt = log_excerpt(&raw);
+        assert_eq!(
+            excerpt.chars().count(),
+            catalog_core::UNMAPPABLE_EXCERPT_MAX
+        );
+        assert!(raw.to_string().starts_with(&excerpt));
     }
 }

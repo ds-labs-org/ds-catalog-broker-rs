@@ -195,7 +195,7 @@ pub const UNMAPPABLE_OPERATOR: &str = "urn:ds42:broker:unmappable";
 pub const UNMAPPABLE_ACTION: &str = "urn:ds42:broker:unmappable-action";
 
 /// Longest raw excerpt [`Constraint::unmappable`] keeps, in characters.
-const UNMAPPABLE_EXCERPT_MAX: usize = 256;
+pub const UNMAPPABLE_EXCERPT_MAX: usize = 256;
 
 impl Constraint {
     /// A marker for policy content the crawler could not parse. It is an
