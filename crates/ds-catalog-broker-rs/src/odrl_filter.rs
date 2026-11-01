@@ -182,16 +182,12 @@ impl Default for PolicyFilterConfig {
 impl PolicyFilterConfig {
     /// Reads `broker:policyFilterUnmappableConstraintAction` (`skip` | `drop_policy` |
     /// `hide_dataset`), `broker:policyFilterNoPolicyVisibility` (`open` | `closed`) and
-    /// `broker:policyFilterRunWhenOauth2Disabled` (`false`/`0` disables filtering when OAuth2
-    /// is off; anything else, *including unset*, keeps it enabled - see that field's own doc
-    /// comment for why "unset" and "explicitly true" are deliberately the same value here,
-    /// unlike the other settings' unset case). See [`crate::config`].
+    /// `broker:policyFilterRunWhenOauth2Disabled` (a boolean). See [`crate::config`].
     ///
-    /// An unset value for either of the first two settings falls back to
-    /// `Default::default()`'s value for that field silently. A *present but unrecognized*
-    /// value also falls back to the default, but logs a `tracing::warn!` first - a typo'd
-    /// setting should be visible in the logs, not merely silently ignored the same way an
-    /// absent one is.
+    /// An unset value is `Default::default()`'s value for that field. Any other value was
+    /// already checked against [`config::UNMAPPABLE_CONSTRAINT_ACTIONS`] and
+    /// [`config::NO_POLICY_VISIBILITIES`] when the config was read: a value outside them
+    /// stops the broker at startup instead of reaching this function.
     pub fn from_settings(settings: &BrokerSettings) -> Self {
         let default = Self::default();
 
@@ -203,15 +199,9 @@ impl PolicyFilterConfig {
             Some("skip") => UnmappableConstraintAction::SkipConstraint,
             Some("drop_policy") => UnmappableConstraintAction::DropPolicy,
             Some("hide_dataset") => UnmappableConstraintAction::HideDataset,
-            Some(other) => {
-                tracing::warn!(
-                    value = other,
-                    "unrecognized policyFilterUnmappableConstraintAction (expected 'skip', \
-                     'drop_policy', or 'hide_dataset'); falling back to the default \
-                     (hide_dataset)"
-                );
-                default.unmappable_constraint_action
-            }
+            Some(other) => unreachable!(
+                "policyFilterUnmappableConstraintAction {other:?} passed the config check"
+            ),
         };
 
         let no_policy_visibility = match settings
@@ -222,18 +212,12 @@ impl PolicyFilterConfig {
             Some("open") => NoPolicyVisibility::Open,
             Some("closed") => NoPolicyVisibility::Closed,
             Some(other) => {
-                tracing::warn!(
-                    value = other,
-                    "unrecognized policyFilterNoPolicyVisibility (expected 'open' or \
-                     'closed'); falling back to the default (open)"
-                );
-                default.no_policy_visibility
+                unreachable!("policyFilterNoPolicyVisibility {other:?} passed the config check")
             }
         };
 
         let filter_when_oauth2_disabled = settings
-            .get(config::POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED)
-            .map(|value| value != "false" && value != "0")
+            .boolean(config::POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED)
             .unwrap_or(default.filter_when_oauth2_disabled);
 
         Self {

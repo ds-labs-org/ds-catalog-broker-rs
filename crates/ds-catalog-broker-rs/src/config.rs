@@ -23,7 +23,15 @@
 //! same graph, linked from `broker:BrokerConfig` with `broker:participant` (any number) and
 //! `broker:holder` (at most one); see [`BrokerSettings::crawler`]. They are read strictly: a
 //! missing required property, a value that doesn't parse, or a link to a resource of the wrong
-//! type stops the broker, unlike a bad scalar setting, which falls back to its default.
+//! type stops the broker.
+//!
+//! # Every value is checked when it is read
+//!
+//! Each [`Setting`] has a [`SettingKind`]. A value that does not fit it (a non-positive
+//! integer, an unknown enum value, a boolean spelled `yes`) is a
+//! [`BrokerConfigError::InvalidValue`], and a `broker:` property the broker does not know, on
+//! any resource, is a [`BrokerConfigError::UnknownProperty`]: the broker refuses to start
+//! rather than run with a default the operator did not ask for.
 //!
 //! # No config store at all is not an error
 //!
@@ -93,8 +101,30 @@ impl Setting {
 
     /// Check `value` against [`Self::kind`]; the error is the reason it does not fit.
     pub fn check(&self, value: &str) -> Result<(), String> {
-        let _ = value;
-        todo!()
+        match self.kind {
+            SettingKind::Text => Ok(()),
+            SettingKind::PositiveInteger => parse_positive_integer(value)
+                .map(drop)
+                .ok_or_else(|| "expected a positive integer".to_string()),
+            SettingKind::Boolean => parse_boolean(value)
+                .map(drop)
+                .ok_or_else(|| "expected true, false, 1 or 0".to_string()),
+            SettingKind::OneOf(allowed) if allowed.contains(&value) => Ok(()),
+            SettingKind::OneOf(allowed) => Err(format!("expected one of {}", allowed.join(", "))),
+        }
+    }
+}
+
+fn parse_positive_integer(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok().filter(|n| *n > 0)
+}
+
+/// The `xsd:boolean` lexical forms.
+fn parse_boolean(value: &str) -> Option<bool> {
+    match value.trim() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -146,6 +176,9 @@ pub const ALL_SETTINGS: &[Setting] = &[
     POLICY_FILTER_NO_POLICY_VISIBILITY,
     POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED,
 ];
+
+/// How error messages name the `broker:BrokerConfig` resource.
+const CONFIG_RESOURCE: &str = "the broker:BrokerConfig resource";
 
 /// The crawl interval when `broker:crawlIntervalSecs` is unset.
 pub const DEFAULT_CRAWL_INTERVAL_SECS: u64 = 300;
@@ -423,7 +456,7 @@ impl BrokerSettings {
             return Ok(Self::default());
         };
 
-        let resource = "the broker:BrokerConfig resource".to_string();
+        let resource = CONFIG_RESOURCE.to_string();
         let mut properties = graph.properties(&config)?;
         let participants = properties.remove(PARTICIPANT_LINK).unwrap_or_default();
         let holders = properties.remove(HOLDER_LINK).unwrap_or_default();
@@ -491,20 +524,29 @@ impl BrokerSettings {
         )?))
     }
 
-    /// Build from already-read values, keyed by [`Setting::property`]. Warns about any
-    /// property this broker doesn't know - a typo'd property should be visible in the logs,
-    /// not silently ignored.
+    /// Build from already-read values, keyed by [`Setting::property`]. A property this broker
+    /// doesn't know, or a value that doesn't fit its [`SettingKind`], is an error.
     pub fn from_values(
         values: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, BrokerConfigError> {
         let values: HashMap<String, String> = values.into_iter().collect();
-        for property in values.keys() {
-            if !ALL_SETTINGS.iter().any(|s| s.property == property) {
-                tracing::warn!(
-                    property,
-                    "unknown broker:{property} in the config graph; ignored"
-                );
-            }
+        for (property, value) in &values {
+            let resource = || CONFIG_RESOURCE.to_string();
+            let setting = ALL_SETTINGS
+                .iter()
+                .find(|s| s.property == property)
+                .ok_or_else(|| BrokerConfigError::UnknownProperty {
+                    resource: resource(),
+                    property: property.clone(),
+                })?;
+            setting
+                .check(value)
+                .map_err(|reason| BrokerConfigError::InvalidValue {
+                    resource: resource(),
+                    property: property.clone(),
+                    value: value.clone(),
+                    reason,
+                })?;
         }
         Ok(Self {
             values,
@@ -524,27 +566,16 @@ impl BrokerSettings {
         self.values.get(setting.property).cloned()
     }
 
-    /// `setting` as a positive integer; `None` when unset, or (with a warning) when it is not
-    /// one.
+    /// `setting` as a positive integer; `None` when unset. The value was checked when it was
+    /// read, so `None` also covers asking for a setting of another [`SettingKind`].
     pub fn positive_integer(&self, setting: Setting) -> Option<usize> {
-        let value = self.get(setting)?;
-        match value.trim().parse::<usize>() {
-            Ok(parsed) if parsed > 0 => Some(parsed),
-            _ => {
-                tracing::warn!(
-                    property = setting.property,
-                    value,
-                    "expected a positive integer; falling back to the default"
-                );
-                None
-            }
-        }
+        parse_positive_integer(self.values.get(setting.property)?)
     }
 
-    /// `setting` as a boolean; `None` when unset.
+    /// `setting` as a boolean; `None` when unset. The value was checked when it was read, so
+    /// `None` also covers asking for a setting of another [`SettingKind`].
     pub fn boolean(&self, setting: Setting) -> Option<bool> {
-        let _ = setting;
-        todo!()
+        parse_boolean(self.values.get(setting.property)?)
     }
 
     /// Where the values were read from, if anywhere.
@@ -682,8 +713,7 @@ fn reject_unlinked(
     Ok(())
 }
 
-/// Drop, with a warning, every property not in `known`, whatever its values; reject a known
-/// one with more than one value.
+/// Reject a property not in `known`, and a known one with more than one value.
 fn single_values(
     resource: &str,
     properties: BTreeMap<String, Vec<Term>>,
@@ -691,18 +721,13 @@ fn single_values(
 ) -> Result<BTreeMap<String, Term>, BrokerConfigError> {
     properties
         .into_iter()
-        .filter(|(property, _)| {
-            let is_known = known.contains(&property.as_str());
-            if !is_known {
-                tracing::warn!(
-                    property,
-                    resource,
-                    "unknown broker:{property} on {resource}; ignored"
-                );
-            }
-            is_known
-        })
         .map(|(property, mut terms)| {
+            if !known.contains(&property.as_str()) {
+                return Err(BrokerConfigError::UnknownProperty {
+                    resource: resource.to_string(),
+                    property,
+                });
+            }
             if terms.len() > 1 {
                 return Err(BrokerConfigError::MultipleValues {
                     resource: resource.to_string(),
@@ -869,11 +894,13 @@ fn read_holder(
     let props = Properties::read(graph, node, "Holder", HOLDER_PROPERTIES)?;
     let insecure_http = match props.optional(INSECURE_HTTP)? {
         None => false,
-        Some(raw) => match raw.trim() {
-            "true" | "1" => true,
-            "false" | "0" => false,
-            _ => return Err(props.invalid(INSECURE_HTTP, raw, "expected a boolean".to_string())),
-        },
+        Some(raw) => parse_boolean(&raw).ok_or_else(|| {
+            props.invalid(
+                INSECURE_HTTP,
+                raw,
+                "expected true, false, 1 or 0".to_string(),
+            )
+        })?,
     };
     let credential_jws_file = props.credential_file()?;
     Ok(HolderConfig {
