@@ -10,7 +10,8 @@ use axum::{Json, Router, http::StatusCode, routing::post};
 use catalog_core::Constraint;
 use catalog_core::{Catalog, DataService, Dataset, Distribution, NodeId, Policy, PolicyKind, Rule};
 use edc_connector_client::types::policy::{
-    Constraint as RealConstraint, LeftOperand, Operator, PolicyKind as RealPolicyKind,
+    Constraint as RealConstraint, LeftOperand, MultiplicityConstraint, Operator,
+    PolicyKind as RealPolicyKind,
 };
 use edc_connector_client::types::properties::PropertyValue;
 use edc_federated_catalog_client::ListOfferBody;

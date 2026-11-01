@@ -135,7 +135,7 @@ may be a `file:` IRI.
 | `broker:participantName` | yes | Display name. |
 | `broker:catalogRequestUrl` | yes | The participant's DSP catalog request endpoint. |
 | `broker:credentialProtocol` | no | `none` (default), `dcp` or `oid4vp`: what the crawler presents to this participant. |
-| `broker:providerDid` | for `dcp` | The participant's DID, the audience of the self-issued token. |
+| `broker:providerDid` | for `dcp` | The participant's DID, the audience of the self-issued token. It is also the `participantId`/`originator` the management API serves for this participant's catalog. Without it the offer carries `broker:participantId`. The `participantId` in the crawled response is ignored. |
 | `broker:oid4vpResponseUri` | for `oid4vp` | The OID4VP `direct_post` endpoint the presentation is sent to. |
 
 | `broker:Holder` property | Required | Meaning |

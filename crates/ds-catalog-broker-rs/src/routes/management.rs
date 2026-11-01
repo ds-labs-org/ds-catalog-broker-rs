@@ -156,9 +156,10 @@ pub(super) struct CatalogRequestParticipantId {
 /// Field mapping notes (everything not explicitly called out is a direct
 /// copy):
 /// - `participantId`/`originator`: `catalog.participant_id` when the crawl
-///   recorded one (a DID, typically), else `catalog.origin_node`'s id - the
-///   best identifier this product actually has for who this catalog came
-///   from.
+///   recorded one, else `catalog.origin_node`'s id. The crawler records the
+///   configured participant's `provider_did` there and never the identity
+///   the crawled response declares for itself, so a participant cannot
+///   have its datasets offered under another participant's id.
 /// - dataset `name`/`contenttype`: `catalog_core::Dataset` has no separate
 ///   "name" or "content type" field, so `name` is `dataset.id` (the best
 ///   available stand-in) and `contenttype` is the first distribution's
@@ -225,12 +226,9 @@ pub(super) fn catalog_to_offer(catalog: &Catalog) -> Option<CatalogRequestOffer>
 /// - each atomic `Constraint` -> `{"leftOperand": ..., "operator": ...,
 ///   "rightOperand": ...}`, all three always present - the real
 ///   `AtomicConstraint` requires all three with no defaults. A `Logical`
-///   `catalog_core::Constraint` (gap analysis §3.4 - `Constraint` now
-///   models both shapes, see its own doc comment) is skipped here rather
-///   than mis-emitted as if it were atomic: mapping a logical group to the
-///   real client's own `MultiplicityConstraint` wire shape is separate,
-///   not-yet-done work this route does not perform yet, and no current
-///   producer constructs a `Logical` constraint in the first place.
+///   `catalog_core::Constraint` is served as the real client's
+///   `MultiplicityConstraint` shape (`{"and"|"or"|"xone": [...]}`), nested
+///   groups included; see `constraint_to_json`.
 pub(super) fn policy_to_json(policy: &Policy) -> serde_json::Value {
     let kind = match policy.kind {
         PolicyKind::Set => "Set",
@@ -283,21 +281,37 @@ pub(super) fn policy_to_json(policy: &Policy) -> serde_json::Value {
 pub(super) fn rule_to_json(rule: &Rule) -> serde_json::Value {
     let mut value = serde_json::json!({ "action": rule.action });
     if !rule.constraints.is_empty() {
-        value["constraint"] = serde_json::Value::Array(
-            rule.constraints
-                .iter()
-                .filter_map(|constraint| match constraint {
-                    catalog_core::Constraint::Atomic(atomic) => Some(serde_json::json!({
-                        "leftOperand": atomic.left_operand,
-                        "operator": atomic.operator,
-                        "rightOperand": atomic.right_operand,
-                    })),
-                    catalog_core::Constraint::Logical(_) => None,
-                })
-                .collect(),
-        );
+        value["constraint"] =
+            serde_json::Value::Array(rule.constraints.iter().map(constraint_to_json).collect());
     }
     value
+}
+
+/// One constraint as the real client's wire shape: an atomic constraint as
+/// `{leftOperand, operator, rightOperand}`, a logical group as
+/// `{"and"|"or"|"xone": [children...]}` with the children serialized
+/// recursively. The real client has no `andSequence`; it is served as
+/// `and`, which keeps every child instead of dropping the group (it loses
+/// only the ordering requirement).
+fn constraint_to_json(constraint: &catalog_core::Constraint) -> serde_json::Value {
+    match constraint {
+        catalog_core::Constraint::Atomic(atomic) => serde_json::json!({
+            "leftOperand": atomic.left_operand,
+            "operator": atomic.operator,
+            "rightOperand": atomic.right_operand,
+        }),
+        catalog_core::Constraint::Logical(logical) => {
+            let (key, children) = match logical {
+                catalog_core::LogicalConstraint::And(children)
+                | catalog_core::LogicalConstraint::AndSequence(children) => ("and", children),
+                catalog_core::LogicalConstraint::Or(children) => ("or", children),
+                catalog_core::LogicalConstraint::Xone(children) => ("xone", children),
+            };
+            serde_json::json!({
+                key: children.iter().map(constraint_to_json).collect::<Vec<_>>()
+            })
+        }
+    }
 }
 
 /// Reads the optional descriptive properties `crawler::collect_datasets_and_services`

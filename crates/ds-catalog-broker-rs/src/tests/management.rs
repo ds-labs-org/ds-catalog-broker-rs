@@ -528,3 +528,101 @@ async fn catalog_request_route_200s_with_the_real_body_for_a_fully_valid_token()
     assert_eq!(offers.len(), 1);
     assert_eq!(offers[0].id, "sample-catalog");
 }
+
+fn rule_with(constraints: Vec<Constraint>) -> Policy {
+    Policy {
+        id: Some("policy-logical".to_string()),
+        kind: PolicyKind::Offer,
+        assigner: None,
+        assignee: None,
+        permissions: vec![Rule {
+            action: "odrl:use".to_string(),
+            constraints,
+        }],
+        prohibitions: Vec::new(),
+        obligations: Vec::new(),
+    }
+}
+
+/// A harvested `odrl:or` group must be served as a group, nested groups
+/// included, not dropped (which would offer the dataset unconstrained).
+#[tokio::test]
+async fn catalog_request_route_serves_logical_constraint_groups() {
+    let state = test_state();
+    let mut catalog = participant_catalog("node-a", "cat-a", "DATASET-A");
+    catalog.datasets[0]
+        .policies
+        .push(rule_with(vec![Constraint::or(vec![
+            Constraint::atomic("odrl:dateTime", "odrl:gteq", "2020-01-01T00:00:00Z"),
+            Constraint::and(vec![
+                Constraint::atomic("odrl:dateTime", "odrl:lteq", "2027-01-01T00:00:00Z"),
+                Constraint::atomic("odrl:dateTime", "odrl:gteq", "2021-01-01T00:00:00Z"),
+            ]),
+        ])]));
+    state.cache.upsert(catalog).await.unwrap();
+
+    let response = build_router(state)
+        .oneshot(catalog_request(Body::from(
+            serde_json::to_vec(&ListOfferBody::default()).unwrap(),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+
+    let offers: Vec<FederatedCatalogOffer> = serde_json::from_slice(&body).unwrap();
+    let permission = &offers[0].dataset[0].has_policy[0].permissions()[0];
+    assert_eq!(permission.constraints().len(), 1, "group was dropped");
+    let RealConstraint::MultiplicityConstraint(MultiplicityConstraint::Or(children)) =
+        &permission.constraints()[0]
+    else {
+        panic!(
+            "expected an or group, got {:?}",
+            permission.constraints()[0]
+        );
+    };
+    assert_eq!(children.len(), 2);
+    assert!(matches!(children[0], RealConstraint::Atomic(_)));
+    let RealConstraint::MultiplicityConstraint(MultiplicityConstraint::And(nested)) = &children[1]
+    else {
+        panic!("expected a nested and group, got {:?}", children[1]);
+    };
+    assert_eq!(nested.len(), 2);
+}
+
+/// `xone` is served as `xone`; `andSequence` has no counterpart in the
+/// real client's model and is served as `and`, never dropped.
+#[tokio::test]
+async fn catalog_request_route_serves_xone_and_and_sequence_groups() {
+    let state = test_state();
+    let mut catalog = participant_catalog("node-a", "cat-a", "DATASET-A");
+    catalog.datasets[0].policies.push(rule_with(vec![
+        Constraint::xone(vec![
+            Constraint::atomic("odrl:dateTime", "odrl:gteq", "2999-01-01T00:00:00Z"),
+            Constraint::atomic("odrl:dateTime", "odrl:lteq", "2027-01-01T00:00:00Z"),
+        ]),
+        Constraint::and_sequence(vec![Constraint::atomic(
+            "odrl:dateTime",
+            "odrl:lteq",
+            "2027-01-01T00:00:00Z",
+        )]),
+    ]));
+    state.cache.upsert(catalog).await.unwrap();
+
+    let response = build_router(state)
+        .oneshot(catalog_request(Body::empty()))
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let offers: Vec<FederatedCatalogOffer> = serde_json::from_slice(&body).unwrap();
+    let constraints = offers[0].dataset[0].has_policy[0].permissions()[0].constraints();
+    assert_eq!(constraints.len(), 2);
+    assert!(matches!(
+        constraints[0],
+        RealConstraint::MultiplicityConstraint(MultiplicityConstraint::Xone(_))
+    ));
+    assert!(matches!(
+        constraints[1],
+        RealConstraint::MultiplicityConstraint(MultiplicityConstraint::And(_))
+    ));
+}
