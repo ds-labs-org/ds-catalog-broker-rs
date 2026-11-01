@@ -574,3 +574,116 @@ async fn sparql_query_json_restricted_supports_graph_from_ask_and_count() {
         true
     );
 }
+
+// --- `sparql_query_json_policy_filtered` (#34) ---------------------------
+
+/// One dataset `ds-1` carrying a `visibility` and a `title` property.
+fn visibility_catalog(visibility: &str, title: &str) -> Catalog {
+    let mut catalog = Catalog::new("cat-v", NodeId::new("node-v"));
+    let mut properties = BTreeMap::new();
+    properties.insert("visibility".to_string(), visibility.to_string());
+    properties.insert("title".to_string(), title.to_string());
+    catalog.datasets.push(Dataset {
+        id: "ds-1".to_string(),
+        properties,
+        distributions: Vec::new(),
+        policies: Vec::new(),
+    });
+    catalog
+}
+
+/// The allow-list a caller who may see only `public` datasets gets.
+fn public_only(catalogs: &[Catalog]) -> BTreeSet<String> {
+    catalogs
+        .iter()
+        .flat_map(|catalog| {
+            catalog
+                .datasets
+                .iter()
+                .filter(|dataset| {
+                    dataset.properties.get("visibility").map(String::as_str) == Some("public")
+                })
+                .map(|dataset| dataset_resource_iri(&catalog.origin_node, &dataset.id))
+        })
+        .collect()
+}
+
+/// A crawl that tightens a dataset's policy lands after the allow-list is
+/// computed. The old allow-list admits the dataset, the store now holds
+/// the new graph. The query must not return the new triples.
+#[test]
+fn policy_filtered_query_does_not_show_new_data_through_an_old_allow_list() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let mut interleaved = false;
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            "SELECT ?o WHERE { ?s ?p ?o }",
+            |catalogs| {
+                let allow = public_only(catalogs);
+                if !interleaved {
+                    interleaved = true;
+                    cache
+                        .store_catalog(visibility_catalog("private", "title-v2"))
+                        .unwrap();
+                }
+                allow
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    assert!(interleaved);
+    let values = binding_values(&body);
+    assert!(!values.iter().any(|v| v == "title-v2"), "{values:?}");
+    assert!(!values.iter().any(|v| v == "title-v1"), "{values:?}");
+}
+
+/// A write that lands before the query starts is an ordinary update, not
+/// a retry.
+#[test]
+fn policy_filtered_query_with_no_overlapping_write_runs_once() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let mut calls = 0;
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            "SELECT ?o WHERE { ?s ?p ?o }",
+            |catalogs| {
+                calls += 1;
+                public_only(catalogs)
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(calls, 1);
+    assert!(binding_values(&body).iter().any(|v| v == "title-v1"));
+}
+
+/// A store written during every attempt gives up instead of answering
+/// from mixed states.
+#[test]
+fn policy_filtered_query_gives_up_when_the_store_keeps_changing() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let mut calls = 0;
+    let result = cache.sparql_query_json_policy_filtered(
+        "SELECT ?o WHERE { ?s ?p ?o }",
+        |catalogs| {
+            calls += 1;
+            let allow = public_only(catalogs);
+            cache
+                .store_catalog(visibility_catalog("public", &format!("title-{calls}")))
+                .unwrap();
+            allow
+        },
+        &SparqlLimits::default(),
+    );
+    assert!(matches!(result, Err(SparqlError::StoreBusy)), "{result:?}");
+    assert_eq!(calls, POLICY_FILTERED_ATTEMPTS);
+}

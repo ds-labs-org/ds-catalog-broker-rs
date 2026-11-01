@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// How many times [`OxigraphCatalogCache::sparql_query_json_policy_filtered`]
+/// runs a query before giving up because the store keeps changing.
+pub const POLICY_FILTERED_ATTEMPTS: usize = 5;
+
 impl OxigraphCatalogCache {
     /// Evaluate an arbitrary, caller-supplied SPARQL query and return
     /// the result serialized as
@@ -122,8 +126,10 @@ impl OxigraphCatalogCache {
     ///   snapshot per query), and the caller computes
     ///   `visible_resource_iris` before evaluation starts. A crawl
     ///   landing mid-request can therefore show an allow-listed
-    ///   dataset's newer triples. It cannot show anything not on the
-    ///   allow-list.
+    ///   dataset's newer triples, including ones whose policy the
+    ///   crawl tightened. Use [`Self::sparql_query_json_policy_filtered`],
+    ///   which computes the allow-list and evaluates on one store state,
+    ///   when the allow-list comes from the catalogs in the store.
     /// - **No numeric canonicalization.** Terms are compared as written:
     ///   `"01"^^xsd:integer` in a query doesn't match a stored `1`. The
     ///   only typed numbers this store writes are the position numbers
@@ -134,6 +140,59 @@ impl OxigraphCatalogCache {
         visible_resource_iris: &BTreeSet<String>,
     ) -> SparqlQueryResult<Vec<u8>> {
         self.sparql_query_json_limited(query, Some(visible_resource_iris), &SparqlLimits::default())
+    }
+
+    /// [`Self::sparql_query_json_restricted`] with the allow-list computed
+    /// from the store's own catalogs, on the same store state the query
+    /// reads.
+    ///
+    /// `allow_list` receives every catalog ([`Self::catalogs`]) and
+    /// returns the resource IRIs the caller may see. Filtered evaluation
+    /// reads the store once per lookup (see [`VisibleDataset`]), so a
+    /// write landing between the allow-list and the end of evaluation
+    /// would mix two states: a join could see an old graph and a new one,
+    /// and an allow-list built from old policies would admit new data.
+    /// The cache counts writes (`write_sequence`); when a write overlapped
+    /// the attempt, its result is discarded and the whole attempt,
+    /// allow-list included, runs again. After [`POLICY_FILTERED_ATTEMPTS`]
+    /// attempts the call returns [`SparqlError::StoreBusy`].
+    ///
+    /// Writers are never blocked. A crawl that commits rarely sees one
+    /// retry; one that commits continuously can starve a long query,
+    /// which then ends in `StoreBusy` (or the caller's time limit).
+    /// `allow_list` may therefore run more than once.
+    ///
+    /// Alternatives considered: a store transaction gives a read view but
+    /// takes the in-memory backend's single writer lock for the whole
+    /// query, and oxigraph exposes no public snapshot to hand to both the
+    /// allow-list and `VisibleDataset`.
+    pub fn sparql_query_json_policy_filtered(
+        &self,
+        query: &str,
+        mut allow_list: impl FnMut(&[Catalog]) -> BTreeSet<String>,
+        limits: &SparqlLimits,
+    ) -> SparqlQueryResult<Vec<u8>> {
+        for _ in 0..POLICY_FILTERED_ATTEMPTS {
+            let before = self.write_sequence.load(Ordering::SeqCst);
+            if before % 2 == 1 {
+                // A write is committing; it is short, so wait it out.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            }
+            let catalogs = self
+                .catalogs(CatalogQuery::all())
+                .map_err(|err| SparqlError::Evaluation(err.to_string()))?;
+            let visible = allow_list(&catalogs);
+            drop(catalogs);
+            let result = self.sparql_query_json_limited(query, Some(&visible), limits);
+            if self.write_sequence.load(Ordering::SeqCst) == before {
+                return result;
+            }
+            if matches!(result, Err(SparqlError::Cancelled)) {
+                return result;
+            }
+        }
+        Err(SparqlError::StoreBusy)
     }
 
     /// [`Self::sparql_query_json`] (`visible_resource_iris: None`) or

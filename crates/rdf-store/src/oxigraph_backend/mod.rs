@@ -354,6 +354,8 @@ use oxigraph::sparql::{PreparedSparqlQuery, QueryEvaluationError, QueryResults, 
 use oxigraph::store::StorageError;
 use spareval::{InternalQuad, QueryableDataset};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::{CatalogCache, CatalogQuery, StoreError, StoreResult};
@@ -441,6 +443,12 @@ pub enum SparqlError {
     /// truncated result.
     #[error("SPARQL query returned more than {0} rows - add a LIMIT or narrow the query")]
     TooManyRows(usize),
+    /// A policy-filtered query could not be evaluated against one store
+    /// state: the store was written during every one of the attempts
+    /// [`OxigraphCatalogCache::sparql_query_json_policy_filtered`] made.
+    /// Retrying the request is safe.
+    #[error("the catalog store kept changing while the query ran - retry later")]
+    StoreBusy,
 }
 
 /// Bounds on one [`OxigraphCatalogCache::sparql_query_json_limited`]
@@ -470,6 +478,7 @@ mod write;
 
 use iris::*;
 pub use iris::{dataset_resource_iri, service_resource_iri};
+pub use sparql::POLICY_FILTERED_ATTEMPTS;
 use vocab::*;
 
 /// A [`CatalogCache`] backed by a real `contreforts_kg::store::GraphStore`
@@ -477,6 +486,31 @@ use vocab::*;
 #[derive(Clone)]
 pub struct OxigraphCatalogCache {
     store: GraphStore,
+    /// Write sequence, shared by every clone. Odd while a write
+    /// transaction is open, even otherwise, and it increases on every
+    /// write. A reader that sees the same even value before and after
+    /// its reads knows no write overlapped them; see
+    /// [`WriteSequenceGuard`].
+    write_sequence: Arc<AtomicU64>,
+}
+
+/// Marks a write as in progress for as long as it lives: the sequence
+/// goes odd on creation and even again on drop. Create it after the
+/// write transaction starts, which serializes writers, and drop it after
+/// the commit.
+struct WriteSequenceGuard<'a>(&'a AtomicU64);
+
+impl<'a> WriteSequenceGuard<'a> {
+    fn begin(sequence: &'a AtomicU64) -> Self {
+        sequence.fetch_add(1, Ordering::SeqCst);
+        Self(sequence)
+    }
+}
+
+impl Drop for WriteSequenceGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl OxigraphCatalogCache {
@@ -485,7 +519,10 @@ impl OxigraphCatalogCache {
     /// persistence.
     pub fn in_memory() -> StoreResult<Self> {
         let store = GraphStore::in_memory()?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            write_sequence: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Every quad of `graph`, read from one store snapshot - so the
@@ -720,6 +757,7 @@ impl OxigraphCatalogCache {
         // transaction, so a reader sees one catalog or the other, never
         // a partly written one.
         let mut transaction = self.store.inner().start_transaction()?;
+        let _writing = WriteSequenceGuard::begin(&self.write_sequence);
         transaction.remove_named_graph(&graph.name)?;
         transaction.extend(&graph.quads);
         transaction.commit()?;
@@ -732,6 +770,7 @@ impl OxigraphCatalogCache {
         // Checked and removed in one transaction, so a concurrent upsert
         // lands wholly before or wholly after the delete.
         let mut transaction = self.store.inner().start_transaction()?;
+        let _writing = WriteSequenceGuard::begin(&self.write_sequence);
         let existed = transaction
             .quads_for_pattern(None, None, None, Some(graph.as_ref().into()))
             .next()

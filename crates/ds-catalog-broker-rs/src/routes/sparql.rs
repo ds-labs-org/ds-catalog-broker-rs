@@ -12,7 +12,6 @@ use axum::{
 use rdf_store::oxigraph_backend::{
     CancellationToken, OxigraphCatalogCache, SparqlError, SparqlLimits,
 };
-use rdf_store::{CatalogQuery, StoreError};
 use serde::Deserialize;
 
 use super::auth::check_oauth2_bearer;
@@ -122,7 +121,9 @@ pub(super) fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 ///   gets 503 Service Unavailable straight away; past `timeout` it is
 ///   cancelled and the caller gets 503; a result over `max_rows` rows is
 ///   400 Bad Request. The policy allow-list is computed in the same
-///   blocking task, just before evaluation.
+///   blocking task, on the same store state the query reads: a crawl
+///   landing mid-query makes the evaluation start over, and a store that
+///   keeps changing ends in 503.
 /// - Otherwise: 200 with an `application/sparql-results+json` body.
 ///
 /// Checked first, ahead of all of the above: the OAuth2 Bearer gate (see
@@ -200,20 +201,19 @@ pub(super) async fn sparql_route(
             // Timed out or abandoned while waiting for a blocking thread.
             return Err(Evaluation::Sparql(SparqlError::Cancelled));
         }
-        let visible_resources = if should_filter_by_policy(&state) {
+        if should_filter_by_policy(&state) {
             let engine_claims = engine_claims_from_bearer(claims.as_ref());
-            let catalogs = state
-                .cache
-                .catalogs(CatalogQuery::all())
-                .map_err(Evaluation::Store)?;
-            Some(visible_resource_iris(&catalogs, &engine_claims, &state))
+            // The allow-list and the evaluation run on one store state;
+            // see `sparql_query_json_policy_filtered`.
+            state.cache.sparql_query_json_policy_filtered(
+                &query,
+                |catalogs| visible_resource_iris(catalogs, &engine_claims, &state),
+                &limits,
+            )
         } else {
-            None
-        };
-        state
-            .cache
-            .sparql_query_json_limited(&query, visible_resources.as_ref(), &limits)
-            .map_err(Evaluation::Sparql)
+            state.cache.sparql_query_json_limited(&query, None, &limits)
+        }
+        .map_err(Evaluation::Sparql)
     });
     let stopping = async move {
         match draining {
@@ -235,7 +235,6 @@ pub(super) async fn sparql_route(
     let result = match finished {
         Ok(Ok(Ok(body))) => Ok(body),
         Ok(Ok(Err(Evaluation::Sparql(err)))) => Err(err),
-        Ok(Ok(Err(Evaluation::Store(err)))) => return internal_error(err),
         Ok(Err(join_error)) => {
             tracing::error!(error = %join_error, "SPARQL evaluation task panicked");
             return internal_error("SPARQL evaluation failed");
@@ -257,6 +256,11 @@ pub(super) async fn sparql_route(
             | SparqlError::Evaluation(_)
             | SparqlError::UnsupportedGraphResult),
         ) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        Err(SparqlError::StoreBusy) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            SparqlError::StoreBusy.to_string(),
+        )
+            .into_response(),
         Err(SparqlError::Cancelled) => (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
@@ -278,8 +282,6 @@ pub(super) async fn sparql_route(
 
 /// Why the blocking half of [`sparql_route`] failed.
 enum Evaluation {
-    /// Decoding the store for the policy allow-list failed: a 500.
-    Store(StoreError),
     /// The query itself failed - see [`SparqlError`] for each status.
     Sparql(SparqlError),
 }
