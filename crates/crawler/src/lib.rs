@@ -449,6 +449,17 @@ async fn crawl_one(
     Ok(parse_catalog_response(&body, participant))
 }
 
+/// Whether a response's declared `participantId` contradicts the
+/// configured identity. Only a configured `provider_did` is a real
+/// expectation. Without one the local `broker:participantId` is not what
+/// the participant declares about itself, so there is nothing to compare.
+fn participant_id_mismatch(participant: &ParticipantEntry, declared: &str) -> bool {
+    participant
+        .provider_did
+        .as_deref()
+        .is_some_and(|did| did != declared)
+}
+
 /// Parse a DSP catalog-request response body into a `catalog_core::Catalog`,
 /// leniently enough to accept either this workspace's own compact DSP
 /// shape or real Eclipse EDC's fuller one. Notably: EDC's `accessService`
@@ -541,15 +552,21 @@ fn parse_catalog_response(value: &Value, participant: &ParticipantEntry) -> Cata
     // claim any `participantId`, so it is never adopted; a mismatch is only
     // logged.
     catalog.participant_id = participant.provider_did.clone();
-    if let Some(declared) = value.get("participantId").and_then(Value::as_str)
-        && catalog.participant_id.as_deref().unwrap_or(&participant.id) != declared
-    {
-        tracing::warn!(
-            participant = %participant.id,
-            declared,
-            "crawled response declares a participantId that differs from the configured \
-             identity; the declared value is ignored"
-        );
+    if let Some(declared) = value.get("participantId").and_then(Value::as_str) {
+        if participant_id_mismatch(participant, declared) {
+            tracing::warn!(
+                participant = %participant.id,
+                declared,
+                "crawled response declares a participantId that differs from the configured \
+                 providerDid; the declared value is ignored"
+            );
+        } else if participant.provider_did.is_none() {
+            tracing::debug!(
+                participant = %participant.id,
+                declared,
+                "no providerDid configured; the declared participantId is ignored"
+            );
+        }
     }
 
     collect_datasets_and_services(value, &mut catalog, &mut SeenIds::default());
