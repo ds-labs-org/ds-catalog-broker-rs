@@ -775,13 +775,15 @@ impl OxigraphCatalogCache {
         // Checked and removed in one transaction, so a concurrent upsert
         // lands wholly before or wholly after the delete.
         let mut transaction = self.store.inner().start_transaction()?;
-        let _writing = WriteSequenceGuard::begin(&self.write_sequence);
         let existed = transaction
             .quads_for_pattern(None, None, None, Some(graph.as_ref().into()))
             .next()
             .transpose()?
             .is_some();
         if existed {
+            // Only a delete that writes counts as a write; the open
+            // transaction already serializes it against other writers.
+            let _writing = WriteSequenceGuard::begin(&self.write_sequence);
             transaction.remove_named_graph(&graph)?;
             transaction.commit()?;
         }
