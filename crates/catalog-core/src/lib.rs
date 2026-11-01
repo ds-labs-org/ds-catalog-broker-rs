@@ -184,7 +184,35 @@ pub enum Constraint {
     Logical(LogicalConstraint),
 }
 
+/// `operator` of the marker constraint [`Constraint::unmappable`] builds. It
+/// is not an ODRL operator, so the broker's operator mapping rejects it and
+/// `broker:policyFilterUnmappableConstraintAction` decides what happens.
+pub const UNMAPPABLE_OPERATOR: &str = "urn:ds42:broker:unmappable";
+
+/// `action` of a placeholder [`Rule`] that carries only an unmappable
+/// constraint, used when the crawler cannot read a rule's action or
+/// assignee.
+pub const UNMAPPABLE_ACTION: &str = "urn:ds42:broker:unmappable-action";
+
+/// Longest raw excerpt [`Constraint::unmappable`] keeps, in characters.
+pub const UNMAPPABLE_EXCERPT_MAX: usize = 256;
+
 impl Constraint {
+    /// A marker for policy content the crawler could not parse. It is an
+    /// atomic constraint whose operator ([`UNMAPPABLE_OPERATOR`]) the broker
+    /// never maps, so the configured unmappable-constraint action applies
+    /// instead of the content being silently dropped (which would loosen the
+    /// policy). `raw` is kept, truncated, in `right_operand` for diagnosis.
+    pub fn unmappable(raw: impl AsRef<str>) -> Self {
+        let excerpt: String = raw.as_ref().chars().take(UNMAPPABLE_EXCERPT_MAX).collect();
+        Constraint::atomic("", UNMAPPABLE_OPERATOR, excerpt)
+    }
+
+    /// Whether this is a marker built by [`Constraint::unmappable`].
+    pub fn is_unmappable(&self) -> bool {
+        matches!(self, Constraint::Atomic(a) if a.operator == UNMAPPABLE_OPERATOR)
+    }
+
     /// Build an atomic constraint from its three parts - the direct
     /// replacement for the bare `Constraint { left_operand, operator,
     /// right_operand }` struct literal every caller used before
@@ -360,6 +388,29 @@ mod tests {
     fn node_id_display_matches_inner_string() {
         let id = NodeId::new("abc");
         assert_eq!(id.to_string(), "abc");
+    }
+
+    #[test]
+    fn unmappable_marker_is_recognized_and_truncated() {
+        let marker = Constraint::unmappable("x".repeat(10_000));
+        assert!(marker.is_unmappable());
+        let Constraint::Atomic(a) = &marker else {
+            panic!("atomic")
+        };
+        assert_eq!(a.right_operand.chars().count(), 256);
+        assert!(!Constraint::atomic("a", "eq", "b").is_unmappable());
+    }
+
+    #[test]
+    fn marker_truncation_keeps_multi_byte_characters_whole() {
+        // Three-byte characters straddling the 256-character boundary.
+        let raw = format!("{}{}", "a".repeat(255), "\u{20ac}".repeat(10));
+        let Constraint::Atomic(a) = Constraint::unmappable(&raw) else {
+            panic!("atomic")
+        };
+        assert_eq!(a.right_operand.chars().count(), 256);
+        assert!(a.right_operand.ends_with('\u{20ac}'));
+        assert!(raw.starts_with(&a.right_operand));
     }
 
     #[test]

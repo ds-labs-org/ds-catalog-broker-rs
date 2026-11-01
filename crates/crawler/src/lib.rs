@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use catalog_core::{
     Catalog, Constraint, DataService, Dataset, Distribution, NodeId, Policy, PolicyKind, Rule,
+    UNMAPPABLE_ACTION,
 };
 use dcp_core::HolderIdentity;
 use futures_util::future::BoxFuture;
@@ -468,8 +469,8 @@ async fn crawl_one(
 /// `Dataset.properties` bag under those exact keys when present, and simply
 /// left absent from it when not. See `collect_datasets_and_services`.
 ///
-/// A dataset object's `odrl:hasPolicy` entries (compact key `hasPolicy` or
-/// the expanded IRI key real EDC/DSP JSON-LD uses,
+/// A dataset object's `odrl:hasPolicy` entries (any spelling: `hasPolicy`,
+/// `odrl:hasPolicy`, or the expanded IRI real EDC/DSP JSON-LD uses,
 /// `http://www.w3.org/ns/odrl/2/hasPolicy`) are parsed into
 /// `Dataset.policies: Vec<catalog_core::Policy>` - real harvested policy
 /// data, not the placeholder the now-removed http-api DSP layer used to
@@ -478,21 +479,31 @@ async fn crawl_one(
 /// `permission`/`prohibition`/`obligation` under a policy follows the same
 /// convention. See `parse_policies` for the field-by-field mapping.
 ///
+/// Every ODRL key is read through one helper, [`aliased_all`], in its bare,
+/// `odrl:`-prefixed or full-IRI spelling. Scalar values go through one
+/// helper, [`json_ld_scalar`], which accepts plain strings, numbers,
+/// booleans, `{"@value": ...}` value objects and `{"@id": ...}` references.
+///
 /// Both *atomic* ODRL constraints (`leftOperand`/`operator`/`rightOperand`)
-/// and *logical* groups (`odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`
-/// nesting further constraints, recursively) are modeled - gap analysis
-/// §3.4's earlier atomic-only scope cut is closed; see [`parse_constraint`]
-/// for the recursive parse and [`MAX_CONSTRAINT_DEPTH`] for the nesting
-/// bound. A constraint entry that is neither shape (no flat
-/// `leftOperand`/`operator`/`rightOperand` triple and no recognized
-/// `odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence` key), or a logical
-/// group nested past [`MAX_CONSTRAINT_DEPTH`], is skipped - only that one
-/// constraint entry, never the enclosing rule or policy - with a
-/// `tracing::warn!` marking the skip rather than silently dropping it. A
-/// rule (`permission`/`prohibition`/`obligation`) missing its required
-/// `action` is skipped the same way, one entry at a time, so one malformed
-/// entry from a crawled participant degrades gracefully instead of taking
-/// down the whole crawl cycle.
+/// and *logical* groups (`and`/`or`/`xone`/`andSequence`, nesting further
+/// constraints, recursively) are modeled; see [`parse_constraint`] and
+/// [`MAX_CONSTRAINT_DEPTH`].
+///
+/// Content that cannot be parsed is never dropped, because dropping a
+/// restriction loosens the policy before the broker sees it. It is kept as
+/// an unmappable marker ([`Constraint::unmappable`]) and the broker's
+/// `policyFilterUnmappableConstraintAction` decides what happens to it. This
+/// covers an incomplete or unreadable constraint (also inside a group), a
+/// logical group nested past [`MAX_CONSTRAINT_DEPTH`], a rule with no
+/// readable `action` (kept under [`UNMAPPABLE_ACTION`]), a rule or policy
+/// entry that is not a JSON-LD node, an unreadable policy-level `assignee` (a
+/// marker rule is added to the policy), a rule-level `assignee`, `target` or
+/// `duty`, an action node with keys beyond `@id`/`@type`, and a policy node
+/// with no rule key. An unreadable `assigner` is ignored, as it
+/// scopes nothing. One limit remains: `response.json()` stops at
+/// serde_json's 128-level recursion limit, so a body nested deeper than
+/// that fails the whole catalog fetch (the previous cache entry is kept
+/// until it expires) rather than being marked per entry.
 ///
 /// Datasets are deduplicated by id within one response, as services are:
 /// the first occurrence wins and later ones are skipped with a
@@ -682,34 +693,143 @@ fn parse_data_service(value: &Value) -> Option<DataService> {
     })
 }
 
-/// The expanded-IRI form of `odrl:hasPolicy` real EDC/DSP JSON-LD uses in
-/// place of the compact `hasPolicy` key - matches
+/// The ODRL namespace. `<ODRL_NS>hasPolicy` is the expanded-IRI form real
+/// EDC/DSP JSON-LD uses in place of the compact `hasPolicy` key (see
 /// `edc_federated_catalog_client::models::Dataset::has_policy`'s own
-/// `#[serde(rename = "http://www.w3.org/ns/odrl/2/hasPolicy")]` on the wire
-/// side (see this crate's task briefing / gap analysis §3.4).
-const ODRL_HAS_POLICY_IRI: &str = "http://www.w3.org/ns/odrl/2/hasPolicy";
+/// `#[serde(rename = ...)]`); [`aliased_all`] accepts every key in that form.
+const ODRL_NS: &str = "http://www.w3.org/ns/odrl/2/";
 
 /// ODRL/JSON-LD's "one-or-many" convention: a value that is normally an
 /// array may legally appear as a single bare object instead when there is
 /// exactly one entry. Returns an empty `Vec` for a missing key, the single
 /// value wrapped for a bare object, or the array's own entries otherwise.
+///
+/// A JSON-LD list or set object (`{"@list": [...]}`, `{"@set": [...]}`, as
+/// its only key) is unwrapped to its entries, so wrapping a rule or policy
+/// in one does not hide it from the parser.
 fn one_or_many(value: Option<&Value>) -> Vec<&Value> {
     match value {
         None => Vec::new(),
         Some(Value::Array(items)) => items.iter().collect(),
+        Some(Value::Object(map)) if map.len() == 1 => {
+            match map.get("@list").or_else(|| map.get("@set")) {
+                Some(inner) => one_or_many(Some(inner)),
+                None => vec![value.unwrap()],
+            }
+        }
         Some(other) => vec![other],
     }
 }
 
-/// Read a string field that may appear under `plain` (this workspace's own
-/// compact DSP shape) or under `alias` (real EDC/DSP's `odrl:`-prefixed
-/// JSON-LD key) - e.g. `assigner`/`odrl:assigner`.
-fn get_str_with_alias(value: &Value, plain: &str, alias: &str) -> Option<String> {
+/// Every value `name` has in a JSON-LD node, one per spelling present: bare
+/// (`permission`), `odrl:`-prefixed (`odrl:permission`) and full ODRL IRI
+/// (`http://www.w3.org/ns/odrl/2/permission`). JSON-LD expands all spellings
+/// to one IRI and merges their values, so a node carrying two spellings has
+/// both contributions. Every ODRL key this parser reads goes through here (a
+/// skipped spelling would loosen the policy).
+fn aliased_all<'a>(value: &'a Value, name: &str) -> Vec<&'a Value> {
+    [
+        name.to_string(),
+        format!("odrl:{name}"),
+        format!("{ODRL_NS}{name}"),
+    ]
+    .iter()
+    .filter_map(|key| value.get(key.as_str()))
+    .collect()
+}
+
+/// The one-or-many entries of `name` under all its spellings, merged in
+/// spelling order (bare, `odrl:`, full IRI).
+fn one_or_many_aliased<'a>(value: &'a Value, name: &str) -> Vec<&'a Value> {
+    aliased_all(value, name)
+        .into_iter()
+        .flat_map(|v| one_or_many(Some(v)))
+        .collect()
+}
+
+/// Reduce a JSON-LD scalar to a string: a plain string, a number or boolean
+/// (rendered as JSON does), a value object (`{"@value": ...}`, language and
+/// datatype tags ignored), a node reference (`{"@id": ...}`), or a
+/// one-element array of any of those. Anything else (null, a nested node, a
+/// multi-element array) has no single string reading and yields `None`.
+fn json_ld_scalar(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(render_number(n)),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Object(map) => match map.get("@value") {
+            Some(inner @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) => {
+                json_ld_scalar(inner)
+            }
+            Some(_) => None,
+            // A node reference is its @id only when nothing else qualifies
+            // it: an action with a `refinement`, for example, is narrower
+            // than its bare @id.
+            None if map.keys().all(|k| k == "@id" || k == "@type") => {
+                map.get("@id").and_then(Value::as_str).map(str::to_string)
+            }
+            None => None,
+        },
+        Value::Array(items) if items.len() == 1 => json_ld_scalar(&items[0]),
+        _ => None,
+    }
+}
+
+/// Render a JSON number as the claim strings the broker compares against: an
+/// integral float (`10.0`, `1e3`) renders as an integer (`10`, `1000`), so an
+/// `eq` against a claim written `10` still matches.
+fn render_number(n: &serde_json::Number) -> String {
+    match n.as_f64() {
+        Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() < 1e15 => format!("{}", f as i64),
+        _ => n.to_string(),
+    }
+}
+
+/// What reading one scalar ODRL field produced.
+enum Field {
+    /// The key is not there.
+    Absent,
+    Value(String),
+    /// The key is there but holds something with no single string reading.
+    Unreadable,
+}
+
+impl Field {
+    fn value(self) -> Option<String> {
+        match self {
+            Field::Value(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// Read the scalar field `name` of `value`, under any alias.
+fn get_field(value: &Value, name: &str) -> Field {
+    match aliased_all(value, name).as_slice() {
+        [] => Field::Absent,
+        [raw] => json_ld_scalar(raw).map_or(Field::Unreadable, Field::Value),
+        // The same scalar under two spellings has no single reading.
+        _ => Field::Unreadable,
+    }
+}
+
+/// The raw value as logged next to a marker.
+fn log_excerpt(value: &Value) -> String {
     value
-        .get(plain)
-        .or_else(|| value.get(alias))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+        .to_string()
+        .chars()
+        .take(catalog_core::UNMAPPABLE_EXCERPT_MAX)
+        .collect()
+}
+
+/// A rule that carries only an unmappable marker, standing in for policy
+/// content that could not be read (see [`Constraint::unmappable`]).
+fn unmappable_rule(raw: &Value) -> Rule {
+    tracing::warn!(entry = %log_excerpt(raw), "keeping unreadable crawled ODRL content as an unmappable marker");
+    Rule {
+        action: UNMAPPABLE_ACTION.to_string(),
+        constraints: vec![Constraint::unmappable(raw.to_string())],
+    }
 }
 
 /// Parse a dataset object's `hasPolicy` entries (see `parse_catalog_response`'s
@@ -717,14 +837,26 @@ fn get_str_with_alias(value: &Value, plain: &str, alias: &str) -> Option<String>
 /// `catalog_core::Policy` values. Absent entirely -> an empty `Vec`, exactly
 /// like every other optional dataset descriptor this crawler handles.
 fn parse_policies(dataset_value: &Value) -> Vec<Policy> {
-    let has_policy = dataset_value
-        .get("hasPolicy")
-        .or_else(|| dataset_value.get(ODRL_HAS_POLICY_IRI));
-
-    one_or_many(has_policy)
+    one_or_many_aliased(dataset_value, "hasPolicy")
         .into_iter()
-        .filter(|entry| entry.is_object())
-        .map(parse_policy)
+        .map(|entry| {
+            if entry.is_object() {
+                parse_policy(entry)
+            } else {
+                // A bare string (a policy reference) or other non-node: the
+                // broker cannot evaluate it, so it must not read as "no
+                // policy".
+                Policy {
+                    id: None,
+                    kind: PolicyKind::default(),
+                    assigner: None,
+                    assignee: None,
+                    permissions: Vec::new(),
+                    prohibitions: Vec::new(),
+                    obligations: vec![unmappable_rule(entry)],
+                }
+            }
+        })
         .collect()
 }
 
@@ -747,8 +879,36 @@ fn parse_policy(value: &Value) -> Policy {
             _ => PolicyKind::default(),
         })
         .unwrap_or_default();
-    let assigner = get_str_with_alias(value, "assigner", "odrl:assigner");
-    let assignee = get_str_with_alias(value, "assignee", "odrl:assignee");
+    let assigner = get_field(value, "assigner").value();
+    let mut obligations = parse_rules(value, "obligation");
+    // A policy node with none of the rule keys has nothing the broker can
+    // evaluate (a bare reference, an unknown shape). An empty policy would
+    // read as permissive, so it carries a marker. An explicitly empty rule
+    // list is a real, empty policy and is not marked.
+    if ["permission", "prohibition", "obligation"]
+        .iter()
+        .all(|k| aliased_all(value, k).is_empty())
+    {
+        obligations.push(unmappable_rule(value));
+    }
+    // An assignee scopes the policy to one party. Reading it as absent would
+    // widen the policy to everyone, so an unreadable one adds a marker rule.
+    let assignee = match get_field(value, "assignee") {
+        Field::Value(v) => Some(v),
+        Field::Absent => None,
+        Field::Unreadable => {
+            let raws: Vec<Value> = aliased_all(value, "assignee")
+                .into_iter()
+                .cloned()
+                .collect();
+            let raw = match raws.as_slice() {
+                [one] => one.clone(),
+                _ => Value::Array(raws),
+            };
+            obligations.push(unmappable_rule(&raw));
+            None
+        }
+    };
 
     Policy {
         id,
@@ -757,40 +917,66 @@ fn parse_policy(value: &Value) -> Policy {
         assignee,
         permissions: parse_rules(value, "permission"),
         prohibitions: parse_rules(value, "prohibition"),
-        obligations: parse_rules(value, "obligation"),
+        obligations,
     }
 }
 
 /// Parse a policy object's `key` entries (`"permission"`, `"prohibition"`,
-/// or `"obligation"`, one-or-many) into `Rule`s. A malformed entry -
-/// missing its required `action` - is skipped on its own, with a
-/// `tracing::warn!`, rather than failing the rest of the list; see
-/// `parse_catalog_response`'s doc comment for why.
+/// or `"obligation"`, one-or-many, any alias) into `Rule`s. An entry that
+/// is not a node is kept as an unmappable marker rule rather than dropped.
 fn parse_rules(policy_value: &Value, key: &str) -> Vec<Rule> {
-    one_or_many(policy_value.get(key))
+    one_or_many_aliased(policy_value, key)
         .into_iter()
-        .filter_map(parse_rule)
+        .map(parse_rule)
         .collect()
 }
 
 /// Parse one `permission`/`prohibition`/`obligation` entry into a `Rule`.
-/// Returns `None` (skipping just this entry) when `action` is missing -
-/// required by ODRL's rule shape and by
-/// `edc_connector_client_next::types::policy`'s wire model, which has no
-/// `#[serde(default)]` on it either.
-fn parse_rule(value: &Value) -> Option<Rule> {
-    let action = get_str_with_alias(value, "action", "odrl:action").or_else(|| {
-        tracing::warn!(
-            entry = %value,
-            "skipping a crawled ODRL permission/prohibition/obligation entry with no 'action'"
-        );
-        None
-    })?;
-
-    Some(Rule {
+/// An `action` that is missing or unreadable keeps the rule's constraints
+/// under [`UNMAPPABLE_ACTION`] plus an unmappable marker: dropping the rule
+/// would loosen the policy when it is a prohibition.
+fn parse_rule(value: &Value) -> Rule {
+    if !value.is_object() {
+        return unmappable_rule(value);
+    }
+    let mut constraints = Vec::new();
+    let action = match get_field(value, "action") {
+        Field::Value(action) => action,
+        Field::Absent | Field::Unreadable => {
+            tracing::warn!(
+                entry = %log_excerpt(value),
+                "crawled ODRL rule has no readable 'action'; keeping it as an unmappable marker"
+            );
+            constraints.push(Constraint::unmappable(value.to_string()));
+            UNMAPPABLE_ACTION.to_string()
+        }
+    };
+    constraints.extend(parse_constraints(one_or_many_aliased(value, "constraint")));
+    // The model has no rule-level assignee, target or duty. Dropping one
+    // would widen the rule (an assignee-scoped permission would apply to
+    // everyone), so each present key adds a marker.
+    for key in ["assignee", "target", "duty"] {
+        let raws = aliased_all(value, key);
+        if !raws.is_empty() {
+            tracing::warn!(
+                key,
+                entry = %log_excerpt(raws[0]),
+                "crawled ODRL rule carries a rule-level key the broker cannot honour; \
+                 keeping it as an unmappable marker"
+            );
+            constraints.push(Constraint::unmappable(format!(
+                "{key}: {}",
+                raws.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+    Rule {
         action,
-        constraints: parse_constraints(value.get("constraint")),
-    })
+        constraints,
+    }
 }
 
 /// Bounds how many nested `odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`
@@ -814,7 +1000,8 @@ const MAX_CONSTRAINT_DEPTH: usize = 64;
 /// clippy `type_complexity` warning).
 type LogicalConstraintBuilder = fn(Vec<Constraint>) -> Constraint;
 
-/// The `odrl:`-prefixed JSON-LD keys a logical constraint group may use,
+/// The JSON-LD keys (read under any alias, see [`aliased_all`]) a logical
+/// constraint group may use,
 /// each paired with the `catalog_core::Constraint` constructor for that
 /// combinator, in the same fixed precedence order
 /// `ds-odrl-engine-rs::engine::Constraint::evaluate` applies when more than
@@ -826,76 +1013,90 @@ type LogicalConstraintBuilder = fn(Vec<Constraint>) -> Constraint;
 /// generally lenient stance - is at least interpreted identically by both
 /// this crawler and the engine that will later evaluate it.
 const LOGICAL_CONSTRAINT_KEYS: [(&str, LogicalConstraintBuilder); 4] = [
-    ("odrl:xone", Constraint::xone),
-    ("odrl:or", Constraint::or),
-    ("odrl:and", Constraint::and),
-    ("odrl:andSequence", Constraint::and_sequence),
+    ("xone", Constraint::xone),
+    ("or", Constraint::or),
+    ("and", Constraint::and),
+    ("andSequence", Constraint::and_sequence),
 ];
 
 /// Parse a rule's `constraint` entries (one-or-many) into `Constraint`s -
 /// see [`parse_constraint`] for the per-entry (recursive) parse.
-fn parse_constraints(value: Option<&Value>) -> Vec<Constraint> {
-    one_or_many(value)
+fn parse_constraints(entries: Vec<&Value>) -> Vec<Constraint> {
+    entries
         .into_iter()
-        .filter_map(|entry| parse_constraint(entry, 0))
+        .map(|entry| parse_constraint(entry, 0))
         .collect()
 }
 
 /// Parse one `constraint` entry into a `Constraint`, recursively: either the
 /// atomic `leftOperand`/`operator`/`rightOperand` shape, or a logical group
-/// under one of [`LOGICAL_CONSTRAINT_KEYS`] (`odrl:and`/`odrl:or`/
-/// `odrl:xone`/`odrl:andSequence`), whose own child entries (one-or-many,
-/// same convention as everywhere else in this parser) are parsed by
-/// recursing into this same function at `depth + 1` - so a group nested
-/// inside another group is handled the same way as a top-level one.
+/// under one of [`LOGICAL_CONSTRAINT_KEYS`], whose child entries
+/// (one-or-many) are parsed by recursing at `depth + 1`.
 ///
-/// `depth` is the caller's nesting depth for `value` itself (0 for a rule's
-/// own top-level `constraint` entries); recursion stops and this entry is
-/// skipped, logged via `tracing::warn!`, once `depth` exceeds
-/// [`MAX_CONSTRAINT_DEPTH`], the same bound
-/// `ds-odrl-engine-rs::engine::Constraint::evaluate` enforces on the tree it
-/// would later evaluate - see that constant's own doc comment. Also skipped
-/// the same way (single entry, not the enclosing rule/policy): a node with
-/// neither a complete atomic triple nor a recognized logical key, e.g. one
-/// missing `rightOperand`, or one using an ODRL constraint shape this parser
-/// does not recognize.
-fn parse_constraint(value: &Value, depth: usize) -> Option<Constraint> {
+/// This never drops an entry. Content that cannot be read becomes a
+/// [`Constraint::unmappable`] marker, so the broker's
+/// `unmappableConstraintAction` decides what happens to it. A dropped
+/// constraint would loosen the policy before the broker sees it. Marked
+/// cases: an incomplete or unreadable atomic triple, an unrecognized shape,
+/// a non-object entry, and a logical group whose children would sit past
+/// [`MAX_CONSTRAINT_DEPTH`] (the group itself is replaced by the marker, at a
+/// depth the store accepts).
+fn parse_constraint(value: &Value, depth: usize) -> Constraint {
     if depth > MAX_CONSTRAINT_DEPTH {
+        return Constraint::unmappable(value.to_string());
+    }
+
+    // A node that mixes an atomic triple with a logical key, or carries more
+    // than one logical key, is ambiguous. Reading one part would drop the
+    // rest and loosen the policy, so the whole node is marked.
+    let has_atomic_key = ["leftOperand", "operator", "rightOperand"]
+        .iter()
+        .any(|k| !aliased_all(value, k).is_empty());
+    let logical_present: Vec<&(&str, LogicalConstraintBuilder)> = LOGICAL_CONSTRAINT_KEYS
+        .iter()
+        .filter(|(key, _)| !aliased_all(value, key).is_empty())
+        .collect();
+    if logical_present.len() > 1 || (has_atomic_key && !logical_present.is_empty()) {
         tracing::warn!(
-            entry = %value,
-            depth,
-            max_depth = MAX_CONSTRAINT_DEPTH,
-            "skipping a crawled ODRL logical constraint nested past MAX_CONSTRAINT_DEPTH"
+            entry = %log_excerpt(value),
+            "crawled ODRL constraint mixes atomic and logical keys or several logical keys; \
+             keeping it as an unmappable marker"
         );
-        return None;
+        return Constraint::unmappable(value.to_string());
     }
 
-    let left_operand = get_str_with_alias(value, "leftOperand", "odrl:leftOperand");
-    let operator = get_str_with_alias(value, "operator", "odrl:operator");
-    let right_operand = get_str_with_alias(value, "rightOperand", "odrl:rightOperand");
-
-    if let (Some(left_operand), Some(operator), Some(right_operand)) =
-        (left_operand, operator, right_operand)
-    {
-        return Some(Constraint::atomic(left_operand, operator, right_operand));
+    if let (Field::Value(left), Field::Value(operator), Field::Value(right)) = (
+        get_field(value, "leftOperand"),
+        get_field(value, "operator"),
+        get_field(value, "rightOperand"),
+    ) {
+        return Constraint::atomic(left, operator, right);
     }
 
-    for (key, build) in LOGICAL_CONSTRAINT_KEYS {
-        if let Some(children_value) = value.get(key) {
-            let children: Vec<Constraint> = one_or_many(Some(children_value))
-                .into_iter()
-                .filter_map(|child| parse_constraint(child, depth + 1))
-                .collect();
-            return Some(build(children));
+    if let Some((_, build)) = logical_present.first() {
+        if depth >= MAX_CONSTRAINT_DEPTH {
+            tracing::warn!(
+                depth,
+                max_depth = MAX_CONSTRAINT_DEPTH,
+                "crawled ODRL logical constraint nested past MAX_CONSTRAINT_DEPTH; \
+                 keeping it as an unmappable marker"
+            );
+            return Constraint::unmappable(value.to_string());
         }
+        let key = logical_present[0].0;
+        let children: Vec<Constraint> = one_or_many_aliased(value, key)
+            .into_iter()
+            .map(|child| parse_constraint(child, depth + 1))
+            .collect();
+        return build(children);
     }
 
     tracing::warn!(
-        entry = %value,
-        "skipping a crawled ODRL constraint that is neither an atomic leftOperand/operator/rightOperand \
-         triple nor a recognized logical group (odrl:and/odrl:or/odrl:xone/odrl:andSequence)"
+        entry = %log_excerpt(value),
+        "crawled ODRL constraint is neither a complete atomic triple nor a recognized logical \
+         group; keeping it as an unmappable marker"
     );
-    None
+    Constraint::unmappable(value.to_string())
 }
 
 /// Spawn a background task that runs [`Harvester::run_cycle`] every
@@ -1455,15 +1656,15 @@ mod tests {
     /// alongside one genuinely malformed one (neither a complete atomic
     /// `leftOperand`/`operator`/`rightOperand` triple - `rightOperand` is
     /// missing here - nor a recognized `odrl:and`/`odrl:or`/`odrl:xone`/
-    /// `odrl:andSequence` logical key) skips only the malformed constraint -
-    /// the well-formed constraint and the rest of the permission/policy
-    /// survive intact, and the whole crawl does not panic. Note this is
+    /// `odrl:andSequence` logical key) keeps the malformed one as an
+    /// unmappable marker - the well-formed constraint and the rest of the
+    /// permission/policy survive intact, and the whole crawl does not panic. Note this is
     /// *not* an `odrl:and`/etc. node: those are real, well-formed ODRL and
     /// are now parsed into `Constraint::Logical` (see
     /// `logical_and_constraint_is_parsed_not_skipped`), not treated as
     /// malformed.
     #[test]
-    fn malformed_nested_constraint_is_skipped_without_dropping_the_rest_of_the_policy() {
+    fn malformed_nested_constraint_is_kept_as_a_marker_beside_the_rest_of_the_policy() {
         let body = json!({
             "@id": "cat-1",
             "dataset": [{
@@ -1496,10 +1697,12 @@ mod tests {
         let policies = &catalog.datasets[0].policies;
         assert_eq!(policies.len(), 1);
         assert_eq!(policies[0].permissions.len(), 1);
-        assert_eq!(
-            policies[0].permissions[0].constraints,
-            vec![Constraint::atomic("count", "lteq", "10")],
-            "the well-formed atomic constraint must survive; the constraint missing rightOperand must be skipped, not crash or wipe the whole list"
+        let constraints = &policies[0].permissions[0].constraints;
+        assert_eq!(constraints.len(), 2);
+        assert_eq!(constraints[0], Constraint::atomic("count", "lteq", "10"));
+        assert!(
+            constraints[1].is_unmappable(),
+            "the constraint missing rightOperand must be kept as an unmappable marker, not dropped"
         );
     }
 
@@ -1555,12 +1758,11 @@ mod tests {
     }
 
     /// A `permission`/`prohibition`/`obligation` entry missing its
-    /// required `action` is skipped as a single malformed rule entry,
-    /// without failing the rest of the policy - a crawled participant
-    /// sending malformed data degrades gracefully rather than taking down
-    /// harvesting.
+    /// required `action` is kept as a marker rule under `UNMAPPABLE_ACTION`
+    /// (dropping it would loosen the policy when it is a prohibition), and
+    /// the rest of the policy is unaffected.
     #[test]
-    fn rule_entry_missing_action_is_skipped_without_dropping_other_rules() {
+    fn rule_entry_missing_action_is_kept_as_a_marker_rule() {
         let body = json!({
             "@id": "cat-1",
             "dataset": [{
@@ -1581,12 +1783,16 @@ mod tests {
 
         let policies = &catalog.datasets[0].policies;
         assert_eq!(policies.len(), 1);
-        assert_eq!(
-            policies[0].permissions.len(),
-            1,
-            "the actionless permission entry must be dropped, the valid one kept"
+        let permissions = &policies[0].permissions;
+        assert_eq!(permissions.len(), 2, "no rule is dropped");
+        assert_eq!(permissions[0].action, UNMAPPABLE_ACTION);
+        assert!(
+            permissions[0]
+                .constraints
+                .iter()
+                .any(Constraint::is_unmappable)
         );
-        assert_eq!(policies[0].permissions[0].action, "use");
+        assert_eq!(permissions[1].action, "use");
     }
 
     /// An unrecognized `@type` value degrades leniently to the default
@@ -2268,5 +2474,337 @@ mod tests {
         let report = harvester.run_cycle().await;
         assert_eq!(report.expired, vec!["flaky"], "the delete is retried");
         assert!(!harvester.status().snapshot().participants["flaky"].cached);
+    }
+
+    // --- #40: unparseable policy content is kept as an unmappable marker ---
+
+    fn parse_one_policy(policy: Value) -> Policy {
+        let body = json!({"@id": "cat-1", "dataset": [{"@id": "D", "hasPolicy": [policy]}]});
+        let catalog = parse_catalog_response(&body, &participant("p40"));
+        catalog.datasets[0].policies[0].clone()
+    }
+
+    fn is_marker(c: &Constraint) -> bool {
+        c.is_unmappable()
+    }
+
+    #[test]
+    fn duplicate_spellings_are_merged_not_dropped() {
+        let policy = parse_one_policy(json!({
+            "prohibition": [],
+            "odrl:prohibition": [{"action": "distribute"}],
+            "permission": [{
+                "action": "use",
+                "constraint": [],
+                "odrl:constraint": [{"leftOperand": "a", "operator": "eq", "rightOperand": "b"}]
+            }]
+        }));
+        assert_eq!(policy.prohibitions.len(), 1);
+        assert_eq!(policy.permissions[0].constraints.len(), 1);
+    }
+
+    #[test]
+    fn mixed_or_multiple_constraint_keys_become_a_marker() {
+        let atomic_plus_group = json!({
+            "leftOperand": "a", "operator": "eq", "rightOperand": "b",
+            "odrl:and": [{"leftOperand": "x", "operator": "eq", "rightOperand": "y"}]
+        });
+        let two_groups = json!({
+            "or": [{"leftOperand": "x", "operator": "eq", "rightOperand": "y"}],
+            "odrl:and": [{"leftOperand": "x", "operator": "eq", "rightOperand": "y"}]
+        });
+        let dup_scalar = json!({
+            "leftOperand": "a", "odrl:leftOperand": "z", "operator": "eq", "rightOperand": "b"
+        });
+        let policy = parse_one_policy(json!({"permission": [{
+            "action": "use",
+            "constraint": [atomic_plus_group, two_groups, dup_scalar]
+        }]}));
+        let constraints = &policy.permissions[0].constraints;
+        assert_eq!(constraints.len(), 3);
+        assert!(constraints.iter().all(is_marker), "{constraints:?}");
+    }
+
+    #[test]
+    fn incomplete_atomic_constraint_becomes_an_unmappable_marker() {
+        let policy = parse_one_policy(json!({"permission": [{
+            "action": "use",
+            "constraint": [{"leftOperand": "purpose", "operator": "eq"}]
+        }]}));
+        let constraints = &policy.permissions[0].constraints;
+        assert_eq!(constraints.len(), 1);
+        assert!(is_marker(&constraints[0]), "{constraints:?}");
+    }
+
+    #[test]
+    fn unrecognized_constraint_shape_becomes_an_unmappable_marker() {
+        let policy = parse_one_policy(json!({"permission": [{
+            "action": "use",
+            "constraint": [{"foo": "bar"}, "not-an-object"]
+        }]}));
+        let constraints = &policy.permissions[0].constraints;
+        assert_eq!(constraints.len(), 2);
+        assert!(constraints.iter().all(is_marker));
+    }
+
+    #[test]
+    fn over_deep_group_child_is_marked_not_dropped() {
+        let mut deep = json!({"leftOperand": "a", "operator": "eq", "rightOperand": "b"});
+        for _ in 0..(MAX_CONSTRAINT_DEPTH + 5) {
+            deep = json!({"odrl:and": [deep]});
+        }
+        let leaf = json!({"leftOperand": "x", "operator": "eq", "rightOperand": "y"});
+        let policy = parse_one_policy(json!({"permission": [{
+            "action": "use",
+            "constraint": [{"odrl:and": [leaf, deep]}]
+        }]}));
+        let Constraint::Logical(catalog_core::LogicalConstraint::And(children)) =
+            &policy.permissions[0].constraints[0]
+        else {
+            panic!("expected an and group");
+        };
+        assert_eq!(children.len(), 2, "the deep child must not be dropped");
+        // Walk down the deep child: it must end in a marker within the
+        // depth bound the store accepts.
+        let mut node = &children[1];
+        let mut depth = 1;
+        loop {
+            match node {
+                Constraint::Logical(catalog_core::LogicalConstraint::And(c)) => {
+                    node = &c[0];
+                    depth += 1;
+                }
+                other => {
+                    assert!(is_marker(other), "{other:?}");
+                    break;
+                }
+            }
+        }
+        assert!(depth <= MAX_CONSTRAINT_DEPTH, "depth {depth}");
+    }
+
+    #[test]
+    fn bare_and_prefixed_aliases_are_read_everywhere() {
+        let policy = parse_one_policy(json!({
+            "odrl:assignee": "did:web:a",
+            "odrl:prohibition": [{
+                "odrl:action": "odrl:distribute",
+                "odrl:constraint": [{"and": [
+                    {"odrl:leftOperand": "count", "odrl:operator": "lt", "odrl:rightOperand": "3"}
+                ]}]
+            }],
+            "http://www.w3.org/ns/odrl/2/permission": {"action": "use"},
+            "obligation": {"action": "delete"}
+        }));
+        assert_eq!(policy.assignee.as_deref(), Some("did:web:a"));
+        assert_eq!(policy.prohibitions.len(), 1);
+        assert_eq!(
+            policy.prohibitions[0].constraints,
+            vec![Constraint::and(vec![Constraint::atomic(
+                "count", "lt", "3"
+            )])]
+        );
+        assert_eq!(policy.permissions.len(), 1);
+        assert_eq!(policy.obligations.len(), 1);
+    }
+
+    #[test]
+    fn odrl_prefixed_has_policy_is_read() {
+        let body = json!({"@id": "c", "dataset": [{
+            "@id": "D",
+            "odrl:hasPolicy": {"permission": {"action": "use"}}
+        }]});
+        let catalog = parse_catalog_response(&body, &participant("p40"));
+        assert_eq!(catalog.datasets[0].policies.len(), 1);
+    }
+
+    #[test]
+    fn json_ld_value_objects_are_normalized() {
+        let policy = parse_one_policy(json!({
+            "assignee": {"@id": "did:web:a"},
+            "permission": [{
+                "action": {"@id": "odrl:use"},
+                "constraint": [
+                    {"leftOperand": {"@id": "odrl:purpose"}, "operator": {"@id": "odrl:eq"},
+                     "rightOperand": {"@value": "research", "@type": "xsd:string"}},
+                    {"leftOperand": "count", "operator": "lteq", "rightOperand": 10},
+                    {"leftOperand": "flag", "operator": "eq", "rightOperand": true}
+                ]
+            }]
+        }));
+        assert_eq!(policy.assignee.as_deref(), Some("did:web:a"));
+        assert_eq!(policy.permissions[0].action, "odrl:use");
+        assert_eq!(
+            policy.permissions[0].constraints,
+            vec![
+                Constraint::atomic("odrl:purpose", "odrl:eq", "research"),
+                Constraint::atomic("count", "lteq", "10"),
+                Constraint::atomic("flag", "eq", "true"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unparseable_right_operand_is_marked() {
+        let policy = parse_one_policy(json!({"permission": [{
+            "action": "use",
+            "constraint": [{"leftOperand": "x", "operator": "isAnyOf", "rightOperand": ["a", "b"]}]
+        }]}));
+        assert!(is_marker(&policy.permissions[0].constraints[0]));
+    }
+
+    #[test]
+    fn rule_without_a_readable_action_is_kept_with_a_marker() {
+        let policy = parse_one_policy(json!({"prohibition": [
+            {"constraint": [{"leftOperand": "a", "operator": "eq", "rightOperand": "b"}]},
+            {"action": [1, 2]}
+        ]}));
+        assert_eq!(policy.prohibitions.len(), 2);
+        for rule in &policy.prohibitions {
+            assert!(rule.constraints.iter().any(is_marker), "{rule:?}");
+        }
+    }
+
+    #[test]
+    fn unreadable_assignee_is_kept_as_a_marker_rule() {
+        let policy = parse_one_policy(json!({
+            "assignee": {"unexpected": true},
+            "permission": {"action": "use"}
+        }));
+        let marked = policy
+            .permissions
+            .iter()
+            .chain(&policy.prohibitions)
+            .chain(&policy.obligations)
+            .any(|r| r.constraints.iter().any(is_marker));
+        assert!(marked, "{policy:?}");
+    }
+
+    // --- #40 audit follow-ups ---
+
+    #[test]
+    fn action_node_with_a_refinement_is_not_read_through_its_id_alone() {
+        let policy = parse_one_policy(json!({"permission": [{"action": {
+            "@id": "odrl:use",
+            "refinement": [{"leftOperand": "count", "operator": "lt", "rightOperand": "5"}]
+        }}]}));
+        let rule = &policy.permissions[0];
+        assert_eq!(rule.action, UNMAPPABLE_ACTION, "{rule:?}");
+        assert!(rule.constraints.iter().any(is_marker), "{rule:?}");
+    }
+
+    #[test]
+    fn action_node_with_only_id_and_type_is_still_read() {
+        let policy = parse_one_policy(json!({"permission": [{"action": {
+            "@id": "odrl:use", "@type": "odrl:Action"
+        }}]}));
+        assert_eq!(policy.permissions[0].action, "odrl:use");
+        assert!(policy.permissions[0].constraints.is_empty());
+    }
+
+    #[test]
+    fn rule_level_assignee_target_or_duty_adds_a_marker() {
+        for extra in [
+            json!({"assignee": "did:web:x"}),
+            json!({"odrl:assignee": {"@id": "did:web:x"}}),
+            json!({"target": "urn:other-asset"}),
+            json!({"duty": [{"action": "delete"}]}),
+        ] {
+            let mut rule = json!({"action": "use"});
+            rule.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            for key in ["permission", "prohibition"] {
+                let policy = parse_one_policy(json!({ key: [rule.clone()] }));
+                let rules = if key == "permission" {
+                    &policy.permissions
+                } else {
+                    &policy.prohibitions
+                };
+                assert_eq!(rules[0].action, "use", "{extra}");
+                assert!(
+                    rules[0].constraints.iter().any(is_marker),
+                    "{extra}: {rules:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn has_policy_in_list_or_set_syntax_is_unwrapped() {
+        for wrapper in ["@list", "@set"] {
+            let body = json!({"@id": "c", "dataset": [{"@id": "D", "hasPolicy": {
+                wrapper: [{"prohibition": [{"action": "use"}]}]
+            }}]});
+            let catalog = parse_catalog_response(&body, &participant("p40"));
+            let policies = &catalog.datasets[0].policies;
+            assert_eq!(policies.len(), 1, "{wrapper}");
+            assert_eq!(policies[0].prohibitions.len(), 1, "{wrapper}: {policies:?}");
+        }
+    }
+
+    #[test]
+    fn rules_in_list_syntax_are_unwrapped() {
+        let policy = parse_one_policy(json!({"prohibition": {"@list": [
+            {"action": "use"}, {"action": "distribute"}
+        ]}}));
+        assert_eq!(policy.prohibitions.len(), 2, "{policy:?}");
+        assert!(
+            policy
+                .prohibitions
+                .iter()
+                .all(|r| !r.constraints.iter().any(is_marker))
+        );
+    }
+
+    #[test]
+    fn policy_node_with_no_recognised_policy_key_is_marked() {
+        let policy = parse_one_policy(json!({"@id": "p", "unexpected": true}));
+        let marked = policy
+            .permissions
+            .iter()
+            .chain(&policy.prohibitions)
+            .chain(&policy.obligations)
+            .any(|r| r.constraints.iter().any(is_marker));
+        assert!(marked, "{policy:?}");
+    }
+
+    #[test]
+    fn policy_with_an_empty_rule_list_is_not_marked() {
+        let policy = parse_one_policy(json!({"@type": "Set", "permission": []}));
+        assert!(policy.permissions.is_empty() && policy.obligations.is_empty());
+    }
+
+    #[test]
+    fn integral_floats_render_as_integers() {
+        let policy = parse_one_policy(json!({"prohibition": [{
+            "action": "use",
+            "constraint": [
+                {"leftOperand": "n", "operator": "eq", "rightOperand": 10.0},
+                {"leftOperand": "n", "operator": "eq", "rightOperand": 1e3},
+                {"leftOperand": "n", "operator": "eq", "rightOperand": {"@value": 2.0}},
+                {"leftOperand": "n", "operator": "eq", "rightOperand": 2.5}
+            ]
+        }]}));
+        assert_eq!(
+            policy.prohibitions[0].constraints,
+            vec![
+                Constraint::atomic("n", "eq", "10"),
+                Constraint::atomic("n", "eq", "1000"),
+                Constraint::atomic("n", "eq", "2"),
+                Constraint::atomic("n", "eq", "2.5"),
+            ]
+        );
+    }
+
+    #[test]
+    fn logged_excerpt_is_truncated_on_a_character_boundary() {
+        let raw = json!({"k": "\u{e9}".repeat(1000)});
+        let excerpt = log_excerpt(&raw);
+        assert_eq!(
+            excerpt.chars().count(),
+            catalog_core::UNMAPPABLE_EXCERPT_MAX
+        );
+        assert!(raw.to_string().starts_with(&excerpt));
     }
 }
