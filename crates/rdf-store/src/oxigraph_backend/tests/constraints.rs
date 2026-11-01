@@ -213,3 +213,18 @@ async fn an_undecodable_catalog_is_left_out_of_reading_all_catalogs() {
         "asking for that participant alone still reports the error"
     );
 }
+
+/// The marker the crawler writes for unparseable content, including one at
+/// the depth bound, survives the store unchanged.
+#[tokio::test]
+async fn unmappable_markers_round_trip_including_at_the_depth_bound() {
+    let cache = cache();
+    let marker = Constraint::unmappable("{\"leftOperand\":\"x\"}");
+    let catalog =
+        catalog_with_constraint("node-marker", Constraint::and(vec![leaf(), marker.clone()]));
+    assert_eq!(round_trip(&cache, &catalog).await, catalog);
+
+    let catalog =
+        catalog_with_constraint("node-marker-deep", nested_and(MAX_CONSTRAINT_DEPTH, marker));
+    assert_eq!(round_trip(&cache, &catalog).await, catalog);
+}

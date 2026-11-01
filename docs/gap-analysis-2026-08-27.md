@@ -188,9 +188,10 @@ logical groups (`odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`, via
 participant's `odrl:hasPolicy` triples, the logical half recursively, bounded by a
 `MAX_CONSTRAINT_DEPTH` (64, deliberately matching
 `ds-odrl-engine-rs::engine::constraint::MAX_CONSTRAINT_DEPTH`'s own bound and rationale)
-past which a pathologically deep group is skipped - with a `tracing::warn!`, not a crash,
-and not dropping the rest of the rule/policy - rather than growing the parser's call
-stack unboundedly. The earlier atomic-only scope cut on the crawler's own parsing is
+past which a group is kept as an unmappable marker (`Constraint::unmappable`) with a
+`tracing::warn!`, rather than growing the parser's call stack unboundedly. The same
+marker replaces any constraint the crawler cannot read (see
+[configuration.md](configuration.md#unparseable-policy-content)). The earlier atomic-only scope cut on the crawler's own parsing is
 closed. `rdf-store`'s Oxigraph-backed semantic cache also writes/reads the logical shape
 now (`crates/rdf-store/src/lib.rs`'s `write_constraint`/`load_constraint`, persisting a
 `Logical` constraint via one blank-node subtree per nesting level, reconstructed on read

@@ -85,7 +85,7 @@ Every setting is optional.
 | `broker:sparqlQueryTimeoutMs` | `10000` | A `/sparql` request whose work (the policy allow-list, then the evaluation) runs longer gets `503` and its evaluation is cancelled. Positive integer. |
 | `broker:sparqlMaxRows` | `10000` | A `/sparql` `SELECT` result with more rows is rejected with `400`. Positive integer. |
 | `broker:sparqlMaxConcurrent` | `4` | How many `/sparql` evaluations may run at once; another query gets `503` straight away. A query past its timeout keeps its slot until it really stops, since some in-memory work cannot be interrupted. Positive integer. |
-| `broker:policyFilterUnmappableConstraintAction` | `hide_dataset` | `skip`, `drop_policy` or `hide_dataset`: what ODRL filtering does with a constraint it cannot evaluate. |
+| `broker:policyFilterUnmappableConstraintAction` | `hide_dataset` | `skip`, `drop_policy` or `hide_dataset`: what ODRL filtering does with a constraint it cannot evaluate, including policy content the crawler could not parse (see [Unparseable policy content](#unparseable-policy-content)). |
 | `broker:policyFilterNoPolicyVisibility` | `open` | `open` or `closed`: whether a dataset with no permissions is visible. |
 | `broker:shutdownDelaySecs` | unset (no delay) | Seconds between a shutdown signal and closing the listener, while `/ready` already answers `503`. See [operations.md](operations.md#shutdown). Positive integer. |
 | `broker:policyFilterRunWhenOauth2Disabled` | `true` | Boolean. `false` turns ODRL filtering off when OAuth2 gating is off. |
@@ -194,3 +194,42 @@ effect.
 
 These replace the participant registry TOML file that
 `broker:crawlerConfigPath` used to name. That property is no longer read.
+
+## Unparseable policy content
+
+The crawler does not drop ODRL content it cannot read, because dropping a
+restriction loosens the policy before the broker sees it. It stores the
+content as an unmappable constraint (operator `urn:ds42:broker:unmappable`,
+with a truncated copy of the raw JSON in `rightOperand`), and
+`broker:policyFilterUnmappableConstraintAction` decides what happens, the
+same as for an unknown operator. With the default `hide_dataset` the dataset
+is hidden.
+
+Content that becomes an unmappable constraint:
+
+- an atomic constraint with a missing or unreadable `leftOperand`,
+  `operator` or `rightOperand`, a constraint of unknown shape, or a
+  non-object constraint entry, at top level or inside a group;
+- a logical group whose children would nest past 64 levels (the group is
+  replaced by the marker);
+- a rule with a missing or unreadable `action` (kept under the action
+  `urn:ds42:broker:unmappable-action`);
+- a rule or policy entry that is not a JSON-LD node;
+- an unreadable `assignee` (a marker rule is added to the policy).
+
+Under `skip` the marker is dropped like any unmappable constraint, so a
+participant's unreadable restriction is ignored. Use `skip` only for
+participants you trust.
+
+The crawler reads every ODRL key in its bare, `odrl:`-prefixed or full IRI
+form (`permission`, `odrl:permission`,
+`http://www.w3.org/ns/odrl/2/permission`), including `hasPolicy`, the logical
+keys `and`/`or`/`xone`/`andSequence`, and the constraint fields. Scalar
+values may be plain strings, numbers, booleans, `{"@value": ...}` value
+objects or `{"@id": ...}` references. A `rightOperand` array with more than
+one element has no single string reading and becomes an unmappable
+constraint.
+
+One case is not handled per entry: a catalog response nested deeper than
+serde_json's 128-level recursion limit fails the whole fetch. The previous
+cache entry for that participant stays until it expires.

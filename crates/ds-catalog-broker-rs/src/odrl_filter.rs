@@ -990,6 +990,39 @@ mod tests {
         );
     }
 
+    fn dataset_with_marker(prohibition: bool) -> Dataset {
+        let rule = CoreRule {
+            action: "use".to_string(),
+            constraints: vec![CoreConstraint::unmappable("{\"leftOperand\":\"purpose\"}")],
+        };
+        let mut p = policy(Vec::new(), Vec::new());
+        if prohibition {
+            p.prohibitions = vec![rule];
+            p.permissions = vec![CoreRule {
+                action: "use".to_string(),
+                constraints: Vec::new(),
+            }];
+        } else {
+            p.permissions = vec![rule];
+        }
+        dataset_with_policies(vec![p])
+    }
+
+    #[test]
+    fn crawler_marker_constraint_follows_the_unmappable_action() {
+        for prohibition in [false, true] {
+            let dataset = dataset_with_marker(prohibition);
+            let claims = Claims::new();
+            let hide = PolicyFilterConfig::default();
+            assert!(!dataset_is_visible(&dataset, &claims, "use", &hide));
+            let drop = PolicyFilterConfig {
+                unmappable_constraint_action: UnmappableConstraintAction::DropPolicy,
+                ..PolicyFilterConfig::default()
+            };
+            assert!(!dataset_is_visible(&dataset, &claims, "use", &drop));
+        }
+    }
+
     // --- leftOperand normalization (normalize_left_operand) --------------
     //
     // A harvested `leftOperand` is vocabulary, compacted out of the ODRL
