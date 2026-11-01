@@ -467,6 +467,11 @@ async fn crawl_one(
 /// entry from a crawled participant degrades gracefully instead of taking
 /// down the whole crawl cycle.
 ///
+/// Datasets are deduplicated by id within one response, as services are:
+/// the first occurrence wins and later ones are skipped with a
+/// `tracing::warn!`. rdf-store derives resource IRIs from the dataset id,
+/// so keeping both would merge their triples into one mixed policy.
+///
 /// Also tolerates a "federation of federations" response - one where the
 /// crawled participant is itself a multi-participant aggregator (e.g.
 /// another instance of this workspace's own `ds-catalog-broker-rs`, once it has 2+
@@ -528,6 +533,17 @@ fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog) {
             else {
                 continue;
             };
+
+            // The store derives resource IRIs from the dataset id, so two
+            // datasets with one id would merge their triples into a mixed
+            // policy. Keep the first, as for services.
+            if catalog.datasets.iter().any(|d| d.id == dataset_id) {
+                tracing::warn!(
+                    dataset_id,
+                    "skipping a crawled dataset whose id was already seen in this response (first one wins)"
+                );
+                continue;
+            }
 
             let mut dataset = Dataset {
                 id: dataset_id.to_string(),
