@@ -4,17 +4,19 @@
 use std::sync::Arc;
 
 use axum::{
-    Form, Json,
+    Form,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use rdf_store::oxigraph_backend::{CancellationToken, SparqlError, SparqlLimits};
-use rdf_store::{CatalogCache, CatalogQuery};
+use rdf_store::oxigraph_backend::{
+    CancellationToken, OxigraphCatalogCache, SparqlError, SparqlLimits,
+};
+use rdf_store::{CatalogQuery, StoreError};
 use serde::Deserialize;
 
-use super::ErrorResponse;
 use super::auth::check_oauth2_bearer;
+use super::internal_error;
 use super::policy::{engine_claims_from_bearer, should_filter_by_policy, visible_resource_iris};
 use crate::AppState;
 
@@ -116,8 +118,11 @@ pub(super) fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 ///   comments): 400 Bad Request with a plain-text explanation - these are
 ///   all the caller's own query's fault.
 /// - Evaluation runs on the blocking pool under [`SparqlLimitsConfig`](crate::SparqlLimitsConfig):
-///   past `timeout` it is cancelled and the caller gets 503 Service
-///   Unavailable; a result over `max_rows` rows is 400 Bad Request.
+///   when `max_concurrent` evaluations are already running the caller
+///   gets 503 Service Unavailable straight away; past `timeout` it is
+///   cancelled and the caller gets 503; a result over `max_rows` rows is
+///   400 Bad Request. The policy allow-list is computed in the same
+///   blocking task, just before evaluation.
 /// - Otherwise: 200 with an `application/sparql-results+json` body.
 ///
 /// Checked first, ahead of all of the above: the OAuth2 Bearer gate (see
@@ -154,46 +159,86 @@ pub(super) async fn sparql_route(
         }
     };
 
-    let visible_resources = if should_filter_by_policy(&state) {
-        let engine_claims = engine_claims_from_bearer(claims.as_ref());
-        let catalogs = match state.cache.query(CatalogQuery::all()).await {
-            Ok(catalogs) => catalogs,
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: err.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        };
-        Some(visible_resource_iris(&catalogs, &engine_claims, &state))
-    } else {
-        None
+    // A query that does not even parse is the caller's error, answered
+    // before it costs a slot or a store decode.
+    if let Err(err) = OxigraphCatalogCache::check_sparql(&query) {
+        return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+    }
+
+    // One slot per evaluation that may run at once. The slot moves into
+    // the blocking task and is freed only when evaluation really ends,
+    // which can be well after the timeout: oxigraph checks for
+    // cancellation only when it reads the store.
+    let Ok(slot) = Arc::clone(&state.sparql_slots).try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "the SPARQL endpoint is busy: {} queries are already running - retry later",
+                state.sparql_limits.max_concurrent
+            ),
+        )
+            .into_response();
     };
 
     // Evaluation is synchronous and can be slow, so it runs on the
-    // blocking pool, never on an async worker. On timeout the token makes
-    // oxigraph stop at its next lookup or row instead of running on.
+    // blocking pool, never on an async worker - and so does the full-store
+    // decode the policy allow-list needs. The token makes oxigraph stop at
+    // its next lookup or row: it is cancelled on timeout, when the broker
+    // starts draining requests at shutdown, and
+    // when this handler is dropped (the client went away).
     let cancellation = CancellationToken::new();
+    let _cancel_when_dropped = CancelOnDrop(cancellation.clone());
     let limits = SparqlLimits {
         cancellation: Some(cancellation.clone()),
         max_rows: Some(state.sparql_limits.max_rows),
     };
-    let store = Arc::clone(&state.cache);
+    let timeout = state.sparql_limits.timeout;
+    let draining = state.draining.clone();
     let evaluation = tokio::task::spawn_blocking(move || {
-        store.sparql_query_json_limited(&query, visible_resources.as_ref(), &limits)
+        let _slot = slot;
+        if cancellation_requested(&limits) {
+            // Timed out or abandoned while waiting for a blocking thread.
+            return Err(Evaluation::Sparql(SparqlError::Cancelled));
+        }
+        let visible_resources = if should_filter_by_policy(&state) {
+            let engine_claims = engine_claims_from_bearer(claims.as_ref());
+            let catalogs = state
+                .cache
+                .catalogs(CatalogQuery::all())
+                .map_err(Evaluation::Store)?;
+            Some(visible_resource_iris(&catalogs, &engine_claims, &state))
+        } else {
+            None
+        };
+        state
+            .cache
+            .sparql_query_json_limited(&query, visible_resources.as_ref(), &limits)
+            .map_err(Evaluation::Sparql)
     });
-    let result = match tokio::time::timeout(state.sparql_limits.timeout, evaluation).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(join_error)) => {
-            tracing::error!(error = %join_error, "SPARQL evaluation task failed");
+    let stopping = async move {
+        match draining {
+            Some(draining) => draining.cancelled_owned().await,
+            None => std::future::pending().await,
+        }
+    };
+    let finished = tokio::select! {
+        finished = tokio::time::timeout(timeout, evaluation) => finished,
+        () = stopping => {
+            cancellation.cancel();
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "SPARQL evaluation failed".to_string(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the broker is shutting down; the SPARQL query was stopped".to_string(),
             )
                 .into_response();
+        }
+    };
+    let result = match finished {
+        Ok(Ok(Ok(body))) => Ok(body),
+        Ok(Ok(Err(Evaluation::Sparql(err)))) => Err(err),
+        Ok(Ok(Err(Evaluation::Store(err)))) => return internal_error(err),
+        Ok(Err(join_error)) => {
+            tracing::error!(error = %join_error, "SPARQL evaluation task panicked");
+            return internal_error("SPARQL evaluation failed");
         }
         Err(_elapsed) => {
             cancellation.cancel();
@@ -217,7 +262,7 @@ pub(super) async fn sparql_route(
             format!(
                 "SPARQL query ran past the {} ms time limit and was stopped - add a LIMIT or \
                  narrow the query",
-                state.sparql_limits.timeout.as_millis()
+                timeout.as_millis()
             ),
         )
             .into_response(),
@@ -229,4 +274,30 @@ pub(super) async fn sparql_route(
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
     }
+}
+
+/// Why the blocking half of [`sparql_route`] failed.
+enum Evaluation {
+    /// Decoding the store for the policy allow-list failed: a 500.
+    Store(StoreError),
+    /// The query itself failed - see [`SparqlError`] for each status.
+    Sparql(SparqlError),
+}
+
+/// Cancels the evaluation's token when dropped, so an evaluation whose
+/// request handler went away (the client disconnected) stops at its next
+/// store lookup instead of running on with its slot.
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+fn cancellation_requested(limits: &SparqlLimits) -> bool {
+    limits
+        .cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
 }

@@ -148,6 +148,8 @@ pub const OAUTH2_REQUIRED_SCOPE: Setting = Setting::new("oauth2RequiredScope", S
 pub const SPARQL_QUERY_TIMEOUT_MS: Setting =
     Setting::new("sparqlQueryTimeoutMs", SettingKind::PositiveInteger);
 pub const SPARQL_MAX_ROWS: Setting = Setting::new("sparqlMaxRows", SettingKind::PositiveInteger);
+pub const SPARQL_MAX_CONCURRENT: Setting =
+    Setting::new("sparqlMaxConcurrent", SettingKind::PositiveInteger);
 pub const SHUTDOWN_DELAY_SECS: Setting =
     Setting::new("shutdownDelaySecs", SettingKind::PositiveInteger);
 pub const POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION: Setting = Setting::new(
@@ -174,6 +176,7 @@ pub const ALL_SETTINGS: &[Setting] = &[
     OAUTH2_REQUIRED_SCOPE,
     SPARQL_QUERY_TIMEOUT_MS,
     SPARQL_MAX_ROWS,
+    SPARQL_MAX_CONCURRENT,
     POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION,
     POLICY_FILTER_NO_POLICY_VISIBILITY,
     POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED,

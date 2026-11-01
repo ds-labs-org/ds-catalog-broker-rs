@@ -75,6 +75,7 @@ async fn main() {
     // when the config lists participants. An unreadable holder credential
     // stops the broker on boot, like any other bad crawler config.
     let shutdown = CancellationToken::new();
+    let draining = CancellationToken::new();
     let serving::Serving {
         cache,
         holder,
@@ -88,7 +89,8 @@ async fn main() {
         .with_policy_filter(PolicyFilterConfig::from_settings(&settings))
         .with_sparql_limits(SparqlLimitsConfig::from_settings(&settings))
         .with_crawl_status(crawler.as_ref().map(|c| c.status.clone()))
-        .with_shutdown(shutdown.clone());
+        .with_shutdown(shutdown.clone())
+        .with_draining(draining.clone());
     state.http = http_client;
     let app = build_router(state);
 
@@ -100,12 +102,14 @@ async fn main() {
     tokio::spawn(handle_signals(shutdown.clone()));
     // On SIGTERM or SIGINT: /ready starts failing and the crawler stops
     // (interrupting a cycle in flight); after broker:shutdownDelaySecs the
-    // listener closes and in-flight requests are drained.
+    // listener closes and in-flight requests are drained, with running
+    // /sparql evaluations stopped.
+    let stop = serving::stop_after(shutdown.clone(), shutdown_delay_from_settings(&settings));
     let server = axum::serve(listener, app)
-        .with_graceful_shutdown(serving::stop_after(
-            shutdown.clone(),
-            shutdown_delay_from_settings(&settings),
-        ))
+        .with_graceful_shutdown(async move {
+            stop.await;
+            draining.cancel();
+        })
         .into_future();
     let mut server = std::pin::pin!(server);
     match crawler {

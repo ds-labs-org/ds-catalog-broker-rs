@@ -482,6 +482,7 @@ async fn sparql_cancels_a_query_that_runs_past_its_time_limit_with_503() {
         SparqlLimitsConfig {
             timeout: Duration::from_millis(50),
             max_rows: usize::MAX,
+            ..Default::default()
         },
     )
     .await;
@@ -517,4 +518,161 @@ async fn sparql_answers_a_result_within_the_row_cap() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+/// A `SELECT` whose cost is all in-memory join work: oxigraph never reads
+/// the store while evaluating it, so cancellation cannot stop it. Takes a
+/// couple of seconds in a debug build.
+fn uncancellable_query() -> String {
+    let values: String = (0..3000).map(|i| format!("{i} ")).collect();
+    format!("SELECT (COUNT(*) AS ?n) WHERE {{ VALUES ?a {{ {values} }} VALUES ?b {{ {values} }} }}")
+}
+
+async fn sparql_status(app: &Router, query: &str) -> (StatusCode, String) {
+    let uri = format!("/sparql?query={}", urlencoding::encode(query));
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn sparql_answers_503_when_every_evaluation_slot_is_busy() {
+    let state = test_state().with_sparql_limits(SparqlLimitsConfig {
+        max_concurrent: 1,
+        ..Default::default()
+    });
+    let busy = Arc::clone(&state.sparql_slots).try_acquire_owned().unwrap();
+    let app = build_router(state);
+
+    let (status, body) = sparql_status(&app, "ASK { ?s ?p ?o }").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert!(body.contains("busy"), "body: {body}");
+
+    drop(busy);
+    let (status, body) = sparql_status(&app, "ASK { ?s ?p ?o }").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a freed slot serves again. body: {body}"
+    );
+}
+
+/// The 503 for a timed-out query goes out at once, but its evaluation
+/// keeps running on the blocking pool; it must keep its slot until then,
+/// or repeated slow queries would pile up blocking threads.
+#[tokio::test]
+async fn a_timed_out_sparql_query_keeps_its_slot_until_evaluation_stops() {
+    let state = test_state().with_sparql_limits(SparqlLimitsConfig {
+        timeout: Duration::from_millis(50),
+        max_concurrent: 1,
+        ..Default::default()
+    });
+    let slots = Arc::clone(&state.sparql_slots);
+    let app = build_router(state);
+
+    let (status, body) = sparql_status(&app, &uncancellable_query()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    let (status, body) = sparql_status(&app, "ASK { ?s ?p ?o }").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the timed-out evaluation still runs, so no slot is free. body: {body}"
+    );
+    assert!(body.contains("busy"), "body: {body}");
+
+    // Once the runaway evaluation ends, its slot comes back.
+    let _slot = tokio::time::timeout(Duration::from_secs(60), slots.acquire_owned())
+        .await
+        .expect("the slot was never released")
+        .unwrap();
+}
+
+/// A `SELECT` that oxigraph can cancel (every join step reads the store)
+/// but that runs for seconds if nobody does.
+const SLOW_CANCELLABLE_QUERY: &str = "SELECT (COUNT(*) AS ?count) WHERE { \
+     ?a ?b ?c . ?d ?e ?f . ?g ?h ?i . ?j ?k ?l . ?m ?n ?o . ?p ?q ?r }";
+
+fn one_slot_without_a_deadline() -> SparqlLimitsConfig {
+    SparqlLimitsConfig {
+        timeout: Duration::from_secs(120),
+        max_rows: usize::MAX,
+        max_concurrent: 1,
+    }
+}
+
+/// A client that gives up drops the request; its evaluation must be
+/// cancelled then, not left holding the slot until it finishes alone.
+#[tokio::test]
+async fn an_abandoned_sparql_request_frees_its_slot_promptly() {
+    let state = test_state().with_sparql_limits(one_slot_without_a_deadline());
+    state
+        .cache
+        .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))
+        .await
+        .unwrap();
+    let slots = Arc::clone(&state.sparql_slots);
+    let app = build_router(state);
+
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(100),
+        sparql_status(&app, SLOW_CANCELLABLE_QUERY),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the query should still be running");
+    let freed = tokio::time::timeout(Duration::from_secs(2), slots.acquire_owned()).await;
+    assert!(freed.is_ok(), "the abandoned evaluation kept its slot");
+}
+
+/// Draining at shutdown stops evaluations in flight, so it does not wait
+/// for a long query to finish on its own.
+#[tokio::test]
+async fn shutdown_stops_a_running_sparql_evaluation() {
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let state = test_state()
+        .with_sparql_limits(one_slot_without_a_deadline())
+        .with_draining(shutdown.clone());
+    state
+        .cache
+        .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))
+        .await
+        .unwrap();
+    let app = build_router(state);
+
+    let request = tokio::spawn(async move { sparql_status(&app, SLOW_CANCELLABLE_QUERY).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    shutdown.cancel();
+    let (status, body) = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("the evaluation kept running after shutdown")
+        .unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+}
+
+/// A query that does not parse is rejected before it takes a slot.
+#[tokio::test]
+async fn an_invalid_query_is_rejected_even_when_every_slot_is_busy() {
+    let state = test_state().with_sparql_limits(SparqlLimitsConfig {
+        max_concurrent: 1,
+        ..Default::default()
+    });
+    let _busy = Arc::clone(&state.sparql_slots).try_acquire_owned().unwrap();
+    let app = build_router(state);
+    let (status, body) = sparql_status(&app, "this is not sparql").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+#[test]
+fn a_huge_sparql_max_concurrent_is_capped_rather_than_panicking() {
+    let settings = config::BrokerSettings::from_values([(
+        "sparqlMaxConcurrent".to_string(),
+        usize::MAX.to_string(),
+    )])
+    .unwrap();
+    let state = test_state().with_sparql_limits(SparqlLimitsConfig::from_settings(&settings));
+    assert!(state.sparql_slots.available_permits() > 0);
 }

@@ -617,26 +617,11 @@ pub(super) struct GraphWrite {
     quads: Vec<Quad>,
 }
 
-#[async_trait]
-impl CatalogCache for OxigraphCatalogCache {
-    async fn upsert(&self, catalog: Catalog) -> StoreResult<()> {
-        let mut graph = GraphWrite {
-            name: node_iri(&catalog.origin_node),
-            quads: Vec::new(),
-        };
-        self.write_catalog(&catalog, &mut graph)?;
-        // Insert-or-replace (EDC's upsert-by-origin-node-url behavior):
-        // the old graph is removed and the new one written in a single
-        // transaction, so a reader sees one catalog or the other, never
-        // a partly written one.
-        let mut transaction = self.store.inner().start_transaction()?;
-        transaction.remove_named_graph(&graph.name)?;
-        transaction.extend(&graph.quads);
-        transaction.commit()?;
-        Ok(())
-    }
-
-    async fn query(&self, query: CatalogQuery) -> StoreResult<Vec<Catalog>> {
+impl OxigraphCatalogCache {
+    /// [`CatalogCache::query`], as the synchronous call it really is:
+    /// decoding a large store takes a while, so async callers should run
+    /// this on a blocking thread rather than await `query` on a worker.
+    pub fn catalogs(&self, query: CatalogQuery) -> StoreResult<Vec<Catalog>> {
         let mut results: Vec<Catalog> = Vec::new();
 
         match &query.origin_node {
@@ -665,6 +650,30 @@ impl CatalogCache for OxigraphCatalogCache {
             None => skipped.collect(),
         };
         Ok(limited)
+    }
+}
+
+#[async_trait]
+impl CatalogCache for OxigraphCatalogCache {
+    async fn upsert(&self, catalog: Catalog) -> StoreResult<()> {
+        let mut graph = GraphWrite {
+            name: node_iri(&catalog.origin_node),
+            quads: Vec::new(),
+        };
+        self.write_catalog(&catalog, &mut graph)?;
+        // Insert-or-replace (EDC's upsert-by-origin-node-url behavior):
+        // the old graph is removed and the new one written in a single
+        // transaction, so a reader sees one catalog or the other, never
+        // a partly written one.
+        let mut transaction = self.store.inner().start_transaction()?;
+        transaction.remove_named_graph(&graph.name)?;
+        transaction.extend(&graph.quads);
+        transaction.commit()?;
+        Ok(())
+    }
+
+    async fn query(&self, query: CatalogQuery) -> StoreResult<Vec<Catalog>> {
+        self.catalogs(query)
     }
 
     async fn delete(&self, node: &NodeId) -> StoreResult<bool> {

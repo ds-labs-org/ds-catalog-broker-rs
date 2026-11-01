@@ -70,7 +70,13 @@ On `SIGTERM` or `SIGINT`:
 A second `SIGTERM` or `SIGINT` exits at once with status 130, without
 draining. Nothing is persisted, so nothing needs flushing. Give the
 process a termination grace period longer than the delay plus your slowest
-request; `/sparql` evaluations are bounded by `broker:sparqlQueryTimeoutMs`.
+request. A `/sparql` request is answered within `broker:sparqlQueryTimeoutMs`,
+but a query whose cost is in-memory work (a large `VALUES` cross product,
+say) cannot be interrupted and keeps its evaluation slot until it ends.
+When draining starts, running evaluations are cancelled; the process still
+waits for an uninterruptible one to end before exiting. At most
+`broker:sparqlMaxConcurrent` of them run at once, and further queries get
+`503` until a slot frees up.
 
 If the crawl scheduler stops on its own (a panic), the broker exits with
 status 1 rather than keep serving catalogs that would no longer be

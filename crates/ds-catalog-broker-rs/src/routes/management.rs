@@ -19,19 +19,13 @@
 //! response body from this route with the real client crate's own
 //! `FederatedCatalogOffer` type.
 
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-};
+use axum::{Json, extract::State, http::HeaderMap, response::IntoResponse};
 use catalog_core::{Catalog, Dataset, Policy, PolicyKind, Rule};
-use rdf_store::{CatalogCache, CatalogQuery};
+use rdf_store::CatalogQuery;
 use serde::{Deserialize, Serialize};
 
-use super::ErrorResponse;
 use super::auth::check_oauth2_bearer;
-use super::policy::{ServiceFiltering, filter_catalogs_by_policy};
+use super::policy::{ServiceFiltering, render_visible_catalogs};
 use crate::AppState;
 
 /// One offer, matching `edc-federated-catalog-client`'s
@@ -402,9 +396,10 @@ pub(super) struct CatalogRequestConstraint {
 /// level comment above for the wire-compatibility contract this route
 /// exists to satisfy.
 ///
-/// Response: one offer per catalog currently in `state.cache`
-/// (`state.cache.query(CatalogQuery::all())`, the same call `GET /catalog`
-/// already uses), built by `catalog_to_offer` - catalogs with no data
+/// Response: one offer per catalog currently in `state.cache` (decoded,
+/// filtered and rendered on the blocking pool by
+/// `policy::render_visible_catalogs`, like `GET /catalog`), built by
+/// `catalog_to_offer` - catalogs with no data
 /// services are skipped (logged once as a `tracing::warn!` with the
 /// skipped count, not per-catalog) rather than erroring or fabricating a
 /// service.
@@ -444,28 +439,22 @@ pub(super) async fn catalog_request_route(
         Err(response) => return *response,
     };
 
-    let mut catalogs = match state.cache.query(CatalogQuery::all()).await {
-        Ok(catalogs) => catalogs,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: err.to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
-    filter_catalogs_by_policy(
-        &mut catalogs,
-        claims.as_ref(),
-        &state,
+    render_visible_catalogs(
+        state,
+        CatalogQuery::all(),
+        claims,
         ServiceFiltering::KeepAll,
-    );
+        move |catalogs| render_offers(&catalogs, &body),
+    )
+    .await
+}
 
+/// The offers for `catalogs`, narrowed by the request `body`'s
+/// `filterExpression`.
+fn render_offers(catalogs: &[Catalog], body: &[u8]) -> axum::response::Response {
     let mut skipped = 0usize;
     let mut offers: Vec<CatalogRequestOffer> = Vec::with_capacity(catalogs.len());
-    for catalog in &catalogs {
+    for catalog in catalogs {
         match catalog_to_offer(catalog) {
             Some(offer) => offers.push(offer),
             None => skipped += 1,
@@ -481,7 +470,7 @@ pub(super) async fn catalog_request_route(
         );
     }
 
-    let filter = serde_json::from_slice::<CatalogRequestBody>(&body).unwrap_or_default();
+    let filter = serde_json::from_slice::<CatalogRequestBody>(body).unwrap_or_default();
     let dataset_id_filter = filter.filter_expression.iter().find_map(|constraint| {
         (constraint.operand_left == "datasets.id" && constraint.operator == "=")
             .then(|| constraint.operand_right.clone())

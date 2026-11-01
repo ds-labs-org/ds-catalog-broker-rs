@@ -159,6 +159,13 @@ impl OxigraphCatalogCache {
         serialize_sparql_results(results, limits.max_rows)
     }
 
+    /// Whether `query` parses as a SPARQL query this store would evaluate,
+    /// without evaluating it: [`SparqlError::Parse`] when it doesn't. Cheap
+    /// enough to run before committing any evaluation resources.
+    pub fn check_sparql(query: &str) -> SparqlQueryResult<()> {
+        Self::prepare_sparql(query, None).map(|_| ())
+    }
+
     /// Parses `query` (Query grammar only - see "Why this is inherently
     /// read-only" on [`Self::sparql_query_json`]) and defaults its
     /// dataset to the union of every named graph.

@@ -32,6 +32,7 @@ use crate::{build_router, crawl_limits_from_settings};
 use sample::seed_sample_catalog;
 
 mod bearer_gate;
+mod blocking;
 mod catalog;
 mod management;
 mod policy;
@@ -49,6 +50,20 @@ use sparql::participant_catalog;
 
 fn test_state() -> AppState {
     AppState::new(Arc::new(OxigraphCatalogCache::in_memory().unwrap()))
+}
+
+#[test]
+fn sparql_limits_come_from_the_broker_config() {
+    let settings =
+        config::BrokerSettings::from_values([("sparqlMaxConcurrent".to_string(), "2".to_string())])
+            .unwrap();
+    let limits = SparqlLimitsConfig::from_settings(&settings);
+    assert_eq!(limits.max_concurrent, 2);
+    assert_eq!(
+        limits.timeout,
+        SparqlLimitsConfig::default().timeout,
+        "an unset value is the default"
+    );
 }
 
 #[test]
