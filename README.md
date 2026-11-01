@@ -59,6 +59,10 @@ below). See
 
 ![This product implements the DSP spec's own Catalog Broker role: a Consumer with trusted access to 1..N Catalog Services, harvesting them into a semantic cache, served only via a dataset list, SPARQL, and a management API - never a DSP catalog-serving endpoint](docs/diagrams/harvester-deployment.svg)
 
+`GET /health` (liveness) and `GET /ready` (readiness, with each
+participant's crawl status) are described, with shutdown and the container
+image, in [`docs/operations.md`](docs/operations.md).
+
 ## Configuration
 
 Runtime settings come from a Turtle file (`config_graph.ttl`) loaded
@@ -211,6 +215,9 @@ and `--workspace` would activate its own default `rocksdb` feature (a
 capability its own tests need, not a bug). Scoping to these five crates
 — exactly what `.github/workflows/ci.yml`'s `PRODUCT_CRATES` builds —
 keeps a real build of this product free of that dependency.
+
+The container image is built from the [`Dockerfile`](Dockerfile); see
+[`docs/operations.md`](docs/operations.md#container-image).
 
 ## License
 

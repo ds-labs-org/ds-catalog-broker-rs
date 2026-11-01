@@ -1,0 +1,6 @@
+target
+.git
+**/target
+**/.gradle
+**/build
+**/node_modules

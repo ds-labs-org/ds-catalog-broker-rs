@@ -71,7 +71,7 @@ Every setting is optional.
 
 | Property | Default | Meaning |
 |---|---|---|
-| `broker:httpApiAddr` | `127.0.0.1:8080` | Address the HTTP API listens on. |
+| `broker:httpApiAddr` | `127.0.0.1:8080` | Address the HTTP API listens on. In a container, set a non-loopback address such as `0.0.0.0:8080` (see [operations.md](operations.md#container-image)). |
 | `broker:participant` | none | A `broker:Participant` to crawl; repeat for each. With none, no crawler runs and every route, `/sparql` included, answers from an empty store. |
 | `broker:holder` | unset | The crawler's `broker:Holder` identity. Required when a participant uses the `dcp` or `oid4vp` credential protocol. |
 | `broker:crawlIntervalSecs` | `300` | Seconds between the starts of two crawl cycles. Positive integer. |
