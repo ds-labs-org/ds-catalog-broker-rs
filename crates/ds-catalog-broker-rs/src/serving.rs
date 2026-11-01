@@ -75,7 +75,7 @@ pub fn start(
         cache,
         holder,
         crawler: Some(scheduler.handle),
-        crawl_status: None,
+        crawl_status: Some(scheduler.status),
     })
 }
 

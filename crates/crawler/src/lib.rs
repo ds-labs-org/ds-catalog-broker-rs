@@ -208,6 +208,15 @@ impl Harvester {
         holder: Option<Arc<HolderIdentity>>,
         limits: CrawlLimits,
     ) -> Self {
+        // Every configured participant is listed from the start, before its
+        // first crawl, so a reader sees the whole registry.
+        let status = SharedCrawlStatus::new(std::sync::RwLock::new(CrawlStatus {
+            cycles_completed: 0,
+            participants: participants
+                .iter()
+                .map(|p| (p.id.clone(), ParticipantStatus::default()))
+                .collect(),
+        }));
         Self {
             cache,
             participants,
@@ -215,7 +224,7 @@ impl Harvester {
             holder,
             limits,
             last_success: HashMap::new(),
-            status: SharedCrawlStatus::default(),
+            status,
         }
     }
 
@@ -257,7 +266,35 @@ impl Harvester {
             }
         }
 
+        self.record_status(&summary, &expired);
         CycleReport { summary, expired }
+    }
+
+    /// Fold one cycle's outcome into [`Self::status`].
+    fn record_status(&self, summary: &CrawlSummary, expired: &[String]) {
+        let now = std::time::SystemTime::now();
+        // A poisoned lock only means a reader panicked; the data is still
+        // whole, so keep writing.
+        let mut status = self
+            .status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for id in &summary.succeeded_ids {
+            let entry = status.participants.entry(id.clone()).or_default();
+            entry.last_attempt = Some(now);
+            entry.last_success = Some(now);
+            entry.last_error = None;
+            entry.cached = true;
+        }
+        for (id, error) in &summary.failures {
+            let entry = status.participants.entry(id.clone()).or_default();
+            entry.last_attempt = Some(now);
+            entry.last_error = Some(error.clone());
+        }
+        for id in expired {
+            status.participants.entry(id.clone()).or_default().cached = false;
+        }
+        status.cycles_completed += 1;
     }
 }
 
@@ -798,11 +835,9 @@ fn parse_constraint(value: &Value, depth: usize) -> Option<Constraint> {
 /// `tokio::time::interval`'s default first-tick behavior), logging each
 /// cycle's [`CrawlSummary`] and any expired catalogs via `tracing`.
 ///
-/// Runs for the lifetime of the returned `JoinHandle` (i.e. forever,
-/// unless the handle is aborted or the runtime shuts down) - there is no
-/// built-in stop condition, matching a long-lived server process. A cycle
-/// that outlasts the interval delays the next tick rather than overlapping
-/// it.
+/// Runs until `shutdown` is cancelled, which also interrupts a cycle in
+/// flight; the returned [`Scheduler::handle`] then completes. A cycle that
+/// outlasts the interval delays the next tick rather than overlapping it.
 pub fn spawn_scheduler(
     cache: Arc<dyn CatalogCache>,
     config: ParticipantsConfig,
@@ -811,15 +846,23 @@ pub fn spawn_scheduler(
     limits: CrawlLimits,
     shutdown: CancellationToken,
 ) -> Scheduler {
-    let _ = shutdown;
     let mut harvester = Harvester::new(cache, config.participants, http, holder, limits);
     let status = harvester.status();
     let handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(config.interval_secs.max(1)));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
-            let CycleReport { summary, expired } = harvester.run_cycle().await;
+            // On shutdown, drop the cycle in flight: its HTTP requests are
+            // cancelled, and a catalog write in progress completes first
+            // because `upsert` has no await point inside it.
+            let CycleReport { summary, expired } = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                report = async {
+                    interval.tick().await;
+                    harvester.run_cycle().await
+                } => report,
+            };
             if summary.failed > 0 {
                 tracing::warn!(
                     attempted = summary.attempted,
@@ -842,6 +885,7 @@ pub fn spawn_scheduler(
                 );
             }
         }
+        tracing::info!("crawl scheduler stopped");
     });
     Scheduler { handle, status }
 }

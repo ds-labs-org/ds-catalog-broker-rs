@@ -4,6 +4,7 @@ use ds_catalog_broker_rs::config::{self, BrokerSettings};
 use ds_catalog_broker_rs::oauth2::{OAuth2Config, OAuth2Verifier};
 use ds_catalog_broker_rs::odrl_filter::PolicyFilterConfig;
 use ds_catalog_broker_rs::{AppState, SparqlLimitsConfig, build_router, serving};
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
@@ -69,18 +70,21 @@ async fn main() {
     // `GET /catalog`, the management API and `/sparql`; the crawler fills it
     // when the config lists participants. An unreadable holder credential
     // stops the broker on boot, like any other bad crawler config.
-    let serving::Serving { cache, holder, .. } = serving::start(
-        &settings,
-        &http_client,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .unwrap_or_else(|err| panic!("failed to start serving: {err}"));
+    let shutdown = CancellationToken::new();
+    let serving::Serving {
+        cache,
+        holder,
+        crawler,
+        crawl_status,
+    } = serving::start(&settings, &http_client, shutdown.clone())
+        .unwrap_or_else(|err| panic!("failed to start serving: {err}"));
 
     let mut state = AppState::new(cache)
         .with_holder(holder)
         .with_oauth2(oauth2_verifier)
         .with_policy_filter(PolicyFilterConfig::from_settings(&settings))
-        .with_sparql_limits(SparqlLimitsConfig::from_settings(&settings));
+        .with_sparql_limits(SparqlLimitsConfig::from_settings(&settings))
+        .with_crawl_status(crawl_status);
     state.http = http_client;
     let app = build_router(state);
 
@@ -89,7 +93,46 @@ async fn main() {
         .unwrap_or_else(|err| panic!("failed to bind {addr}: {err}"));
     tracing::info!("ds-catalog-broker-rs listening on {addr}");
 
+    tokio::spawn(cancel_on_signal(shutdown.clone()));
+    // On SIGTERM or SIGINT: stop accepting connections, let in-flight
+    // requests finish, and stop the crawler (interrupting a cycle in flight).
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
         .await
         .expect("ds-catalog-broker-rs server failed");
+    if let Some(crawler) = crawler
+        && let Err(err) = crawler.await
+    {
+        tracing::error!(error = %err, "the crawl scheduler ended abnormally");
+    }
+    tracing::info!("ds-catalog-broker-rs stopped");
+}
+
+/// Cancel `shutdown` on the first SIGTERM or SIGINT (Ctrl-C).
+async fn cancel_on_signal(shutdown: CancellationToken) {
+    let interrupt = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %err, "cannot listen for SIGINT");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => tracing::info!("SIGINT received; shutting down"),
+        () = terminate => tracing::info!("SIGTERM received; shutting down"),
+    }
+    shutdown.cancel();
 }
