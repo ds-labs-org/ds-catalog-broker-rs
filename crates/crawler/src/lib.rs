@@ -102,6 +102,8 @@ pub struct CrawlSummary {
     /// `(participant_id, error message)` for every participant that
     /// failed this cycle, in participant order.
     pub failures: Vec<(String, String)>,
+    /// When each participant's crawl ended, success or failure.
+    pub finished_at: std::collections::BTreeMap<String, std::time::SystemTime>,
 }
 
 /// Run one crawl cycle over every entry in `participants`, upserting each
@@ -210,13 +212,13 @@ impl Harvester {
     ) -> Self {
         // Every configured participant is listed from the start, before its
         // first crawl, so a reader sees the whole registry.
-        let status = SharedCrawlStatus::new(std::sync::RwLock::new(CrawlStatus {
+        let status = SharedCrawlStatus::new(CrawlStatus {
             cycles_completed: 0,
             participants: participants
                 .iter()
                 .map(|p| (p.id.clone(), ParticipantStatus::default()))
                 .collect(),
-        }));
+        });
         Self {
             cache,
             participants,
@@ -273,28 +275,24 @@ impl Harvester {
     /// Fold one cycle's outcome into [`Self::status`].
     fn record_status(&self, summary: &CrawlSummary, expired: &[String]) {
         let now = std::time::SystemTime::now();
-        // A poisoned lock only means a reader panicked; the data is still
-        // whole, so keep writing.
-        let mut status = self
-            .status
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for id in &summary.succeeded_ids {
-            let entry = status.participants.entry(id.clone()).or_default();
-            entry.last_attempt = Some(now);
-            entry.last_success = Some(now);
-            entry.last_error = None;
-            entry.cached = true;
-        }
-        for (id, error) in &summary.failures {
-            let entry = status.participants.entry(id.clone()).or_default();
-            entry.last_attempt = Some(now);
-            entry.last_error = Some(error.clone());
-        }
-        for id in expired {
-            status.participants.entry(id.clone()).or_default().cached = false;
-        }
-        status.cycles_completed += 1;
+        self.status.update(|status| {
+            for id in &summary.succeeded_ids {
+                let entry = status.participants.entry(id.clone()).or_default();
+                entry.last_attempt = Some(now);
+                entry.last_success = Some(now);
+                entry.last_error = None;
+                entry.cached = true;
+            }
+            for (id, error) in &summary.failures {
+                let entry = status.participants.entry(id.clone()).or_default();
+                entry.last_attempt = Some(now);
+                entry.last_error = Some(error.clone());
+            }
+            for id in expired {
+                status.participants.entry(id.clone()).or_default().cached = false;
+            }
+            status.cycles_completed += 1;
+        });
     }
 }
 
@@ -1895,10 +1893,10 @@ mod tests {
             CrawlLimits::default(),
         );
         let status = harvester.status();
-        assert_eq!(status.read().unwrap().cycles_completed, 0);
+        assert_eq!(status.snapshot().cycles_completed, 0);
 
         harvester.run_cycle().await;
-        let first = status.read().unwrap().clone();
+        let first = status.snapshot();
         assert_eq!(first.cycles_completed, 1);
         let ok_status = &first.participants["ok"];
         assert!(ok_status.last_attempt.is_some());
@@ -1913,7 +1911,7 @@ mod tests {
 
         up.store(false, std::sync::atomic::Ordering::SeqCst);
         harvester.run_cycle().await;
-        let second = status.read().unwrap().clone();
+        let second = status.snapshot();
         assert_eq!(second.cycles_completed, 2);
         let ok_status = &second.participants["ok"];
         assert_eq!(
@@ -1945,12 +1943,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let report = harvester.run_cycle().await;
         assert_eq!(report.expired, vec!["flaky"]);
-        assert!(!harvester.status().read().unwrap().participants["flaky"].cached);
+        assert!(!harvester.status().snapshot().participants["flaky"].cached);
     }
 
     #[tokio::test]
     async fn the_scheduler_stops_mid_cycle_when_shutdown_is_cancelled() {
-        let (slow_url, _) = spawn_slow_catalog_server(Duration::from_secs(30)).await;
+        let (slow_url, in_flight_peak) = spawn_slow_catalog_server(Duration::from_secs(30)).await;
         let mut slow = participant("slow");
         slow.catalog_request_url = slow_url;
         let shutdown = CancellationToken::new();
@@ -1965,7 +1963,15 @@ mod tests {
             },
             shutdown.clone(),
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Cancel only once the crawl is actually waiting on the slow server.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while in_flight_peak.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the crawl never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         shutdown.cancel();
         let stopped = tokio::time::timeout(Duration::from_secs(2), scheduler.handle).await;
         assert!(
@@ -1973,9 +1979,97 @@ mod tests {
             "the scheduler did not stop: {stopped:?}"
         );
         assert_eq!(
-            scheduler.status.read().unwrap().cycles_completed,
+            scheduler.status.snapshot().cycles_completed,
             0,
             "the interrupted cycle is not counted"
         );
+    }
+
+    #[tokio::test]
+    async fn each_participant_is_stamped_with_its_own_finish_time() {
+        let (slow_url, _) = spawn_slow_catalog_server(Duration::from_millis(500)).await;
+        let (fast_url, _) = spawn_slow_catalog_server(Duration::ZERO).await;
+        let mut slow = participant("slow");
+        slow.catalog_request_url = slow_url;
+        let mut fast = participant("fast");
+        fast.catalog_request_url = fast_url;
+        let cache: Arc<dyn CatalogCache> = Arc::new(OxigraphCatalogCache::in_memory().unwrap());
+        let mut harvester = Harvester::new(
+            cache,
+            vec![slow, fast],
+            reqwest::Client::new(),
+            None,
+            CrawlLimits::default(),
+        );
+        let report = harvester.run_cycle().await;
+        let fast_at = report.summary.finished_at["fast"];
+        let slow_at = report.summary.finished_at["slow"];
+        assert!(
+            slow_at.duration_since(fast_at).unwrap() >= Duration::from_millis(400),
+            "the fast participant is not stamped with the slow one's time"
+        );
+        let status = harvester.status().snapshot();
+        assert_eq!(status.participants["fast"].last_success, Some(fast_at));
+        assert_eq!(status.participants["fast"].last_attempt, Some(fast_at));
+        assert_eq!(status.participants["slow"].last_success, Some(slow_at));
+    }
+
+    /// A cache whose `delete` fails until `allow` is set.
+    struct FailingDelete {
+        inner: OxigraphCatalogCache,
+        allow: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl CatalogCache for FailingDelete {
+        async fn upsert(&self, catalog: Catalog) -> rdf_store::StoreResult<()> {
+            self.inner.upsert(catalog).await
+        }
+        async fn query(&self, query: CatalogQuery) -> rdf_store::StoreResult<Vec<Catalog>> {
+            self.inner.query(query).await
+        }
+        async fn delete(&self, node: &NodeId) -> rdf_store::StoreResult<bool> {
+            if self.allow.load(std::sync::atomic::Ordering::SeqCst) {
+                self.inner.delete(node).await
+            } else {
+                Err(rdf_store::StoreError::Backend("delete refused".to_string()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_expiry_delete_is_retried_and_not_reported_as_removed() {
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut entry = participant("flaky");
+        entry.catalog_request_url = spawn_switchable_catalog_server(up.clone()).await;
+        let cache = Arc::new(FailingDelete {
+            inner: OxigraphCatalogCache::in_memory().unwrap(),
+            allow: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut harvester = Harvester::new(
+            cache.clone(),
+            vec![entry],
+            reqwest::Client::new(),
+            None,
+            CrawlLimits {
+                max_catalog_age: Duration::from_millis(100),
+                ..CrawlLimits::default()
+            },
+        );
+        harvester.run_cycle().await;
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let report = harvester.run_cycle().await;
+        assert!(report.expired.is_empty(), "a failed delete removed nothing");
+        assert!(
+            harvester.status().snapshot().participants["flaky"].cached,
+            "the catalog is still served"
+        );
+
+        cache.allow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let report = harvester.run_cycle().await;
+        assert_eq!(report.expired, vec!["flaky"], "the delete is retried");
+        assert!(!harvester.status().snapshot().participants["flaky"].cached);
     }
 }

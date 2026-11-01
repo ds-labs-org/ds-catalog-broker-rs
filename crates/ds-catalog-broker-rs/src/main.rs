@@ -75,7 +75,6 @@ async fn main() {
         cache,
         holder,
         crawler,
-        crawl_status,
     } = serving::start(&settings, &http_client, shutdown.clone())
         .unwrap_or_else(|err| panic!("failed to start serving: {err}"));
 
@@ -84,7 +83,7 @@ async fn main() {
         .with_oauth2(oauth2_verifier)
         .with_policy_filter(PolicyFilterConfig::from_settings(&settings))
         .with_sparql_limits(SparqlLimitsConfig::from_settings(&settings))
-        .with_crawl_status(crawl_status);
+        .with_crawl_status(crawler.as_ref().map(|c| c.status.clone()));
     state.http = http_client;
     let app = build_router(state);
 
@@ -101,7 +100,7 @@ async fn main() {
         .await
         .expect("ds-catalog-broker-rs server failed");
     if let Some(crawler) = crawler
-        && let Err(err) = crawler.await
+        && let Err(err) = crawler.handle.await
     {
         tracing::error!(error = %err, "the crawl scheduler ended abnormally");
     }

@@ -53,10 +53,7 @@ pub(super) async fn ready(State(state): State<AppState>) -> impl IntoResponse {
             }),
         );
     };
-    let snapshot = shared
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let snapshot = shared.snapshot();
     let (code, status) = if snapshot.cycles_completed == 0 {
         (StatusCode::SERVICE_UNAVAILABLE, "starting")
     } else {

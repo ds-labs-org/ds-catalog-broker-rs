@@ -53,6 +53,9 @@ pub struct AppState {
     /// runs (no `broker:participant`), in which case the broker is ready
     /// as soon as it serves.
     pub crawl_status: Option<crawler::SharedCrawlStatus>,
+    /// Cancelled when the broker starts shutting down; from then on
+    /// `GET /ready` answers 503 `stopping`. `None` in tests that never stop.
+    pub shutdown: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Bounds on one `GET`/`POST /sparql` evaluation, so a caller-supplied
@@ -119,6 +122,13 @@ pub fn crawl_limits_from_settings(settings: &config::BrokerSettings) -> crawler:
     }
 }
 
+/// Reads `broker:shutdownDelaySecs`: how long to keep serving after a
+/// shutdown signal, with `/ready` already failing. Unset: no delay.
+pub fn shutdown_delay_from_settings(settings: &config::BrokerSettings) -> Duration {
+    let _ = settings;
+    todo!()
+}
+
 impl AppState {
     pub fn new(cache: Arc<OxigraphCatalogCache>) -> Self {
         Self {
@@ -129,6 +139,7 @@ impl AppState {
             policy_filter: odrl_filter::PolicyFilterConfig::default(),
             sparql_limits: SparqlLimitsConfig::default(),
             crawl_status: None,
+            shutdown: None,
         }
     }
 
@@ -164,6 +175,13 @@ impl AppState {
     /// `crawl_status` field's doc comment.
     pub fn with_crawl_status(mut self, crawl_status: Option<crawler::SharedCrawlStatus>) -> Self {
         self.crawl_status = crawl_status;
+        self
+    }
+
+    /// Builder-style setter for the shutdown token. See the `shutdown`
+    /// field's doc comment.
+    pub fn with_shutdown(mut self, shutdown: tokio_util::sync::CancellationToken) -> Self {
+        self.shutdown = Some(shutdown);
         self
     }
 }

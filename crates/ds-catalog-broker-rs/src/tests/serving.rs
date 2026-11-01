@@ -19,7 +19,6 @@ async fn no_participant_serves_an_empty_store_with_sparql() {
     )
     .unwrap();
     assert!(serving.crawler.is_none());
-    assert!(serving.crawl_status.is_none());
     assert!(serving.holder.is_none());
     assert!(
         serving
@@ -57,9 +56,8 @@ async fn a_participant_starts_the_crawler() {
         CancellationToken::new(),
     )
     .unwrap();
-    assert!(serving.crawl_status.is_some());
     let crawler = serving.crawler.expect("a participant starts the crawler");
-    crawler.abort();
+    crawler.handle.abort();
 }
 
 /// Cancelling the shutdown token stops the crawler `start` started.
@@ -77,7 +75,8 @@ async fn cancelling_shutdown_stops_the_crawler() {
     )
     .unwrap();
     shutdown.cancel();
-    let stopped = tokio::time::timeout(Duration::from_secs(2), serving.crawler.unwrap()).await;
+    let stopped =
+        tokio::time::timeout(Duration::from_secs(2), serving.crawler.unwrap().handle).await;
     assert!(matches!(stopped, Ok(Ok(()))), "{stopped:?}");
 }
 
@@ -99,5 +98,38 @@ async fn an_unreadable_holder_credential_is_an_error() {
         matches!(result, Err(serving::ServingError::Holder(_))),
         "{:?}",
         result.err()
+    );
+}
+
+/// The graceful-shutdown future waits `delay` after the token is cancelled.
+#[tokio::test(start_paused = true)]
+async fn stop_after_waits_the_delay_after_shutdown() {
+    let shutdown = CancellationToken::new();
+    let stop = tokio::spawn(serving::stop_after(
+        shutdown.clone(),
+        Duration::from_secs(5),
+    ));
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(!stop.is_finished(), "nothing happens before the signal");
+    shutdown.cancel();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        !stop.is_finished(),
+        "the listener stays open during the delay"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(stop.is_finished());
+}
+
+#[test]
+fn the_shutdown_delay_comes_from_the_config() {
+    let unset = config::BrokerSettings::from_values([]).unwrap();
+    assert_eq!(crate::shutdown_delay_from_settings(&unset), Duration::ZERO);
+    let set =
+        config::BrokerSettings::from_values([("shutdownDelaySecs".to_string(), "7".to_string())])
+            .unwrap();
+    assert_eq!(
+        crate::shutdown_delay_from_settings(&set),
+        Duration::from_secs(7)
     );
 }

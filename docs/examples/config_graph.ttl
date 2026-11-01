@@ -41,7 +41,11 @@
     # ODRL policy-based dataset visibility filtering.
     broker:policyFilterUnmappableConstraintAction "hide_dataset" ; # skip | drop_policy | hide_dataset
     broker:policyFilterNoPolicyVisibility "open" ;                 # open | closed
-    broker:policyFilterRunWhenOauth2Disabled true .
+    broker:policyFilterRunWhenOauth2Disabled true ;
+
+    # Seconds between SIGTERM and closing the listener, while /ready already
+    # answers 503 (see docs/operations.md). Unset: no delay.
+    broker:shutdownDelaySecs 5 .
 
 # An open participant: no credential is presented (credentialProtocol "none",
 # the default).

@@ -30,5 +30,32 @@ pub struct ParticipantStatus {
 }
 
 /// [`CrawlStatus`], shared between the crawler that writes it and the
-/// readers that report it.
-pub type SharedCrawlStatus = Arc<RwLock<CrawlStatus>>;
+/// readers that report it. Readers only get [`Self::snapshot`]; only this
+/// crate writes.
+#[derive(Debug, Clone, Default)]
+pub struct SharedCrawlStatus(Arc<RwLock<CrawlStatus>>);
+
+impl SharedCrawlStatus {
+    pub fn new(status: CrawlStatus) -> Self {
+        Self(Arc::new(RwLock::new(status)))
+    }
+
+    /// A copy of the current status.
+    pub fn snapshot(&self) -> CrawlStatus {
+        // A poisoned lock only means a writer panicked mid-update; the map
+        // is still whole, so keep serving it.
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn update(&self, change: impl FnOnce(&mut CrawlStatus)) {
+        change(
+            &mut self
+                .0
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+}

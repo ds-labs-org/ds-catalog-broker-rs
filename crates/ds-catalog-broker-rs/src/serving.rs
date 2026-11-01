@@ -2,6 +2,7 @@
 //! fills it when the config lists participants.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use dcp_core::HolderIdentity;
 use rdf_store::oxigraph_backend::OxigraphCatalogCache;
@@ -18,11 +19,10 @@ pub struct Serving {
     /// The crawler's holder identity, when the config has a `broker:holder`
     /// and at least one participant.
     pub holder: Option<Arc<HolderIdentity>>,
-    /// The crawl scheduler, when the config lists at least one participant.
-    /// It ends once the shutdown token passed to [`start`] is cancelled.
-    pub crawler: Option<tokio::task::JoinHandle<()>>,
-    /// What the crawler reports, for `/ready`; `None` with no crawler.
-    pub crawl_status: Option<crawler::SharedCrawlStatus>,
+    /// The crawl scheduler and its status, when the config lists at least
+    /// one participant. It ends once the shutdown token passed to [`start`]
+    /// is cancelled.
+    pub crawler: Option<crawler::Scheduler>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,7 +48,6 @@ pub fn start(
             cache,
             holder: None,
             crawler: None,
-            crawl_status: None,
         });
     };
 
@@ -74,8 +73,7 @@ pub fn start(
     Ok(Serving {
         cache,
         holder,
-        crawler: Some(scheduler.handle),
-        crawl_status: Some(scheduler.status),
+        crawler: Some(scheduler),
     })
 }
 
@@ -88,4 +86,13 @@ fn build_holder(holder: &crawler::HolderConfig) -> Result<Arc<HolderIdentity>, S
         holder.read_credential_jws()?,
         holder.required_scope.clone(),
     )))
+}
+
+/// The future `main` hands to axum's graceful shutdown: it completes
+/// `delay` after `shutdown` is cancelled. In between, `/ready` already
+/// answers 503, so a load balancer stops routing new requests before the
+/// listener closes.
+pub async fn stop_after(shutdown: CancellationToken, delay: Duration) {
+    let _ = (shutdown, delay);
+    todo!()
 }

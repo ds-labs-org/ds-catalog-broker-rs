@@ -53,6 +53,8 @@ contreforts-core = { workspace = true }
 oxigraph = { workspace = true }
 
 [dev-dependencies]
+# start_paused tests for the shutdown delay.
+tokio = { workspace = true, features = ["test-util"] }
 # A throwaway config store datadir per test in src/config.rs.
 tempfile = "3"
 tower = { workspace = true }
