@@ -921,8 +921,10 @@ pub fn spawn_scheduler(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             // On shutdown, drop the cycle in flight: its HTTP requests are
-            // cancelled, and a catalog write in progress completes first
-            // because the write runs on the blocking pool and finishes on its own.
+            // cancelled. A catalog write already handed to the blocking pool is
+            // not cancelled and may finish after the scheduler has stopped; it is
+            // a single transaction, so the store never holds a half-written
+            // catalog. A write not yet started can be dropped at runtime shutdown.
             let CycleReport { summary, expired } = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
