@@ -79,14 +79,44 @@ waits for an uninterruptible one to end before exiting. At most
 `503` until a slot frees up.
 
 A filtered `/sparql` query needs the caller's policy allow-list, which
-means decoding every catalog. The list is cached per caller (by token
-claims) for up to 5 seconds and discarded when a crawl writes the store,
-so on a large store the first query after each crawl pays the decode and
-the rest do not. The decode checks for cancellation between catalogs and
-datasets, so a query that times out stops building it. Concurrent first
-queries by different callers each decode on their own, up to
-`broker:sparqlMaxConcurrent`. A policy that depends on the clock
-(`odrl:dateTime`) can therefore be applied up to 5 seconds late.
+means decoding every catalog. The list is cached per caller for up to
+5 seconds (`ALLOW_LIST_CACHE_TTL`). The cache key is the claim set the
+policy engine receives, without `jti`, `iat`, `exp` and `nbf`, so a client
+that rotates tokens keeps its entry. An entry is used only while the
+store's write sequence is the one it was built at. A crawl write raises
+the sequence and does not delete entries: they stop matching and stay
+until they expire or are evicted. At most 64 entries are kept, and a new
+key evicts the one built longest ago. On a large store the first query
+after each crawl pays the decode and the rest do not. The decode checks
+for cancellation between catalogs and datasets, so a query that times out
+stops building it.
+
+A build stopped by the time limit keeps the catalogs it fully decided in a
+resume cache, for up to 30 seconds (`PARTIAL_ALLOW_LIST_TTL`), keyed by
+caller key and write sequence. A catalog that was being decided when the
+cancellation came is not kept. The next request with the same key and
+write sequence skips the kept catalogs, so a store whose full decode is
+slower than `broker:sparqlQueryTimeoutMs` completes over several requests.
+Resume saves the per-catalog policy evaluation only. Every attempt still
+reads the whole store (`snapshots_until`), and that scan counts against
+the time limit.
+
+There is no single-flight: concurrent first queries for one caller, or for
+different callers, each decode on their own. The number of such builds is
+bounded by `broker:sparqlMaxConcurrent` (default 4).
+
+A policy that depends on the clock (`odrl:dateTime`) is evaluated at the
+time each catalog is decided. A list that is completed from a resume
+carries catalogs decided up to `PARTIAL_ALLOW_LIST_TTL` (30 seconds)
+earlier, and the completed list is then cached for another
+`ALLOW_LIST_CACHE_TTL` (5 seconds), so a clock-dependent decision can be
+applied up to about 35 seconds late. Without a cancelled build in between
+the bound is 5 seconds.
+
+A filtered query is also re-run when a crawl write lands during it, and
+ends in `503` after 5 attempts if writes keep landing. That behaviour is
+described in the README under "The RDF backend" (the paragraph on writes
+during a policy-filtered query).
 
 If the crawl scheduler stops on its own (a panic), the broker exits with
 status 1 rather than keep serving catalogs that would no longer be
