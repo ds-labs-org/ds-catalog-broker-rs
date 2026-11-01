@@ -164,7 +164,11 @@ impl OxigraphCatalogCache {
     ///
     /// Waiting for a write that is still committing does not use up an
     /// attempt; it is bounded by `WRITE_WAIT` and by the caller's
-    /// cancellation token.
+    /// cancellation token. A cancelled token also ends the call before
+    /// any further attempt, whatever the last attempt returned: oxigraph
+    /// checks the token only when it reads the store, so a query that
+    /// never does would otherwise be re-run in full after its caller gave
+    /// up.
     ///
     /// Writers are never blocked. A crawl that commits rarely sees one
     /// retry; one that commits continuously can starve a long query,
@@ -181,7 +185,20 @@ impl OxigraphCatalogCache {
         mut allow_list: impl FnMut(&[Catalog]) -> BTreeSet<String>,
         limits: &SparqlLimits,
     ) -> SparqlQueryResult<Vec<u8>> {
+        let cancelled = || {
+            limits
+                .cancellation
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+        };
         for _ in 0..POLICY_FILTERED_ATTEMPTS {
+            // A caller that gave up gets no further attempt, even when the
+            // last one ended with a result: a query that never reads the
+            // store cannot be interrupted, and each re-run would hold the
+            // caller's evaluation slot for its full duration.
+            if cancelled() {
+                return Err(SparqlError::Cancelled);
+            }
             // A write is committing: wait it out, bounded by `WRITE_WAIT`,
             // without using up an attempt.
             let waiting_since = std::time::Instant::now();
@@ -190,11 +207,7 @@ impl OxigraphCatalogCache {
                 if sequence.is_multiple_of(2) {
                     break sequence;
                 }
-                if limits
-                    .cancellation
-                    .as_ref()
-                    .is_some_and(|token| token.is_cancelled())
-                {
+                if cancelled() {
                     return Err(SparqlError::Cancelled);
                 }
                 if waiting_since.elapsed() >= WRITE_WAIT {
@@ -211,8 +224,8 @@ impl OxigraphCatalogCache {
             if self.write_sequence.load(Ordering::SeqCst) == before {
                 return result;
             }
-            if matches!(result, Err(SparqlError::Cancelled)) {
-                return result;
+            if cancelled() {
+                return Err(SparqlError::Cancelled);
             }
         }
         Err(SparqlError::StoreBusy)
@@ -273,6 +286,9 @@ impl OxigraphCatalogCache {
 pub(super) fn evaluation_error(err: QueryEvaluationError) -> SparqlError {
     match err {
         QueryEvaluationError::Cancelled => SparqlError::Cancelled,
+        // The evaluator reads the store through a dataset whose only
+        // error is a storage failure: a server fault, not a bad query.
+        QueryEvaluationError::Dataset(err) => SparqlError::Store(err.to_string()),
         err => SparqlError::Evaluation(err.to_string()),
     }
 }
