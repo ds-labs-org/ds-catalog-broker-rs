@@ -1,5 +1,7 @@
 # Harvesting benchmark: EDC's own federated-catalog crawler vs. `crates/crawler` + `ds-catalog-broker-rs`
 
+> Superseded for current numbers by [`harvest-benchmark-2026-11-01.md`](harvest-benchmark-2026-11-01.md), which re-runs this benchmark against the current broker and EDC 1.0.0-RC5. This report is kept as the record of the first run.
+
 **Date:** 2026-08-27
 
 **Re-run following the DSP-serving removal (2026-08-28):** this project's
