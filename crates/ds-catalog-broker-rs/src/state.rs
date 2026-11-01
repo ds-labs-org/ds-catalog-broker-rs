@@ -48,14 +48,15 @@ pub struct AppState {
     pub policy_filter: odrl_filter::PolicyFilterConfig,
     /// Time and size bounds on every `/sparql` evaluation - see
     /// [`SparqlLimitsConfig`]. Defaults to `SparqlLimitsConfig::default()`.
-    pub sparql_limits: SparqlLimitsConfig,
+    pub(crate) sparql_limits: SparqlLimitsConfig,
     /// One permit per `/sparql` evaluation allowed to run at once
-    /// ([`SparqlLimitsConfig::max_concurrent`]); set with `sparql_limits`.
-    pub sparql_slots: Arc<tokio::sync::Semaphore>,
+    /// ([`SparqlLimitsConfig::max_concurrent`]). Only `with_sparql_limits`
+    /// sets it, together with `sparql_limits`, so the two always agree.
+    pub(crate) sparql_slots: Arc<tokio::sync::Semaphore>,
     /// One permit per full-store decode (`GET /catalog`, the management
     /// catalog request) allowed to run at once on the blocking pool; more
     /// requests wait for a permit. Sized to the machine's parallelism.
-    pub catalog_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) catalog_slots: Arc<tokio::sync::Semaphore>,
     /// What the crawler reports, for `GET /ready`. `None` when no crawler
     /// runs (no `broker:participant`), in which case the broker is ready
     /// as soon as it serves.
@@ -63,6 +64,11 @@ pub struct AppState {
     /// Cancelled when the broker starts shutting down; from then on
     /// `GET /ready` answers 503 `stopping`. `None` in tests that never stop.
     pub shutdown: Option<tokio_util::sync::CancellationToken>,
+    /// Cancelled when the shutdown delay is over and the listener closes:
+    /// in-flight requests are being drained, and `/sparql` stops the
+    /// evaluations still running so draining does not wait on them.
+    /// `None` in tests that never stop.
+    pub draining: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Bounds on one `GET`/`POST /sparql` evaluation, so a caller-supplied
@@ -112,7 +118,8 @@ impl SparqlLimitsConfig {
                 .unwrap_or(default.max_rows),
             max_concurrent: settings
                 .positive_integer(config::SPARQL_MAX_CONCURRENT)
-                .unwrap_or(default.max_concurrent),
+                .unwrap_or(default.max_concurrent)
+                .min(tokio::sync::Semaphore::MAX_PERMITS),
         }
     }
 }
@@ -165,6 +172,7 @@ impl AppState {
             )),
             crawl_status: None,
             shutdown: None,
+            draining: None,
         }
     }
 
@@ -192,7 +200,11 @@ impl AppState {
     /// Builder-style setter for the `/sparql` limits. See the
     /// `sparql_limits` field's doc comment.
     pub fn with_sparql_limits(mut self, sparql_limits: SparqlLimitsConfig) -> Self {
-        self.sparql_slots = Arc::new(tokio::sync::Semaphore::new(sparql_limits.max_concurrent));
+        self.sparql_slots = Arc::new(tokio::sync::Semaphore::new(
+            sparql_limits
+                .max_concurrent
+                .min(tokio::sync::Semaphore::MAX_PERMITS),
+        ));
         self.sparql_limits = sparql_limits;
         self
     }
@@ -208,6 +220,13 @@ impl AppState {
     /// field's doc comment.
     pub fn with_shutdown(mut self, shutdown: tokio_util::sync::CancellationToken) -> Self {
         self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// Builder-style setter for the drain signal. See the `draining`
+    /// field's doc comment.
+    pub fn with_draining(mut self, draining: tokio_util::sync::CancellationToken) -> Self {
+        self.draining = Some(draining);
         self
     }
 }

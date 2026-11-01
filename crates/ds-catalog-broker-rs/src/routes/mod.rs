@@ -68,3 +68,15 @@ async fn health() -> Json<HealthResponse> {
 struct ErrorResponse {
     error: String,
 }
+
+/// A `500` with an [`ErrorResponse`] body saying `error`.
+fn internal_error(error: impl std::fmt::Display) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
+}

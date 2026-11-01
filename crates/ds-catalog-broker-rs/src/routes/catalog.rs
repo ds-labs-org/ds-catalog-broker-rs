@@ -42,7 +42,7 @@ pub(super) async fn get_catalog(
     };
 
     render_visible_catalogs(
-        &state,
+        state,
         query,
         claims,
         ServiceFiltering::HideGatedOnly,

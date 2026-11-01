@@ -628,14 +628,14 @@ async fn an_abandoned_sparql_request_frees_its_slot_promptly() {
     assert!(freed.is_ok(), "the abandoned evaluation kept its slot");
 }
 
-/// Shutting down stops evaluations in flight, so draining does not wait
+/// Draining at shutdown stops evaluations in flight, so it does not wait
 /// for a long query to finish on its own.
 #[tokio::test]
 async fn shutdown_stops_a_running_sparql_evaluation() {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let state = test_state()
         .with_sparql_limits(one_slot_without_a_deadline())
-        .with_shutdown(shutdown.clone());
+        .with_draining(shutdown.clone());
     state
         .cache
         .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))

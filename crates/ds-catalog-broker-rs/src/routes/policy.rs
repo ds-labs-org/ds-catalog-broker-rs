@@ -3,11 +3,12 @@
 
 use std::collections::BTreeSet;
 
-use axum::{Json, http::StatusCode, response::IntoResponse};
+use std::sync::Arc;
+
 use catalog_core::{Catalog, Dataset};
 use rdf_store::CatalogQuery;
 
-use super::ErrorResponse;
+use super::internal_error;
 
 use crate::{AppState, odrl_filter};
 
@@ -191,14 +192,20 @@ pub(super) fn visible_resource_iris(
 /// held that long would stall every other request it serves, `/health`
 /// included.
 pub(super) async fn render_visible_catalogs(
-    state: &AppState,
+    state: AppState,
     query: CatalogQuery,
     claims: Option<serde_json::Value>,
     services: ServiceFiltering,
     render: impl FnOnce(Vec<Catalog>) -> axum::response::Response + Send + 'static,
 ) -> axum::response::Response {
-    let state = state.clone();
+    // Wait for a decode slot, so a burst of requests queues here instead
+    // of filling the blocking pool with full copies of the store.
+    let slot = Arc::clone(&state.catalog_slots)
+        .acquire_owned()
+        .await
+        .expect("the catalog decode semaphore is never closed");
     let rendered = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         let mut catalogs = state.cache.catalogs(query)?;
         filter_catalogs_by_policy(&mut catalogs, claims.as_ref(), &state, services);
         Ok::<_, rdf_store::StoreError>(render(catalogs))
@@ -206,20 +213,10 @@ pub(super) async fn render_visible_catalogs(
     .await;
     match rendered {
         Ok(Ok(response)) => response,
-        Ok(Err(err)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: err.to_string(),
-            }),
-        )
-            .into_response(),
+        Ok(Err(err)) => internal_error(err),
         Err(join_error) => {
-            tracing::error!(error = %join_error, "decoding the catalogs failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "decoding the catalogs failed".to_string(),
-            )
-                .into_response()
+            tracing::error!(error = %join_error, "serving the catalogs panicked");
+            internal_error("serving the catalogs failed")
         }
     }
 }

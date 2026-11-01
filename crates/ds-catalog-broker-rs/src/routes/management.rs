@@ -396,9 +396,10 @@ pub(super) struct CatalogRequestConstraint {
 /// level comment above for the wire-compatibility contract this route
 /// exists to satisfy.
 ///
-/// Response: one offer per catalog currently in `state.cache`
-/// (`state.cache.query(CatalogQuery::all())`, the same call `GET /catalog`
-/// already uses), built by `catalog_to_offer` - catalogs with no data
+/// Response: one offer per catalog currently in `state.cache` (decoded,
+/// filtered and rendered on the blocking pool by
+/// `policy::render_visible_catalogs`, like `GET /catalog`), built by
+/// `catalog_to_offer` - catalogs with no data
 /// services are skipped (logged once as a `tracing::warn!` with the
 /// skipped count, not per-catalog) rather than erroring or fabricating a
 /// service.
@@ -439,7 +440,7 @@ pub(super) async fn catalog_request_route(
     };
 
     render_visible_catalogs(
-        &state,
+        state,
         CatalogQuery::all(),
         claims,
         ServiceFiltering::KeepAll,
