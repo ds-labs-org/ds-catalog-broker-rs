@@ -1119,6 +1119,29 @@ mod tests {
         assert!(catalog.data_services.iter().all(|s| s.id != "svc-b"));
     }
 
+    /// Dedup must stay linear in the number of entries: a crawled body of a
+    /// few MB with unique ids is parsed synchronously inside the async task,
+    /// where the per-participant timeout cannot interrupt it. A quadratic
+    /// scan took tens of seconds at this size in a debug build.
+    #[test]
+    fn parsing_many_unique_datasets_and_services_stays_linear() {
+        let n = 60_000;
+        let datasets: Vec<Value> = (0..n).map(|i| json!({"@id": format!("ds-{i}")})).collect();
+        let services: Vec<Value> = (0..n)
+            .map(|i| json!({"@id": format!("svc-{i}"), "endpointURL": "https://x.example.org"}))
+            .collect();
+        let body = json!({"dataset": datasets, "service": services});
+        let start = std::time::Instant::now();
+        let catalog = parse_catalog_response(&body, &participant("big"));
+        let elapsed = start.elapsed();
+        assert_eq!(catalog.datasets.len(), n);
+        assert_eq!(catalog.data_services.len(), n);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "parsing {n} datasets and services took {elapsed:?}, expected linear time"
+        );
+    }
+
     /// "Federation of federations": the crawled participant is itself a
     /// multi-participant aggregator (another instance of this workspace's
     /// own `ds-catalog-broker-rs`, once it has 2+ origin nodes cached - see
