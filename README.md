@@ -94,6 +94,10 @@ Rust crates rather than Java SPI modules, echoing EDC's `crawler-spi` /
   [`docs/oid4vp-holder-2026-08-28.md`](docs/oid4vp-holder-2026-08-28.md).
 - `ds-catalog-broker-rs` — the HTTP surface: `/catalog`, `/sparql`, the
   management API, and the DCP holder routes.
+- `policy-engine` — a standalone prototype of an attribute-based ODRL
+  decision function that compiles to `wasm32-unknown-unknown`. No other
+  crate depends on it; the broker's filtering uses `ds-odrl-engine-rs`.
+  See [`docs/policy-engine.md`](docs/policy-engine.md).
 
 ![Outbound credential presentation when crawling a gated participant: crawl_one reads each participant's configured credential protocol - a fixed placeholder header when none is required, a directly-attached self-issued DCP token, or an OID4VP vp_token/presentation_submission exchange that returns a short-lived access token - all converging on the same Authorization: Bearer header attached to the same catalog request](docs/diagrams/harvester-credential-protocols.svg)
 
@@ -198,6 +202,7 @@ crates/
   dcp-core/                DCP JWS/did:web primitives (crawler's holder role)
   crawler/                 crawl engine
   ds-catalog-broker-rs/    HTTP surface: /catalog, /sparql, management API, DCP holder routes
+  policy-engine/           prototype WASM-compilable ODRL decision engine (not wired in)
 docs/
   diagrams/                    architecture SVGs referenced from this README
   gap-analysis-2026-08-27.md   how this product's scope was settled
@@ -214,13 +219,16 @@ compliance/
 ## Building and testing
 
 ```bash
-cargo build -p catalog-core -p rdf-store -p ds-catalog-broker-rs -p dcp-core -p crawler
-cargo test  -p catalog-core -p rdf-store -p ds-catalog-broker-rs -p dcp-core -p crawler
+cargo build -p catalog-core -p rdf-store -p ds-catalog-broker-rs -p dcp-core -p crawler -p policy-engine
+cargo test  -p catalog-core -p rdf-store -p ds-catalog-broker-rs -p dcp-core -p crawler -p policy-engine
 ```
+
+`policy-engine`'s tests build the crate for `wasm32-unknown-unknown`, so
+install that target first: `rustup target add wasm32-unknown-unknown`.
 
 Not `--workspace`: `vendor/contreforts-kg` is a real workspace member,
 and `--workspace` would activate its own default `rocksdb` feature (a
-capability its own tests need, not a bug). Scoping to these five crates
+capability its own tests need, not a bug). Scoping to these six crates
 — exactly what `.github/workflows/ci.yml`'s `PRODUCT_CRATES` builds —
 keeps a real build of this product free of that dependency.
 
