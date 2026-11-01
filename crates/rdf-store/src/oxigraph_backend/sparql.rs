@@ -412,8 +412,11 @@ pub(super) fn graph_holds_a_catalog(
 // store in the middle of an evaluation, or to make a lookup fail with a
 // storage error.
 #[cfg(test)]
+type LookupHook = Box<dyn FnMut() -> Option<StorageError>>;
+
+#[cfg(test)]
 thread_local! {
-    pub(super) static LOOKUP_HOOK: std::cell::RefCell<Option<Box<dyn FnMut() -> Option<StorageError>>>> =
+    pub(super) static LOOKUP_HOOK: std::cell::RefCell<Option<LookupHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
