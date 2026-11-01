@@ -626,3 +626,42 @@ async fn catalog_request_route_serves_xone_and_and_sequence_groups() {
         RealConstraint::MultiplicityConstraint(MultiplicityConstraint::And(_))
     ));
 }
+
+/// A group chain at the crawler's accepted maximum (64 levels) must not
+/// make the whole response unparseable: serde_json refuses documents
+/// nested past 128 levels, and every group level costs two JSON levels.
+#[tokio::test]
+async fn catalog_request_route_response_parses_with_a_depth_64_constraint_group() {
+    let state = test_state();
+    let mut catalog = participant_catalog("node-a", "cat-a", "DATASET-A");
+    let mut constraint = Constraint::atomic("odrl:dateTime", "odrl:lteq", "2027-01-01T00:00:00Z");
+    for _ in 0..64 {
+        constraint = Constraint::and(vec![constraint]);
+    }
+    catalog.datasets[0]
+        .policies
+        .push(rule_with(vec![constraint]));
+    state.cache.upsert(catalog).await.unwrap();
+
+    let response = build_router(state)
+        .oneshot(catalog_request(Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&body).unwrap();
+
+    serde_json::from_str::<serde_json::Value>(text)
+        .expect("response must stay under serde_json's 128-level recursion limit");
+    let offers: Vec<FederatedCatalogOffer> = serde_json::from_str(text)
+        .expect("response must deserialize with the real client's own type");
+    assert_eq!(offers.len(), 1);
+    // The over-cap remainder is replaced by a marker, never dropped: the
+    // rule keeps one top-level constraint.
+    assert_eq!(
+        offers[0].dataset[0].has_policy[0].permissions()[0]
+            .constraints()
+            .len(),
+        1
+    );
+}
