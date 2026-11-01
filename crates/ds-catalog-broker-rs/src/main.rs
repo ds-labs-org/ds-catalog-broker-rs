@@ -1,14 +1,9 @@
 use std::sync::Arc;
 
-use crawler::HolderConfig;
-use dcp_core::HolderIdentity;
 use ds_catalog_broker_rs::config::{self, BrokerSettings};
 use ds_catalog_broker_rs::oauth2::{OAuth2Config, OAuth2Verifier};
 use ds_catalog_broker_rs::odrl_filter::PolicyFilterConfig;
-use ds_catalog_broker_rs::{
-    AppState, SparqlLimitsConfig, build_router, crawl_limits_from_settings,
-};
-use rdf_store::oxigraph_backend::OxigraphCatalogCache;
+use ds_catalog_broker_rs::{AppState, SparqlLimitsConfig, build_router, serving};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
@@ -28,21 +23,6 @@ fn load_oauth2_config(settings: &BrokerSettings) -> Option<OAuth2Config> {
         audience: settings.get(config::OAUTH2_AUDIENCE),
         required_scope: settings.get(config::OAUTH2_REQUIRED_SCOPE),
     })
-}
-
-/// Builds this connector's own DCP holder identity, reading its credential
-/// from `broker:credentialJwsFile`. An unreadable file panics on boot, like
-/// any other bad crawler config.
-fn build_holder(holder: &HolderConfig) -> Arc<HolderIdentity> {
-    let credential_jws = holder
-        .read_credential_jws()
-        .unwrap_or_else(|err| panic!("failed to load the holder credential: {err}"));
-    Arc::new(HolderIdentity::new(
-        holder.own_did_host.clone(),
-        holder.insecure_http,
-        credential_jws,
-        holder.required_scope.clone(),
-    ))
 }
 
 #[tokio::main]
@@ -85,39 +65,12 @@ async fn main() {
         "oauth2 bearer gating configuration resolved (oauth2JwksUri unset means both /catalog and /sparql stay unauthenticated)"
     );
 
-    // One serving mode: an in-memory Oxigraph store backs `GET /catalog`, the
-    // management API and `/sparql`. In-memory only, like EDC's own
-    // federated-catalog cache: there is no on-disk persistence, by design.
-    // With at least one broker:participant, the scheduled crawler fills it;
-    // with none, it stays empty and every route answers from an empty store.
-    let cache = Arc::new(OxigraphCatalogCache::in_memory().expect("open in-memory Oxigraph store"));
-    let holder = match settings.crawler().cloned() {
-        Some(config) => {
-            let holder = config.holder.as_ref().map(build_holder);
-            let limits = crawl_limits_from_settings(&settings);
-            tracing::info!(
-                participants = config.participants.len(),
-                interval_secs = config.interval_secs,
-                holder_configured = holder.is_some(),
-                timeout_ms = limits.participant_timeout.as_millis() as u64,
-                concurrency = limits.concurrency,
-                max_catalog_age_secs = limits.max_catalog_age.as_secs(),
-                "starting scheduled catalog crawler"
-            );
-            crawler::spawn_scheduler(
-                cache.clone(),
-                config,
-                http_client.clone(),
-                holder.clone(),
-                limits,
-            );
-            holder
-        }
-        None => {
-            tracing::info!("no broker:participant configured; the catalog stays empty");
-            None
-        }
-    };
+    // One serving mode (see `serving`): an in-memory Oxigraph store backs
+    // `GET /catalog`, the management API and `/sparql`; the crawler fills it
+    // when the config lists participants. An unreadable holder credential
+    // stops the broker on boot, like any other bad crawler config.
+    let serving::Serving { cache, holder, .. } = serving::start(&settings, &http_client)
+        .unwrap_or_else(|err| panic!("failed to start serving: {err}"));
 
     let mut state = AppState::new(cache)
         .with_holder(holder)
