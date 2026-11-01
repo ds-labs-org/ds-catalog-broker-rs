@@ -104,13 +104,22 @@ pub struct CrawlSummary {
     pub failures: Vec<(String, String)>,
     /// When each participant's crawl ended, success or failure.
     pub finished_at: std::collections::BTreeMap<String, std::time::SystemTime>,
+    /// The same moments as [`Self::finished_at`], as monotonic instants,
+    /// which is what catalog age is measured with.
+    pub finished_instants: std::collections::BTreeMap<String, Instant>,
 }
+
+/// One participant's result with the wall-clock and monotonic time its
+/// crawl ended.
+type Outcome = (Result<(), String>, std::time::SystemTime, Instant);
 
 /// Run one crawl cycle over every entry in `participants`, upserting each
 /// successful result into `cache`.
 ///
 /// Up to `limits.concurrency` participants are crawled at once, and each
-/// one gets `limits.participant_timeout` to answer. A failure fetching or
+/// one gets `limits.participant_timeout` to answer. A slot frees as soon as
+/// its participant is done, whatever the others are doing; the summary's
+/// lists are still in participant order. A failure fetching or
 /// parsing one participant's catalog (network error, timeout, non-2xx
 /// response, malformed JSON) is recorded in the returned [`CrawlSummary`]
 /// and does not abort the rest of the cycle - one bad participant must
@@ -127,25 +136,40 @@ pub async fn crawl_once(
     // not provably `Send` for every lifetime, which `spawn_scheduler`'s
     // `tokio::spawn` needs.
     // Each outcome carries the time its own crawl ended, not the cycle's.
-    let crawls: Vec<BoxFuture<'_, (Result<(), String>, std::time::SystemTime)>> = participants
+    // Outcomes are taken in completion order (`buffer_unordered`), so a slow
+    // participant never keeps a free slot from the next one, and are put
+    // back in participant order below by the index carried along.
+    let crawls: Vec<BoxFuture<'_, (usize, Outcome)>> = participants
         .iter()
-        .map(|participant| {
+        .enumerate()
+        .map(|(index, participant)| {
             crawl_and_cache(http, participant, holder, cache, limits)
-                .map(|outcome| (outcome, std::time::SystemTime::now()))
+                .map(move |outcome| {
+                    (
+                        index,
+                        (outcome, std::time::SystemTime::now(), Instant::now()),
+                    )
+                })
                 .boxed()
         })
         .collect();
-    let outcomes: Vec<(Result<(), String>, std::time::SystemTime)> = stream::iter(crawls)
-        .buffered(limits.concurrency.max(1))
+    let mut outcomes: Vec<(usize, Outcome)> = stream::iter(crawls)
+        .buffer_unordered(limits.concurrency.max(1))
         .collect()
         .await;
+    outcomes.sort_by_key(|(index, _)| *index);
 
     let mut summary = CrawlSummary::default();
-    for (participant, (outcome, finished_at)) in participants.iter().zip(outcomes) {
+    for (participant, (_, (outcome, finished_at, finished_instant))) in
+        participants.iter().zip(outcomes)
+    {
         summary.attempted += 1;
         summary
             .finished_at
             .insert(participant.id.clone(), finished_at);
+        summary
+            .finished_instants
+            .insert(participant.id.clone(), finished_instant);
         match outcome {
             Ok(()) => {
                 summary.succeeded += 1;
@@ -258,8 +282,11 @@ impl Harvester {
         .await;
 
         let now = Instant::now();
+        // Age counts from when the participant's own crawl ended, not from
+        // the end of the cycle.
         for id in &summary.succeeded_ids {
-            self.last_success.insert(id.clone(), now);
+            let at = summary.finished_instants.get(id).copied().unwrap_or(now);
+            self.last_success.insert(id.clone(), at);
         }
 
         let mut stale: Vec<String> = self
@@ -895,7 +922,7 @@ pub fn spawn_scheduler(
         loop {
             // On shutdown, drop the cycle in flight: its HTTP requests are
             // cancelled, and a catalog write in progress completes first
-            // because `upsert` has no await point inside it.
+            // because the write runs on the blocking pool and finishes on its own.
             let CycleReport { summary, expired } = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
@@ -2118,6 +2145,68 @@ mod tests {
         assert_eq!(status.participants["fast"].last_success, Some(fast_at));
         assert_eq!(status.participants["fast"].last_attempt, Some(fast_at));
         assert_eq!(status.participants["slow"].last_success, Some(slow_at));
+    }
+
+    #[tokio::test]
+    async fn a_slow_participant_does_not_hold_back_the_ones_after_it() {
+        let (slow_url, _) = spawn_slow_catalog_server(Duration::from_millis(600)).await;
+        let (fast_url, _) = spawn_slow_catalog_server(Duration::ZERO).await;
+        let mut participants = Vec::new();
+        for id in ["slow", "a", "b", "c", "d"] {
+            let mut p = participant(id);
+            p.catalog_request_url = if id == "slow" { &slow_url } else { &fast_url }.clone();
+            participants.push(p);
+        }
+        let cache = OxigraphCatalogCache::in_memory().unwrap();
+        let limits = CrawlLimits {
+            concurrency: 2,
+            ..CrawlLimits::default()
+        };
+        let summary = crawl_once(
+            &reqwest::Client::new(),
+            &participants,
+            None,
+            &cache,
+            &limits,
+        )
+        .await;
+        assert_eq!(summary.succeeded, 5);
+        assert!(
+            summary.finished_at["d"] < summary.finished_at["slow"],
+            "the last participant waited for the slow first one"
+        );
+        assert_eq!(
+            summary.succeeded_ids,
+            vec!["slow", "a", "b", "c", "d"],
+            "results stay in participant order"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_age_counts_from_the_participants_own_finish() {
+        let (slow_url, _) = spawn_slow_catalog_server(Duration::from_millis(500)).await;
+        let (fast_url, _) = spawn_slow_catalog_server(Duration::ZERO).await;
+        let mut slow = participant("slow");
+        slow.catalog_request_url = slow_url;
+        let mut fast = participant("fast");
+        fast.catalog_request_url = fast_url;
+        let cache: Arc<dyn CatalogCache> = Arc::new(OxigraphCatalogCache::in_memory().unwrap());
+        let mut harvester = Harvester::new(
+            cache,
+            vec![slow, fast],
+            reqwest::Client::new(),
+            None,
+            CrawlLimits {
+                max_catalog_age: Duration::from_millis(300),
+                ..CrawlLimits::default()
+            },
+        );
+        let report = harvester.run_cycle().await;
+        assert_eq!(
+            report.expired,
+            vec!["fast"],
+            "the fast catalog was already older than the limit when the cycle ended"
+        );
     }
 
     /// A cache whose `delete` fails until `allow` is set.

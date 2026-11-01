@@ -48,6 +48,10 @@ impl CatalogQuery {
 /// Writes are atomic per origin node: a `query` running alongside an
 /// `upsert` or `delete` of the same node sees the catalog as it was
 /// before the write or as it is after it, never a partly written one.
+///
+/// An implementation does blocking storage work off the calling task (the
+/// Oxigraph backend writes on Tokio's blocking pool), so awaiting a write
+/// does not hold up other tasks on the same worker.
 #[async_trait]
 pub trait CatalogCache: Send + Sync {
     /// Insert or replace the named graph for `catalog.origin_node`.

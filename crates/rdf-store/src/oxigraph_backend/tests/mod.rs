@@ -597,3 +597,34 @@ mod concurrency;
 mod constraints;
 mod listing;
 mod sparql;
+
+/// `upsert` hands the encode and commit to the blocking pool, so the
+/// calling task is not held while a large catalog is written: its first
+/// poll returns `Pending`, and the write still lands.
+#[tokio::test]
+async fn upsert_does_not_write_on_the_calling_task() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    let cache = cache();
+    let mut catalog = sample_catalog("node-big", "cat-big");
+    for i in 0..2000 {
+        catalog.datasets.push(Dataset {
+            id: format!("ds-{i}"),
+            properties: BTreeMap::new(),
+            distributions: Vec::new(),
+            policies: Vec::new(),
+        });
+    }
+    let mut upsert = Box::pin(cache.upsert(catalog));
+    let first = upsert
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()));
+    assert!(
+        first.is_pending(),
+        "the write ran to completion inside the first poll"
+    );
+    assert!(matches!(upsert.await, Ok(())));
+    let stored = cache.query(CatalogQuery::all()).await.unwrap();
+    assert_eq!(stored[0].datasets.len(), 2000);
+}

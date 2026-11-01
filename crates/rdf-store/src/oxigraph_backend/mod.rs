@@ -474,6 +474,7 @@ use vocab::*;
 
 /// A [`CatalogCache`] backed by a real `contreforts_kg::store::GraphStore`
 /// (Oxigraph under the hood).
+#[derive(Clone)]
 pub struct OxigraphCatalogCache {
     store: GraphStore,
 }
@@ -685,6 +686,30 @@ impl OxigraphCatalogCache {
 #[async_trait]
 impl CatalogCache for OxigraphCatalogCache {
     async fn upsert(&self, catalog: Catalog) -> StoreResult<()> {
+        // Encoding and committing a large catalog is CPU and disk work, so
+        // it runs on the blocking pool and the calling task stays free to
+        // poll other crawls and serve requests. If the caller is dropped
+        // the write still finishes, and it is atomic either way.
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || cache.store_catalog(catalog))
+            .await
+            .map_err(|err| StoreError::Backend(format!("catalog write task failed: {err}")))?
+    }
+
+    async fn query(&self, query: CatalogQuery) -> StoreResult<Vec<Catalog>> {
+        self.catalogs(query)
+    }
+
+    async fn delete(&self, node: &NodeId) -> StoreResult<bool> {
+        self.remove_catalog(node)
+    }
+}
+
+impl OxigraphCatalogCache {
+    /// Synchronous body of [`CatalogCache::upsert`]: encode `catalog` and
+    /// replace the node's graph in one transaction. Blocks the calling
+    /// thread, so async callers go through `upsert`.
+    pub fn store_catalog(&self, catalog: Catalog) -> StoreResult<()> {
         let mut graph = GraphWrite {
             name: node_iri(&catalog.origin_node),
             quads: Vec::new(),
@@ -701,11 +726,8 @@ impl CatalogCache for OxigraphCatalogCache {
         Ok(())
     }
 
-    async fn query(&self, query: CatalogQuery) -> StoreResult<Vec<Catalog>> {
-        self.catalogs(query)
-    }
-
-    async fn delete(&self, node: &NodeId) -> StoreResult<bool> {
+    /// Synchronous body of [`CatalogCache::delete`].
+    fn remove_catalog(&self, node: &NodeId) -> StoreResult<bool> {
         let graph = node_iri(node);
         // Checked and removed in one transaction, so a concurrent upsert
         // lands wholly before or wholly after the delete.
