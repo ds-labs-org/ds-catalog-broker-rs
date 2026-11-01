@@ -489,10 +489,14 @@ impl HolderIdentity {
     }
 
     fn remember_issued(&self, jti: String, provider_did: &str, exp: u64) {
+        self.remember_issued_capped(MAX_ISSUED_TOKENS, jti, provider_did, exp);
+    }
+
+    fn remember_issued_capped(&self, cap: usize, jti: String, provider_did: &str, exp: u64) {
         let mut issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_secs();
         issued.retain(|_, t| t.exp > now);
-        if issued.len() >= MAX_ISSUED_TOKENS
+        if issued.len() >= cap
             && let Some(oldest) = issued
                 .iter()
                 .min_by_key(|(_, t)| t.exp)
@@ -592,24 +596,33 @@ impl HolderIdentity {
         sign_jws(&t1_payload, &signing_key, &self.key_pair.own_key_id)
     }
 
-    /// The receiving side of a Presentation API callback: when a relying
-    /// party this holder previously queried (via `mint_self_issued_token`)
-    /// calls back into `POST /dsp/holder/presentations/query`, it sends
-    /// its own re-packaged token (T3 in `verify_dcp_bearer_token`'s
-    /// numbering) - the mirror of that function's own step 3
-    /// (proof-of-original-possession repackaging), just consumed from the
-    /// other side: verify the incoming token's signature against the
-    /// caller's resolved `did:web` (its `iss` claim), check it's actually
-    /// addressed to this holder (`aud` == this holder's own DID) and not
-    /// expired, then build and sign a `VerifiablePresentation` JWS
-    /// wrapping this holder's stored `credential_jws`.
+    /// The receiving side of a Presentation API callback: a relying party
+    /// this holder queried (via `mint_self_issued_token`) calls back into
+    /// `POST /dsp/holder/presentations/query` with its re-packaged token (T3
+    /// in `verify_dcp_bearer_token`'s numbering, the mirror of that
+    /// function's step 3).
     ///
-    /// The returned `PresentationResponseMessage` is genuinely symmetric
-    /// with how `verify_dcp_bearer_token` consumes it (its steps 4-5): the
-    /// VP is signed with this holder's `own_key_id`, resolvable via this
-    /// holder's own DID document (the same one `own_did_document` serves)
-    /// - exactly the key `verify_dcp_bearer_token` looks up before
-    ///   verifying the VP's signature.
+    /// The call is answered only for a token this holder issued, checked in
+    /// this order, the first four before any network access:
+    ///
+    /// 1. T3 carries a nested token (T2) with a `jti`.
+    /// 2. That `jti` was recorded by `mint_self_issued_token` and has not
+    ///    expired.
+    /// 3. The provider it was recorded for equals T3's `iss`.
+    /// 4. T2's signature verifies against this holder's own key.
+    ///
+    /// Only then is the caller's `did:web` resolved (through a client that
+    /// follows no redirect, with a timeout and a body cap) and T3's
+    /// signature verified against it. T3's `aud` must be this holder's DID
+    /// and it must not have expired.
+    ///
+    /// The returned `PresentationResponseMessage` holds one
+    /// `VerifiablePresentation` JWS wrapping this holder's stored
+    /// `credential_jws`, signed with `own_key_id` (resolvable via
+    /// `own_did_document`, the key `verify_dcp_bearer_token` looks up in its
+    /// steps 4-5). The VP's `aud` is the caller's DID and its `nonce` is
+    /// T2's `jti`, so it cannot be replayed to another party or for another
+    /// issued token.
     pub async fn answer_presentation_query(
         &self,
         incoming_bearer_token: &str,
@@ -644,7 +657,7 @@ impl HolderIdentity {
             .ok_or("nested token was not issued by this holder, or has expired")?;
         if issued_to != caller_did {
             return Err(format!(
-                "caller '{caller_did}' is not the provider this holder's token was issued to"
+                "caller {caller_did:?} is not the provider this holder's token was issued to"
             ));
         }
         let own_key = VerifyingKey::from(&self.key_pair.signing_key());
@@ -657,7 +670,7 @@ impl HolderIdentity {
         let aud = payload.get("aud").and_then(Value::as_str).unwrap_or("");
         if aud != self.key_pair.own_did {
             return Err(format!(
-                "token audience '{aud}' does not match this holder's DID '{}'",
+                "token audience {aud:?} does not match this holder's DID '{}'",
                 self.key_pair.own_did
             ));
         }
@@ -931,5 +944,147 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("failed to resolve"), "{err}");
         assert!(started.elapsed() < DID_RESOLUTION_TIMEOUT + Duration::from_secs(3));
+    }
+
+    // --- audit follow-ups for #39 ------------------------------------
+
+    /// Serve one raw HTTP response, counting accepted connections.
+    fn serve_raw(
+        listener: tokio::net::TcpListener,
+        head: String,
+        body: Vec<u8>,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0u8; 2048];
+                let _ = sock.read(&mut request).await;
+                let _ = sock.write_all(head.as_bytes()).await;
+                for chunk in body.chunks(8 * 1024) {
+                    if sock.write_all(chunk).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+        hits
+    }
+
+    /// Without a Content-Length the cap is enforced while streaming.
+    #[tokio::test]
+    async fn resolve_did_caps_a_chunked_document_without_content_length() {
+        let padding = "x".repeat(MAX_DID_DOCUMENT_BYTES * 2);
+        let body = json!({"padding": padding}).to_string().into_bytes();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let did = format!(
+            "did:web:127.0.0.1%3A{}",
+            listener.local_addr().unwrap().port()
+        );
+        let mut chunked = Vec::new();
+        for part in body.chunks(8 * 1024) {
+            chunked.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            chunked.extend_from_slice(part);
+            chunked.extend_from_slice(b"\r\n");
+        }
+        chunked.extend_from_slice(b"0\r\n\r\n");
+        serve_raw(
+            listener,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".to_string(),
+            chunked,
+        );
+        let err = resolve_did(&reqwest::Client::new(), &did, true)
+            .await
+            .unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
+    }
+
+    /// The holder's resolver does not follow a redirect: a 302 to a second
+    /// host fails resolution and the second host is never contacted.
+    #[tokio::test]
+    async fn the_holder_resolver_does_not_follow_a_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let target_hits = serve_raw(
+            target,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n"
+                .to_string(),
+            b"{}".to_vec(),
+        );
+        let redirector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let did = format!(
+            "did:web:127.0.0.1%3A{}",
+            redirector.local_addr().unwrap().port()
+        );
+        let redirect_hits = serve_raw(
+            redirector,
+            format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{target_port}/did.json\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            ),
+            Vec::new(),
+        );
+        let err = resolve_did(&holder().resolver, &did, true)
+            .await
+            .unwrap_err();
+        assert!(err.contains("HTTP 302"), "{err}");
+        assert_eq!(redirect_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(target_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A T2 this holder issued but whose `exp` has passed is refused, even
+    /// though it is still in the map and correctly signed.
+    #[tokio::test]
+    async fn an_expired_issued_token_is_refused() {
+        let holder = holder();
+        let caller_did = "did:web:127.0.0.1%3A1:provider";
+        let caller = DcpKeyPair::generate(caller_did.to_string());
+        holder.remember_issued("old-jti".to_string(), caller_did, now_secs() - 1);
+        let t2 = sign_jws(
+            &json!({"jti": "old-jti", "exp": now_secs() - 1}),
+            &holder.key_pair.signing_key(),
+            &holder.key_pair.own_key_id,
+        );
+        let token = callback_token(&caller, &holder.key_pair.own_did, &t2);
+        let err = holder.answer_presentation_query(&token).await.unwrap_err();
+        assert!(
+            err.contains("not issued by this holder, or has expired"),
+            "{err}"
+        );
+    }
+
+    /// At the cap the entry closest to expiry is dropped and the map does
+    /// not grow past the cap.
+    #[test]
+    fn the_issued_token_map_evicts_the_entry_closest_to_expiry_at_the_cap() {
+        let holder = holder();
+        let now = now_secs();
+        holder.remember_issued_capped(3, "a".into(), "p", now + 100);
+        holder.remember_issued_capped(3, "b".into(), "p", now + 50);
+        holder.remember_issued_capped(3, "c".into(), "p", now + 200);
+        holder.remember_issued_capped(3, "d".into(), "p", now + 300);
+        assert!(holder.issued_to("b").is_none(), "b expires first");
+        for kept in ["a", "c", "d"] {
+            assert!(holder.issued_to(kept).is_some(), "{kept}");
+        }
+        for i in 0..50 {
+            holder.remember_issued_capped(3, format!("n{i}"), "p", now + 400 + i);
+        }
+        assert_eq!(holder.issued.lock().unwrap().len(), 3);
+    }
+
+    /// The caller DID is attacker-controlled; it reaches the error (and so
+    /// the log line) escaped.
+    #[tokio::test]
+    async fn a_caller_did_with_control_characters_is_escaped_in_the_error() {
+        let holder = holder();
+        let t1 = holder.mint_self_issued_token("did:web:127.0.0.1%3A1:provider");
+        let thief = DcpKeyPair::generate("did:web:x\nINJECTED level=error".to_string());
+        let token = callback_token(&thief, &holder.key_pair.own_did, &nested_of(&t1));
+        let err = holder.answer_presentation_query(&token).await.unwrap_err();
+        assert!(err.contains("not the provider"), "{err}");
+        assert!(!err.contains('\n'), "{err:?}");
     }
 }
