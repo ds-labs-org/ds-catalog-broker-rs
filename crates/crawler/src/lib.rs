@@ -1063,6 +1063,46 @@ mod tests {
         assert_eq!(catalog.datasets[0].id, "CAT0102");
     }
 
+    /// Two sub-catalogs advertise the same dataset id with opposite
+    /// policies. Both would land under the same store IRIs and merge into
+    /// one mixed policy, so only the first is kept (as with services), and
+    /// the dropped duplicate's nested access service is not folded in.
+    #[test]
+    fn duplicate_dataset_ids_keep_the_first_and_drop_the_rest() {
+        let policy = |op: &str| {
+            json!([{"permission": [{"action": "use", "constraint": [
+                {"leftOperand": "role", "operator": op, "rightOperand": "admin"}
+            ]}]}])
+        };
+        let body = json!({
+            "@id": "urn:uuid:outer",
+            "catalog": [
+                {"dataset": [{
+                    "@id": "ds-1", "title": "first", "hasPolicy": policy("eq"),
+                    "distribution": [{"format": "json", "accessService": "svc-a"}]
+                }], "service": [{"@id": "svc-a", "endpointURL": "https://a.example.org"}]},
+                {"dataset": [{
+                    "@id": "ds-1", "title": "second", "hasPolicy": policy("neq"),
+                    "distribution": [{"format": "json", "accessService": {"@id": "svc-b", "endpointURL": "https://b.example.org"}}]
+                }]}
+            ]
+        });
+        let catalog = parse_catalog_response(&body, &participant("agg"));
+        assert_eq!(catalog.datasets.len(), 1);
+        let ds = &catalog.datasets[0];
+        assert_eq!(
+            ds.properties.get("title").map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(ds.distributions.len(), 1);
+        assert_eq!(ds.distributions[0].access_service, "svc-a");
+        assert_eq!(
+            ds.policies[0].permissions[0].constraints,
+            vec![Constraint::atomic("role", "eq", "admin")]
+        );
+        assert!(catalog.data_services.iter().all(|s| s.id != "svc-b"));
+    }
+
     /// "Federation of federations": the crawled participant is itself a
     /// multi-participant aggregator (another instance of this workspace's
     /// own `ds-catalog-broker-rs`, once it has 2+ origin nodes cached - see
