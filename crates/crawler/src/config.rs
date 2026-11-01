@@ -169,6 +169,10 @@ pub enum ConfigError {
     },
     #[error("the holder credential file {path} is empty")]
     EmptyCredentialFile { path: String },
+    /// The file holds something other than a compact JWS. Its content is
+    /// deliberately not echoed: the file may be anything a config names.
+    #[error("the holder credential file {path} does not hold a compact JWS: {reason}")]
+    InvalidCredentialJws { path: String, reason: &'static str },
 }
 
 impl ParticipantsConfig {
@@ -313,25 +317,89 @@ mod tests {
         assert!(matches!(err, ConfigError::MissingHolder { id } if id == "gated"));
     }
 
+    /// A compact JWS whose header is `{"alg":"ES256","typ":"JWT"}`.
+    const VALID_JWS: &str = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2YyI6e319.c2lnbmF0dXJl";
+
+    /// Write `content` to a fresh credential file and read it back.
+    fn read_credential(content: &str) -> Result<String, ConfigError> {
+        let dir = tempfile_dir();
+        let file = dir.join("holder.jws");
+        std::fs::write(&file, content).unwrap();
+        let mut config = holder();
+        config.credential_jws_file = file;
+        let read = config.read_credential_jws();
+        std::fs::remove_dir_all(&dir).unwrap();
+        read
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "crawler-holder-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn reads_and_trims_the_credential_file() {
-        let dir = std::env::temp_dir().join(format!("crawler-holder-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("holder.jws");
-        std::fs::write(&file, "header.payload.signature\n").unwrap();
-        let mut config = holder();
-        config.credential_jws_file = file.clone();
         assert_eq!(
-            config.read_credential_jws().unwrap(),
-            "header.payload.signature"
+            read_credential(&format!("{VALID_JWS}\n")).unwrap(),
+            VALID_JWS
         );
-
-        std::fs::write(&file, "  \n").unwrap();
         assert!(matches!(
-            config.read_credential_jws(),
+            read_credential("  \n"),
             Err(ConfigError::EmptyCredentialFile { .. })
         ));
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Whatever file the config names is sent as the credential, so only a
+    /// compact JWS is accepted: not environment variables, a key, or a
+    /// JSON credential.
+    #[test]
+    fn rejects_a_credential_file_that_is_not_a_compact_jws() {
+        let header = "eyJhbGciOiJFUzI1NiJ9"; // {"alg":"ES256"}
+        let cases = [
+            ("environment", "PATH=/usr/bin\0HOME=/root\0".to_string()),
+            (
+                "PEM key",
+                "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMG\n-----END PRIVATE KEY-----".to_string(),
+            ),
+            (
+                "JSON credential",
+                r#"{"@context":[],"type":["VerifiableCredential"]}"#.to_string(),
+            ),
+            ("two segments", format!("{header}.eyJ2YyI6e319")),
+            ("four segments", format!("{header}.e30.c2ln.c2ln")),
+            ("empty signature", format!("{header}.e30.")),
+            ("empty payload", format!("{header}..c2ln")),
+            ("not base64url", format!("{header}.e30.c2ln+/==")),
+            ("header not JSON", "aGVsbG8.e30.c2ln".to_string()), // "hello"
+            (
+                "header without alg",
+                "eyJ0eXAiOiJKV1QifQ.e30.c2ln".to_string(),
+            ), // {"typ":"JWT"}
+            ("alg none", "eyJhbGciOiJub25lIn0.e30.c2ln".to_string()), // {"alg":"none"}
+            ("inner whitespace", format!("{header}.e30 .c2ln")),
+        ];
+        for (name, content) in cases {
+            assert!(
+                matches!(
+                    read_credential(&content),
+                    Err(ConfigError::InvalidCredentialJws { .. })
+                ),
+                "{name} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_error_does_not_echo_the_file_content() {
+        let err = read_credential("SECRET_TOKEN=hunter2").unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
     }
 
     #[test]

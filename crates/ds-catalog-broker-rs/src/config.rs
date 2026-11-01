@@ -288,6 +288,11 @@ pub enum BrokerConfigError {
         "{CONFIG_STORE_PATH_ENV}={0:?} uses an unsupported URL scheme (expected file, http or https)"
     )]
     UnsupportedScheme(String),
+    #[error(
+        "{CONFIG_STORE_PATH_ENV}={0:?} is plain http to a non-loopback host; the config decides \
+         where the crawler sends its credential, so fetch it over https"
+    )]
+    InsecureRemote(String),
     #[error("failed to read {location}: {source}")]
     Read {
         location: String,
@@ -1645,6 +1650,39 @@ mod tests {
             ConfigLocation::parse("file://remote-host/broker.ttl"),
             Err(BrokerConfigError::InvalidUrl(..))
         ));
+    }
+
+    /// The config names where the crawler sends its credential, so a
+    /// remote config must come over https; plain http only reaches this
+    /// machine.
+    #[test]
+    fn plain_http_config_is_refused_except_on_loopback() {
+        for raw in [
+            "http://config.example.org/broker.ttl",
+            "http://10.0.0.5:8080/broker.ttl",
+            "http://127.0.0.1.example.org/broker.ttl",
+            "HTTP://config.example.org/broker.ttl",
+        ] {
+            assert!(
+                matches!(
+                    ConfigLocation::parse(raw),
+                    Err(BrokerConfigError::InsecureRemote(_))
+                ),
+                "{raw} was accepted"
+            );
+        }
+        for raw in [
+            "http://127.0.0.1:8000/broker.ttl",
+            "http://127.1.2.3/broker.ttl",
+            "http://localhost:8000/broker.ttl",
+            "http://[::1]:8000/broker.ttl",
+            "https://config.example.org/broker.ttl",
+        ] {
+            assert!(
+                matches!(ConfigLocation::parse(raw), Ok(ConfigLocation::Remote(_))),
+                "{raw} was refused"
+            );
+        }
     }
 
     #[tokio::test]
