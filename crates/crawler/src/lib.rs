@@ -496,8 +496,10 @@ async fn crawl_one(
 /// covers an incomplete or unreadable constraint (also inside a group), a
 /// logical group nested past [`MAX_CONSTRAINT_DEPTH`], a rule with no
 /// readable `action` (kept under [`UNMAPPABLE_ACTION`]), a rule or policy
-/// entry that is not a JSON-LD node, and an unreadable `assignee` (a marker
-/// rule is added to the policy). An unreadable `assigner` is ignored, as it
+/// entry that is not a JSON-LD node, an unreadable policy-level `assignee` (a
+/// marker rule is added to the policy), a rule-level `assignee`, `target` or
+/// `duty`, an action node with keys beyond `@id`/`@type`, and a policy node
+/// with no rule key. An unreadable `assigner` is ignored, as it
 /// scopes nothing. One limit remains: `response.json()` stops at
 /// serde_json's 128-level recursion limit, so a body nested deeper than
 /// that fails the whole catalog fetch (the previous cache entry is kept

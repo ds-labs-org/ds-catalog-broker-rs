@@ -191,8 +191,8 @@ participant's `odrl:hasPolicy` triples, the logical half recursively, bounded by
 past which a group is kept as an unmappable marker (`Constraint::unmappable`) with a
 `tracing::warn!`, rather than growing the parser's call stack unboundedly. The same
 marker replaces any constraint the crawler cannot read (see
-[configuration.md](configuration.md#unparseable-policy-content)). The earlier atomic-only scope cut on the crawler's own parsing is
-closed. `rdf-store`'s Oxigraph-backed semantic cache also writes/reads the logical shape
+[configuration.md](configuration.md#unparseable-policy-content)). The earlier
+atomic-only scope cut on the crawler's own parsing is closed. `rdf-store`'s Oxigraph-backed semantic cache also writes/reads the logical shape
 now (`crates/rdf-store/src/lib.rs`'s `write_constraint`/`load_constraint`, persisting a
 `Logical` constraint via one blank-node subtree per nesting level, reconstructed on read
 via ordered, joined queries and `Term`-based pattern matching - deliberately *not* by

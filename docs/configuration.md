@@ -215,7 +215,14 @@ Content that becomes an unmappable constraint:
 - a rule with a missing or unreadable `action` (kept under the action
   `urn:ds42:broker:unmappable-action`);
 - a rule or policy entry that is not a JSON-LD node;
-- an unreadable `assignee` (a marker rule is added to the policy).
+- an unreadable policy-level `assignee` (a marker rule is added to the
+  policy);
+- a rule-level `assignee`, `target` or `duty`, which the policy model cannot
+  hold (the rule keeps its action and gains a marker);
+- an action node with keys beyond `@id` and `@type`, such as a `refinement`
+  (the rule is kept under the unmappable action plus a marker);
+- a policy node with none of `permission`, `prohibition` or `obligation`
+  (a marker rule is added; an explicitly empty list is a real empty policy).
 
 Under `skip` the marker is dropped like any unmappable constraint, so a
 participant's unreadable restriction is ignored. Use `skip` only for
@@ -226,7 +233,11 @@ form (`permission`, `odrl:permission`,
 `http://www.w3.org/ns/odrl/2/permission`), including `hasPolicy`, the logical
 keys `and`/`or`/`xone`/`andSequence`, and the constraint fields. Scalar
 values may be plain strings, numbers, booleans, `{"@value": ...}` value
-objects or `{"@id": ...}` references. A `rightOperand` array with more than
+objects or `{"@id": ...}` references. `{"@list": [...]}` and `{"@set": [...]}`
+wrappers around `hasPolicy` and the rule lists are unwrapped. A number with
+an integral value renders without a fraction (`10.0` and `1e3` become `10`
+and `1000`); other floats render as JSON prints them. The marker logs and
+stores at most 256 characters of the raw value. A `rightOperand` array with more than
 one element has no single string reading and becomes an unmappable
 constraint.
 
