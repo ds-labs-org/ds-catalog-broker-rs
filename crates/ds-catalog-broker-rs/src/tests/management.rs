@@ -656,6 +656,10 @@ async fn catalog_request_route_response_parses_with_a_depth_64_constraint_group(
     let offers: Vec<FederatedCatalogOffer> = serde_json::from_str(text)
         .expect("response must deserialize with the real client's own type");
     assert_eq!(offers.len(), 1);
+    assert!(
+        text.contains(catalog_core::UNMAPPABLE_OPERATOR),
+        "the group beyond the served depth limit must become the marker"
+    );
     // The over-cap remainder is replaced by a marker, never dropped: the
     // rule keeps one top-level constraint.
     assert_eq!(

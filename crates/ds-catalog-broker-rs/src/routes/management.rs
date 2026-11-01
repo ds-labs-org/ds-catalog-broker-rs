@@ -281,11 +281,28 @@ pub(super) fn policy_to_json(policy: &Policy) -> serde_json::Value {
 pub(super) fn rule_to_json(rule: &Rule) -> serde_json::Value {
     let mut value = serde_json::json!({ "action": rule.action });
     if !rule.constraints.is_empty() {
-        value["constraint"] =
-            serde_json::Value::Array(rule.constraints.iter().map(constraint_to_json).collect());
+        value["constraint"] = serde_json::Value::Array(
+            rule.constraints
+                .iter()
+                .map(|constraint| constraint_to_json(constraint, 0))
+                .collect(),
+        );
     }
     value
 }
+
+/// Deepest chain of logical groups served. The crawler accepts 64 levels,
+/// but serde_json refuses documents nested past 128 levels and every group
+/// costs two JSON levels (object plus array). The route adds 9 levels
+/// around the first constraint array (response array, offer, dataset array,
+/// dataset, hasPolicy array, policy, permission array, permission,
+/// constraint array) and the innermost atomic constraint adds 1. With 56
+/// served groups the deepest document is 9 + 112 + 1 = 122 levels, which
+/// leaves room for a consumer that embeds this response in one more
+/// wrapper level (123) and 5 spare. Groups nested further are served as
+/// the unmappable marker. This limits the served form only; stored
+/// policies and filtering still see the full tree.
+pub(super) const MAX_SERVED_GROUP_DEPTH: usize = 56;
 
 /// One constraint as the real client's wire shape: an atomic constraint as
 /// `{leftOperand, operator, rightOperand}`, a logical group as
@@ -293,8 +310,24 @@ pub(super) fn rule_to_json(rule: &Rule) -> serde_json::Value {
 /// recursively. The real client has no `andSequence`; it is served as
 /// `and`, which keeps every child instead of dropping the group (it loses
 /// only the ordering requirement).
-fn constraint_to_json(constraint: &catalog_core::Constraint) -> serde_json::Value {
+///
+/// `group_depth` is the number of enclosing groups. A group at
+/// `MAX_SERVED_GROUP_DEPTH` is served as the unmappable marker constraint
+/// instead, so the rule stays constrained (the configured unmappable
+/// action applies) and the response stays parseable.
+fn constraint_to_json(
+    constraint: &catalog_core::Constraint,
+    group_depth: usize,
+) -> serde_json::Value {
     match constraint {
+        catalog_core::Constraint::Logical(_) if group_depth >= MAX_SERVED_GROUP_DEPTH => {
+            constraint_to_json(
+                &catalog_core::Constraint::unmappable(
+                    "logical group nested beyond the served depth limit",
+                ),
+                group_depth,
+            )
+        }
         catalog_core::Constraint::Atomic(atomic) => serde_json::json!({
             "leftOperand": atomic.left_operand,
             "operator": atomic.operator,
@@ -308,7 +341,10 @@ fn constraint_to_json(constraint: &catalog_core::Constraint) -> serde_json::Valu
                 catalog_core::LogicalConstraint::Xone(children) => ("xone", children),
             };
             serde_json::json!({
-                key: children.iter().map(constraint_to_json).collect::<Vec<_>>()
+                key: children
+                    .iter()
+                    .map(|child| constraint_to_json(child, group_depth + 1))
+                    .collect::<Vec<_>>()
             })
         }
     }
