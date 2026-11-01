@@ -709,17 +709,30 @@ fn one_or_many(value: Option<&Value>) -> Vec<&Value> {
     }
 }
 
-/// Look `name` up in a JSON-LD node under any of its spellings: bare
-/// (`permission`), `odrl:`-prefixed (`odrl:permission`) or the full ODRL IRI
-/// (`http://www.w3.org/ns/odrl/2/permission`). The bare form wins when more
-/// than one is present. Every ODRL key this parser reads goes through here,
-/// so no key is accepted in one spelling and silently ignored in another
-/// (a skipped `odrl:prohibition` would loosen the policy).
-fn get_aliased<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
-    value
-        .get(name)
-        .or_else(|| value.get(format!("odrl:{name}")))
-        .or_else(|| value.get(format!("{ODRL_NS}{name}")))
+/// Every value `name` has in a JSON-LD node, one per spelling present: bare
+/// (`permission`), `odrl:`-prefixed (`odrl:permission`) and full ODRL IRI
+/// (`http://www.w3.org/ns/odrl/2/permission`). JSON-LD expands all spellings
+/// to one IRI and merges their values, so a node carrying two spellings has
+/// both contributions. Every ODRL key this parser reads goes through here (a
+/// skipped spelling would loosen the policy).
+fn aliased_all<'a>(value: &'a Value, name: &str) -> Vec<&'a Value> {
+    [
+        name.to_string(),
+        format!("odrl:{name}"),
+        format!("{ODRL_NS}{name}"),
+    ]
+    .iter()
+    .filter_map(|key| value.get(key.as_str()))
+    .collect()
+}
+
+/// The one-or-many entries of `name` under all its spellings, merged in
+/// spelling order (bare, `odrl:`, full IRI).
+fn one_or_many_aliased<'a>(value: &'a Value, name: &str) -> Vec<&'a Value> {
+    aliased_all(value, name)
+        .into_iter()
+        .flat_map(|v| one_or_many(Some(v)))
+        .collect()
 }
 
 /// Reduce a JSON-LD scalar to a string: a plain string, a number or boolean
@@ -764,9 +777,11 @@ impl Field {
 
 /// Read the scalar field `name` of `value`, under any alias.
 fn get_field(value: &Value, name: &str) -> Field {
-    match get_aliased(value, name) {
-        None => Field::Absent,
-        Some(raw) => json_ld_scalar(raw).map_or(Field::Unreadable, Field::Value),
+    match aliased_all(value, name).as_slice() {
+        [] => Field::Absent,
+        [raw] => json_ld_scalar(raw).map_or(Field::Unreadable, Field::Value),
+        // The same scalar under two spellings has no single reading.
+        _ => Field::Unreadable,
     }
 }
 
@@ -785,7 +800,7 @@ fn unmappable_rule(raw: &Value) -> Rule {
 /// `catalog_core::Policy` values. Absent entirely -> an empty `Vec`, exactly
 /// like every other optional dataset descriptor this crawler handles.
 fn parse_policies(dataset_value: &Value) -> Vec<Policy> {
-    one_or_many(get_aliased(dataset_value, "hasPolicy"))
+    one_or_many_aliased(dataset_value, "hasPolicy")
         .into_iter()
         .map(|entry| {
             if entry.is_object() {
@@ -835,9 +850,15 @@ fn parse_policy(value: &Value) -> Policy {
         Field::Value(v) => Some(v),
         Field::Absent => None,
         Field::Unreadable => {
-            if let Some(raw) = get_aliased(value, "assignee") {
-                obligations.push(unmappable_rule(raw));
-            }
+            let raws: Vec<Value> = aliased_all(value, "assignee")
+                .into_iter()
+                .cloned()
+                .collect();
+            let raw = match raws.as_slice() {
+                [one] => one.clone(),
+                _ => Value::Array(raws),
+            };
+            obligations.push(unmappable_rule(&raw));
             None
         }
     };
@@ -857,7 +878,7 @@ fn parse_policy(value: &Value) -> Policy {
 /// or `"obligation"`, one-or-many, any alias) into `Rule`s. An entry that
 /// is not a node is kept as an unmappable marker rule rather than dropped.
 fn parse_rules(policy_value: &Value, key: &str) -> Vec<Rule> {
-    one_or_many(get_aliased(policy_value, key))
+    one_or_many_aliased(policy_value, key)
         .into_iter()
         .map(parse_rule)
         .collect()
@@ -883,7 +904,7 @@ fn parse_rule(value: &Value) -> Rule {
             UNMAPPABLE_ACTION.to_string()
         }
     };
-    constraints.extend(parse_constraints(get_aliased(value, "constraint")));
+    constraints.extend(parse_constraints(one_or_many_aliased(value, "constraint")));
     Rule {
         action,
         constraints,
@@ -932,8 +953,8 @@ const LOGICAL_CONSTRAINT_KEYS: [(&str, LogicalConstraintBuilder); 4] = [
 
 /// Parse a rule's `constraint` entries (one-or-many) into `Constraint`s -
 /// see [`parse_constraint`] for the per-entry (recursive) parse.
-fn parse_constraints(value: Option<&Value>) -> Vec<Constraint> {
-    one_or_many(value)
+fn parse_constraints(entries: Vec<&Value>) -> Vec<Constraint> {
+    entries
         .into_iter()
         .map(|entry| parse_constraint(entry, 0))
         .collect()
@@ -957,6 +978,25 @@ fn parse_constraint(value: &Value, depth: usize) -> Constraint {
         return Constraint::unmappable(value.to_string());
     }
 
+    // A node that mixes an atomic triple with a logical key, or carries more
+    // than one logical key, is ambiguous. Reading one part would drop the
+    // rest and loosen the policy, so the whole node is marked.
+    let has_atomic_key = ["leftOperand", "operator", "rightOperand"]
+        .iter()
+        .any(|k| !aliased_all(value, k).is_empty());
+    let logical_present: Vec<&(&str, LogicalConstraintBuilder)> = LOGICAL_CONSTRAINT_KEYS
+        .iter()
+        .filter(|(key, _)| !aliased_all(value, key).is_empty())
+        .collect();
+    if logical_present.len() > 1 || (has_atomic_key && !logical_present.is_empty()) {
+        tracing::warn!(
+            entry = %value,
+            "crawled ODRL constraint mixes atomic and logical keys or several logical keys; \
+             keeping it as an unmappable marker"
+        );
+        return Constraint::unmappable(value.to_string());
+    }
+
     if let (Field::Value(left), Field::Value(operator), Field::Value(right)) = (
         get_field(value, "leftOperand"),
         get_field(value, "operator"),
@@ -965,23 +1005,22 @@ fn parse_constraint(value: &Value, depth: usize) -> Constraint {
         return Constraint::atomic(left, operator, right);
     }
 
-    for (key, build) in LOGICAL_CONSTRAINT_KEYS {
-        if let Some(children_value) = get_aliased(value, key) {
-            if depth >= MAX_CONSTRAINT_DEPTH {
-                tracing::warn!(
-                    depth,
-                    max_depth = MAX_CONSTRAINT_DEPTH,
-                    "crawled ODRL logical constraint nested past MAX_CONSTRAINT_DEPTH; \
-                     keeping it as an unmappable marker"
-                );
-                return Constraint::unmappable(value.to_string());
-            }
-            let children: Vec<Constraint> = one_or_many(Some(children_value))
-                .into_iter()
-                .map(|child| parse_constraint(child, depth + 1))
-                .collect();
-            return build(children);
+    if let Some((_, build)) = logical_present.first() {
+        if depth >= MAX_CONSTRAINT_DEPTH {
+            tracing::warn!(
+                depth,
+                max_depth = MAX_CONSTRAINT_DEPTH,
+                "crawled ODRL logical constraint nested past MAX_CONSTRAINT_DEPTH; \
+                 keeping it as an unmappable marker"
+            );
+            return Constraint::unmappable(value.to_string());
         }
+        let key = logical_present[0].0;
+        let children: Vec<Constraint> = one_or_many_aliased(value, key)
+            .into_iter()
+            .map(|child| parse_constraint(child, depth + 1))
+            .collect();
+        return build(children);
     }
 
     tracing::warn!(
@@ -2379,6 +2418,43 @@ mod tests {
 
     fn is_marker(c: &Constraint) -> bool {
         c.is_unmappable()
+    }
+
+    #[test]
+    fn duplicate_spellings_are_merged_not_dropped() {
+        let policy = parse_one_policy(json!({
+            "prohibition": [],
+            "odrl:prohibition": [{"action": "distribute"}],
+            "permission": [{
+                "action": "use",
+                "constraint": [],
+                "odrl:constraint": [{"leftOperand": "a", "operator": "eq", "rightOperand": "b"}]
+            }]
+        }));
+        assert_eq!(policy.prohibitions.len(), 1);
+        assert_eq!(policy.permissions[0].constraints.len(), 1);
+    }
+
+    #[test]
+    fn mixed_or_multiple_constraint_keys_become_a_marker() {
+        let atomic_plus_group = json!({
+            "leftOperand": "a", "operator": "eq", "rightOperand": "b",
+            "odrl:and": [{"leftOperand": "x", "operator": "eq", "rightOperand": "y"}]
+        });
+        let two_groups = json!({
+            "or": [{"leftOperand": "x", "operator": "eq", "rightOperand": "y"}],
+            "odrl:and": [{"leftOperand": "x", "operator": "eq", "rightOperand": "y"}]
+        });
+        let dup_scalar = json!({
+            "leftOperand": "a", "odrl:leftOperand": "z", "operator": "eq", "rightOperand": "b"
+        });
+        let policy = parse_one_policy(json!({"permission": [{
+            "action": "use",
+            "constraint": [atomic_plus_group, two_groups, dup_scalar]
+        }]}));
+        let constraints = &policy.permissions[0].constraints;
+        assert_eq!(constraints.len(), 3);
+        assert!(constraints.iter().all(is_marker), "{constraints:?}");
     }
 
     #[test]
