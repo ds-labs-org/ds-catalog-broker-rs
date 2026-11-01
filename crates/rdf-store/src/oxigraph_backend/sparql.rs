@@ -391,6 +391,36 @@ pub(super) fn graph_holds_a_catalog(
         .map(|quad| quad.is_some())
 }
 
+// Test seam: runs once per triple-pattern lookup of a `VisibleDataset`
+// on the evaluating thread. A test installs a closure to write to the
+// store in the middle of an evaluation, or to make a lookup fail with a
+// storage error.
+#[cfg(test)]
+thread_local! {
+    pub(super) static LOOKUP_HOOK: std::cell::RefCell<Option<Box<dyn FnMut() -> Option<StorageError>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn lookup_hook() -> Option<StorageError> {
+    // Taken out while it runs, so a hook that itself queries the store
+    // does not re-enter it.
+    let mut hook = LOOKUP_HOOK.with(|hook| hook.borrow_mut().take())?;
+    let injected = hook();
+    LOOKUP_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(hook);
+        }
+    });
+    injected
+}
+
+#[cfg(not(test))]
+fn lookup_hook() -> Option<StorageError> {
+    None
+}
+
 /// The live store, minus every quad [`quad_is_visible`] rejects, as a
 /// dataset oxigraph's SPARQL evaluator can query directly. Terms are
 /// passed through as plain [`Term`]s; `FROM`/`FROM NAMED` and the
@@ -462,6 +492,7 @@ impl<'a> QueryableDataset<'a> for VisibleDataset<'a> {
             NamedOrBlankNodeRef::BlankNode(_) => false,
         });
 
+        let injected = lookup_hook();
         let quads = match (subject, predicate, graph) {
             _ if bound_iri_hidden => None,
             (Some(subject), Some(predicate), Some(graph)) => {
@@ -470,7 +501,11 @@ impl<'a> QueryableDataset<'a> for VisibleDataset<'a> {
             _ => None,
         };
 
-        quads.into_iter().flatten().filter_map(move |quad| {
+        let quads = injected
+            .into_iter()
+            .map(Err)
+            .chain(quads.into_iter().flatten());
+        quads.filter_map(move |quad| {
             let quad = match quad {
                 Ok(quad) => quad,
                 Err(err) => return Some(Err(err)),

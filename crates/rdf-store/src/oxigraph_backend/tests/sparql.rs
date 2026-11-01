@@ -740,3 +740,86 @@ fn policy_filtered_query_stops_waiting_when_cancelled() {
     );
     assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
 }
+
+/// Installs `hook` for the rest of the test's evaluations on this thread.
+fn install_lookup_hook(hook: impl FnMut() -> Option<StorageError> + 'static) {
+    crate::oxigraph_backend::sparql::LOOKUP_HOOK
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// A query that cancellation cannot interrupt is not run again because a
+/// write landed during it: the caller has already given up, and every
+/// extra attempt holds its evaluation slot.
+///
+/// The cancel and the write happen inside the first lookup of the
+/// evaluation. That lookup matches nothing, so oxigraph has no row to
+/// check the token on, and the attempt ends with a result and a changed
+/// write sequence - the shape of a slow `VALUES`-only query cancelled by
+/// the route's timeout.
+#[test]
+fn policy_filtered_query_cancelled_during_an_attempt_is_not_retried() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let token = CancellationToken::new();
+    let limits = SparqlLimits {
+        cancellation: Some(token.clone()),
+        ..SparqlLimits::default()
+    };
+    let writer = cache.clone();
+    let canceller = token.clone();
+    let mut fired = false;
+    install_lookup_hook(move || {
+        if !std::mem::replace(&mut fired, true) {
+            canceller.cancel();
+            writer
+                .store_catalog(visibility_catalog("public", "title-v2"))
+                .unwrap();
+        }
+        None
+    });
+    let mut attempts = 0;
+    let result = cache.sparql_query_json_policy_filtered(
+        "SELECT ?a ?o WHERE { VALUES ?a { 1 } OPTIONAL { ?s <urn:test:absent> ?o } }",
+        |catalogs| {
+            attempts += 1;
+            public_only(catalogs)
+        },
+        &limits,
+    );
+    assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+    assert_eq!(attempts, 1);
+}
+
+/// A storage failure raised while the evaluator reads the store is a
+/// store fault, not an error in the caller's query.
+#[test]
+fn policy_filtered_query_reports_a_storage_failure_during_evaluation_as_a_store_error() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    install_lookup_hook(|| Some(StorageError::Io(std::io::Error::other("disk gone"))));
+    let result = cache.sparql_query_json_policy_filtered(
+        "SELECT ?o WHERE { ?s ?p ?o }",
+        public_only,
+        &SparqlLimits::default(),
+    );
+    assert!(matches!(result, Err(SparqlError::Store(_))), "{result:?}");
+}
+
+/// The same for the unfiltered evaluation path.
+#[test]
+fn evaluation_error_maps_a_dataset_storage_error_to_a_store_error() {
+    let err = QueryEvaluationError::Dataset(Box::new(std::io::Error::other("disk gone")));
+    assert!(matches!(
+        crate::oxigraph_backend::sparql::evaluation_error(err),
+        SparqlError::Store(_)
+    ));
+    let err = QueryEvaluationError::UnboundService;
+    assert!(matches!(
+        crate::oxigraph_backend::sparql::evaluation_error(err),
+        SparqlError::Evaluation(_)
+    ));
+}
