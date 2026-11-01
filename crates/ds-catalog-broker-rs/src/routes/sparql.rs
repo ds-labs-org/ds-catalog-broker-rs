@@ -105,7 +105,7 @@ pub(super) fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 /// - ODRL policy-based filtering (gap analysis §3.4) runs next, whenever
 ///   [`should_filter_by_policy`] says it should: the query is evaluated
 ///   over only the datasets and data services the caller may see
-///   (`OxigraphCatalogCache::sparql_query_json_restricted`, allow-list
+///   (`OxigraphCatalogCache::sparql_query_json_policy_filtered`, allow-list
 ///   from [`visible_resource_iris`], the same per-dataset decision
 ///   `filter_catalogs_by_policy` makes for `GET /catalog`/the management
 ///   API). Hidden data is absent from what the query reads, so every
@@ -123,8 +123,15 @@ pub(super) fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 ///   cancelled and the caller gets 503; a result over `max_rows` rows is
 ///   400 Bad Request. The policy allow-list is computed in the same
 ///   blocking task, on the same store state the query reads: a crawl
-///   landing mid-query makes the evaluation start over, and a store that
-///   keeps changing ends in 503.
+///   landing mid-query makes the evaluation start over, up to 5 attempts,
+///   and a store that keeps changing ends in 503 ("kept changing"). This
+///   trades availability for consistency: a filtered query longer than
+///   the usual interval between crawler commits can get that 503. A read
+///   transaction was rejected because it would hold the store's single
+///   writer lock for the whole query.
+/// - A failed store read, including a storage error raised while the
+///   query runs: 500 with the fixed body "SPARQL evaluation failed"; the
+///   detail is logged.
 /// - Otherwise: 200 with an `application/sparql-results+json` body.
 ///
 /// Checked first, ahead of all of the above: the OAuth2 Bearer gate (see

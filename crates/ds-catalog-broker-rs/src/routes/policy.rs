@@ -143,7 +143,7 @@ pub(super) fn service_is_visible(
 /// Returns the visible datasets plus every data service a visible
 /// dataset's distribution uses, or that no dataset uses at all
 /// ([`service_is_visible`]): the allow-list
-/// `OxigraphCatalogCache::sparql_query_json_restricted` evaluates over.
+/// `OxigraphCatalogCache::sparql_query_json_policy_filtered` evaluates over.
 pub(super) fn visible_resource_iris(
     catalogs: &[Catalog],
     engine_claims: &engine::Claims,
