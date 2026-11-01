@@ -53,14 +53,19 @@ use crate::{Decision, EvaluateRequest, EvaluateResponse};
 /// the wasm-plugin ecosystem (wasm-bindgen's `__wbindgen_malloc`,
 /// Extism's PDK helpers) for exactly this reason. [`dealloc`] below
 /// reconstructs the *same* `Vec<u8>` from `(ptr, len)` alone, which is
-/// only sound because of this invariant — negative `len` is clamped to 0
-/// so a hostile or buggy host can't turn a negative-to-usize cast into a
-/// huge allocation request. A `len` the allocator cannot serve returns 0
-/// and the instance stays usable.
+/// only sound because of this invariant. A negative `len`, or a `len` the
+/// allocator cannot serve, returns 0 and the instance stays usable. The
+/// host must check for 0 before writing.
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn alloc(len: i32) -> i32 {
-    let len = len.max(0) as usize;
+    // A negative i32 is a length of 2 GiB or more as u32, which a wasm32
+    // guest cannot serve. Returning 0 lets the host detect it, where a
+    // zero-byte buffer behind a valid pointer would not.
+    if len < 0 {
+        return 0;
+    }
+    let len = len as usize;
     let mut buf: Vec<u8> = Vec::new();
     // A request the allocator cannot serve returns 0 instead of panicking,
     // which would trap the instance. The host must check for 0.
