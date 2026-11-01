@@ -17,7 +17,10 @@
 //! It supports the `eq`, `neq` and `isAnyOf` operators and combines all
 //! attached policies with deny-overrides. A prohibition with a constraint
 //! the engine cannot evaluate denies. It has no profiles, no duties
-//! and no error result, and obligations are parsed and ignored. The case study's 2026-09-05 update records that
+//! and no error result, and obligations are parsed and ignored. The request has
+//! no action, so `Rule::action` is never read: every permission and
+//! prohibition applies to every use, and an unrecognised action is not an
+//! error. The case study's 2026-09-05 update records that
 //! those were built later in the separate `ds-odrl-engine-rs` repository,
 //! which is what `ds-catalog-broker-rs` uses for its filtering. See
 //! `docs/policy-engine.md` in this repository for the ABI and the build.

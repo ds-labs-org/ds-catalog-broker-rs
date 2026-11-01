@@ -35,6 +35,13 @@ unevaluable. A permission applies only when every constraint matches. A
 prohibition applies when every constraint matches or is unevaluable, and its
 reason reads `could not be evaluated, failing closed`.
 
+The request carries no action, so `action` on a rule is never read. A
+prohibition on one action, for example `distribute`, denies the dataset for
+every use, and a permission for one action, for example `read`, allows every
+use. ODRL would scope each rule to its action, and the case study's section
+4.3 specifies an error result for an unrecognised action. This crate does
+neither.
+
 Policy-level obligations are parsed and ignored. An allowed request carries
 no signal that a duty exists.
 
