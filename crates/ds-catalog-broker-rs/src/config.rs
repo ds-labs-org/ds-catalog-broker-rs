@@ -44,7 +44,7 @@ use std::path::PathBuf;
 
 use contreforts_config::{ConfigStore, ConfigStoreConfig, ConfigStoreError};
 use contreforts_core::namespaces::CONFIG_GRAPH;
-use crawler::{HolderConfig, ParticipantEntry, ParticipantsConfig};
+use crawler::{CredentialProtocol, HolderConfig, ParticipantEntry, ParticipantsConfig};
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::model::vocab::rdf;
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Term};
@@ -128,12 +128,26 @@ pub const CATALOG_REQUEST_URL: &str = "catalogRequestUrl";
 pub const CREDENTIAL_PROTOCOL: &str = "credentialProtocol";
 pub const PROVIDER_DID: &str = "providerDid";
 pub const OID4VP_RESPONSE_URI: &str = "oid4vpResponseUri";
+const PARTICIPANT_PROPERTIES: &[&str] = &[
+    PARTICIPANT_ID,
+    PARTICIPANT_NAME,
+    CATALOG_REQUEST_URL,
+    CREDENTIAL_PROTOCOL,
+    PROVIDER_DID,
+    OID4VP_RESPONSE_URI,
+];
 
 /// The properties of the `broker:Holder`.
 pub const OWN_DID_HOST: &str = "ownDidHost";
 pub const INSECURE_HTTP: &str = "insecureHttp";
 pub const CREDENTIAL_JWS_FILE: &str = "credentialJwsFile";
 pub const REQUIRED_SCOPE: &str = "requiredScope";
+const HOLDER_PROPERTIES: &[&str] = &[
+    OWN_DID_HOST,
+    INSECURE_HTTP,
+    CREDENTIAL_JWS_FILE,
+    REQUIRED_SCOPE,
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerConfigError {
@@ -521,6 +535,23 @@ impl<'a> ConfigGraph<'a> {
             .collect()
     }
 
+    fn has_type(&self, subject: &NamedOrBlankNode, class: &str) -> Result<bool, BrokerConfigError> {
+        let class = broker_node(class);
+        match self
+            .store
+            .quads_for_pattern(
+                Some(subject.as_ref()),
+                Some(rdf::TYPE),
+                Some(class.as_ref().into()),
+                Some(self.graph_name()),
+            )
+            .next()
+        {
+            Some(Err(err)) => Err(BrokerConfigError::Query(err.to_string())),
+            found => Ok(found.is_some()),
+        }
+    }
+
     /// `subject`'s `broker:` properties, keyed by local name, with every value of each.
     fn properties(
         &self,
@@ -558,6 +589,14 @@ fn term_value(term: &Term) -> String {
     }
 }
 
+/// How a resource is named in an error message.
+fn describe(node: &NamedOrBlankNode) -> String {
+    match node {
+        NamedOrBlankNode::NamedNode(node) => format!("<{}>", node.as_str()),
+        NamedOrBlankNode::BlankNode(_) => "a blank node".to_string(),
+    }
+}
+
 /// Reject any property with more than one value.
 fn single_values(
     resource: &str,
@@ -585,30 +624,146 @@ fn linked(
     property: &str,
     class: &str,
 ) -> Result<NamedOrBlankNode, BrokerConfigError> {
-    let _ = (graph, term, property, class);
-    todo!()
+    let node = match term {
+        Term::NamedNode(node) => NamedOrBlankNode::NamedNode(node),
+        Term::BlankNode(node) => NamedOrBlankNode::BlankNode(node),
+        other => {
+            return Err(BrokerConfigError::NotAResource {
+                property: property.to_string(),
+                value: other.to_string(),
+            });
+        }
+    };
+    if !graph.has_type(&node, class)? {
+        return Err(BrokerConfigError::WrongType {
+            resource: describe(&node),
+            property: property.to_string(),
+            expected: class.to_string(),
+        });
+    }
+    Ok(node)
+}
+
+/// A resource's single-valued `broker:` properties as strings, warning about unknown ones.
+struct Properties {
+    resource: String,
+    values: BTreeMap<String, String>,
+}
+
+impl Properties {
+    fn read(
+        graph: &ConfigGraph<'_>,
+        node: &NamedOrBlankNode,
+        class: &str,
+        known: &[&str],
+    ) -> Result<Self, BrokerConfigError> {
+        let resource = format!("broker:{class} {}", describe(node));
+        let values: BTreeMap<String, String> = single_values(&resource, graph.properties(node)?)?
+            .into_iter()
+            .map(|(property, term)| (property, term_value(&term)))
+            .collect();
+        for property in values.keys() {
+            if !known.contains(&property.as_str()) {
+                tracing::warn!(
+                    property,
+                    resource,
+                    "unknown broker:{property} on {resource}; ignored"
+                );
+            }
+        }
+        Ok(Self { resource, values })
+    }
+
+    fn optional(&self, property: &str) -> Option<String> {
+        self.values.get(property).cloned()
+    }
+
+    fn required(&self, property: &str) -> Result<String, BrokerConfigError> {
+        self.optional(property)
+            .ok_or_else(|| BrokerConfigError::MissingProperty {
+                resource: self.resource.clone(),
+                property: property.to_string(),
+            })
+    }
+
+    fn invalid(&self, property: &str, value: String, reason: String) -> BrokerConfigError {
+        BrokerConfigError::InvalidValue {
+            resource: self.resource.clone(),
+            property: property.to_string(),
+            value,
+            reason,
+        }
+    }
 }
 
 fn read_participant(
     graph: &ConfigGraph<'_>,
     node: &NamedOrBlankNode,
 ) -> Result<ParticipantEntry, BrokerConfigError> {
-    let _ = (graph, node);
-    todo!()
+    let props = Properties::read(graph, node, "Participant", PARTICIPANT_PROPERTIES)?;
+    let credential_protocol = match props.optional(CREDENTIAL_PROTOCOL) {
+        Some(raw) => raw
+            .parse::<CredentialProtocol>()
+            .map_err(|err| props.invalid(CREDENTIAL_PROTOCOL, raw, err.to_string()))?,
+        None => CredentialProtocol::None,
+    };
+    Ok(ParticipantEntry {
+        id: props.required(PARTICIPANT_ID)?,
+        name: props.required(PARTICIPANT_NAME)?,
+        catalog_request_url: props.required(CATALOG_REQUEST_URL)?,
+        credential_protocol,
+        provider_did: props.optional(PROVIDER_DID),
+        oid4vp_response_uri: props.optional(OID4VP_RESPONSE_URI),
+    })
 }
 
 fn read_holder(
     graph: &ConfigGraph<'_>,
     node: &NamedOrBlankNode,
 ) -> Result<HolderConfig, BrokerConfigError> {
-    let _ = (graph, node);
-    todo!()
+    let props = Properties::read(graph, node, "Holder", HOLDER_PROPERTIES)?;
+    let insecure_http = match props.optional(INSECURE_HTTP) {
+        None => false,
+        Some(raw) => match raw.trim() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            _ => return Err(props.invalid(INSECURE_HTTP, raw, "expected a boolean".to_string())),
+        },
+    };
+    // A `<file:...>` IRI (which a relative `<holder.jws>` resolves to, against the config
+    // file's own location) or a plain path string.
+    let raw_file = props.required(CREDENTIAL_JWS_FILE)?;
+    let credential_jws_file = if raw_file.starts_with("file:") {
+        Url::parse(&raw_file)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .ok_or_else(|| {
+                props.invalid(
+                    CREDENTIAL_JWS_FILE,
+                    raw_file.clone(),
+                    "not a local file path".to_string(),
+                )
+            })?
+    } else if raw_file.contains("://") {
+        return Err(props.invalid(
+            CREDENTIAL_JWS_FILE,
+            raw_file,
+            "the credential must be a local file".to_string(),
+        ));
+    } else {
+        PathBuf::from(raw_file)
+    };
+    Ok(HolderConfig {
+        own_did_host: props.required(OWN_DID_HOST)?,
+        insecure_http,
+        credential_jws_file,
+        required_scope: props.required(REQUIRED_SCOPE)?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crawler::CredentialProtocol;
 
     fn store_with(ttl: &str) -> (tempfile::TempDir, ConfigStore) {
         let dir = tempfile::tempdir().unwrap();

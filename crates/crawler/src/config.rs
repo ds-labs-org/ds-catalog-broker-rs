@@ -71,8 +71,12 @@ impl FromStr for CredentialProtocol {
     type Err = UnknownCredentialProtocol;
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        let _ = raw;
-        todo!()
+        match raw {
+            "none" => Ok(Self::None),
+            "dcp" => Ok(Self::Dcp),
+            "oid4vp" => Ok(Self::Oid4Vp),
+            other => Err(UnknownCredentialProtocol(other.to_string())),
+        }
     }
 }
 
@@ -124,7 +128,19 @@ impl HolderConfig {
     /// Read the credential from [`Self::credential_jws_file`], with
     /// surrounding whitespace (a trailing newline, say) trimmed.
     pub fn read_credential_jws(&self) -> Result<String, ConfigError> {
-        todo!()
+        let raw = std::fs::read_to_string(&self.credential_jws_file).map_err(|source| {
+            ConfigError::CredentialFile {
+                path: self.credential_jws_file.display().to_string(),
+                source,
+            }
+        })?;
+        let jws = raw.trim();
+        if jws.is_empty() {
+            return Err(ConfigError::EmptyCredentialFile {
+                path: self.credential_jws_file.display().to_string(),
+            });
+        }
+        Ok(jws.to_string())
     }
 }
 
@@ -165,8 +181,41 @@ impl ParticipantsConfig {
         participants: Vec<ParticipantEntry>,
         holder: Option<HolderConfig>,
     ) -> Result<Self, ConfigError> {
-        let _ = (interval_secs, participants, holder);
-        todo!()
+        let mut ids = std::collections::BTreeSet::new();
+        for participant in &participants {
+            if !ids.insert(participant.id.as_str()) {
+                return Err(ConfigError::DuplicateParticipantId {
+                    id: participant.id.clone(),
+                });
+            }
+            match participant.credential_protocol {
+                CredentialProtocol::None => continue,
+                CredentialProtocol::Dcp => {
+                    if participant.provider_did.is_none() {
+                        return Err(ConfigError::MissingProviderDid {
+                            id: participant.id.clone(),
+                        });
+                    }
+                }
+                CredentialProtocol::Oid4Vp => {
+                    if participant.oid4vp_response_uri.is_none() {
+                        return Err(ConfigError::MissingOid4VpResponseUri {
+                            id: participant.id.clone(),
+                        });
+                    }
+                }
+            }
+            if holder.is_none() {
+                return Err(ConfigError::MissingHolder {
+                    id: participant.id.clone(),
+                });
+            }
+        }
+        Ok(Self {
+            interval_secs,
+            participants,
+            holder,
+        })
     }
 }
 
