@@ -311,6 +311,15 @@ impl OxigraphCatalogCache {
         depth: usize,
         graph: &mut GraphWrite,
     ) -> StoreResult<()> {
+        // Refused rather than truncated: dropping a child would loosen the
+        // policy (an emptied `and` matches everything). Writes only fill
+        // the buffer, so the upsert fails before its transaction starts.
+        if depth > MAX_CONSTRAINT_DEPTH {
+            return Err(StoreError::Backend(format!(
+                "{} is nested past the maximum supported logical constraint depth ({MAX_CONSTRAINT_DEPTH})",
+                constraint_node.as_str()
+            )));
+        }
         self.insert(
             constraint_node,
             &sequence_index_pred(),
@@ -354,13 +363,6 @@ impl OxigraphCatalogCache {
                     &Term::from(predicate.clone()),
                     graph,
                 )?;
-                // Children would sit at `depth + 1`. Past the bound they are
-                // all dropped, before any link to them is written, the way
-                // `crawler::parse_constraint` drops them: the group stays,
-                // empty.
-                if depth >= MAX_CONSTRAINT_DEPTH {
-                    return Ok(());
-                }
                 for (child_index, child) in children.iter().enumerate() {
                     let child_node = constraint_iri(constraint_node.as_str(), child_index);
                     self.insert(

@@ -640,8 +640,17 @@ impl OxigraphCatalogCache {
             None => {
                 for (graph_iri, graph) in self.snapshots(None)? {
                     let node = decode_node_id(&graph_iri)?;
-                    if let Some(catalog) = self.load_catalog(&node, &graph)? {
-                        results.push(catalog);
+                    // One unreadable graph must not hide every other
+                    // catalog: it is skipped with a warning here, and still
+                    // an error when asked for by its own node.
+                    match self.load_catalog(&node, &graph) {
+                        Ok(Some(catalog)) => results.push(catalog),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            node = %node,
+                            %error,
+                            "skipping a catalog that cannot be decoded"
+                        ),
                     }
                 }
             }
