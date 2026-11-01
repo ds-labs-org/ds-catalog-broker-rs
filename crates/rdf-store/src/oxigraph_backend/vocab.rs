@@ -141,29 +141,17 @@ pub(super) fn odrl_and_sequence_pred() -> NamedNode {
     odrl("andSequence")
 }
 
-/// Constructor signature shared by [`Constraint::and`],
-/// [`Constraint::or`], [`Constraint::xone`], and
-/// [`Constraint::and_sequence`] - factored into a named alias purely
-/// so [`logical_constraint_preds`]'s own type stays readable, mirroring
-/// `crawler::LogicalConstraintBuilder`.
-pub(super) type LogicalConstraintBuilder = fn(Vec<Constraint>) -> Constraint;
-
 /// The four `odrl:`-namespaced logical-group predicates, each paired
 /// with the `catalog_core::Constraint` constructor for that combinator,
-/// in the same fixed precedence [`crawler::LOGICAL_CONSTRAINT_KEYS`]
-/// uses when parsing (`xone`, then `or`, then `and`, then
+/// in the precedence of [`catalog_core::LOGICAL_CONSTRAINT_BUILDERS`],
+/// which the crawler also uses when parsing (`xone`, then `or`, then `and`, then
 /// `andSequence`). [`OxigraphCatalogCache::load_constraint`] reads a
 /// group's predicate from its `fcns:logicalOperator` marker; only when a
 /// hand-crafted resource lacks the marker does it fall back to this
 /// order, taking the first predicate that links a child, the way
 /// `crawler` would parse the equivalent JSON-LD.
 pub(super) fn logical_constraint_preds() -> [(NamedNode, LogicalConstraintBuilder); 4] {
-    [
-        (odrl_xone_pred(), Constraint::xone),
-        (odrl_or_pred(), Constraint::or),
-        (odrl_and_pred(), Constraint::and),
-        (odrl_and_sequence_pred(), Constraint::and_sequence),
-    ]
+    LOGICAL_CONSTRAINT_BUILDERS.map(|(name, build)| (odrl(name), build))
 }
 
 pub(super) fn odrl_assigner_pred() -> NamedNode {

@@ -284,6 +284,33 @@ impl Constraint {
     }
 }
 
+/// Bounds how many nested `odrl:and`/`odrl:or`/`odrl:xone`/
+/// `odrl:andSequence` levels the crawler's parser, the rdf-store's write and
+/// read, and the broker's policy filter recurse into for one constraint
+/// tree. It equals `ds-odrl-engine-rs`'s own
+/// `engine::constraint::MAX_CONSTRAINT_DEPTH`: a policy that is harvested or
+/// stored but that the engine refuses to evaluate (or the reverse) would be a
+/// mismatch between "stored" and "enforceable" for the same input. Each
+/// consumer applies the bound itself, since a `Constraint` can reach it from
+/// any caller.
+pub const MAX_CONSTRAINT_DEPTH: usize = 64;
+
+/// Constructor signature shared by [`Constraint::and`], [`Constraint::or`],
+/// [`Constraint::xone`] and [`Constraint::and_sequence`].
+pub type LogicalConstraintBuilder = fn(Vec<Constraint>) -> Constraint;
+
+/// The four logical combinators as `(ODRL local name, constructor)`, in the
+/// precedence `ds-odrl-engine-rs` applies when a node carries more than one
+/// of them: `xone`, `or`, `and`, `andSequence`. The crawler and the
+/// rdf-store both read a group's key in this order. The crawler reads each
+/// key under any alias (bare, `odrl:` prefixed, or the full ODRL IRI).
+pub const LOGICAL_CONSTRAINT_BUILDERS: [(&str, LogicalConstraintBuilder); 4] = [
+    ("xone", Constraint::xone),
+    ("or", Constraint::or),
+    ("and", Constraint::and),
+    ("andSequence", Constraint::and_sequence),
+];
+
 /// One ODRL rule entry: a single `permission`, `prohibition`, or
 /// `obligation` inside a [`Policy`].
 ///
@@ -388,6 +415,28 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logical_builders_are_in_engine_precedence_and_build_their_variant() {
+        let names: Vec<&str> = LOGICAL_CONSTRAINT_BUILDERS
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(names, ["xone", "or", "and", "andSequence"]);
+        let built: Vec<Constraint> = LOGICAL_CONSTRAINT_BUILDERS
+            .iter()
+            .map(|(_, build)| build(Vec::new()))
+            .collect();
+        assert_eq!(
+            built,
+            [
+                Constraint::xone(Vec::new()),
+                Constraint::or(Vec::new()),
+                Constraint::and(Vec::new()),
+                Constraint::and_sequence(Vec::new()),
+            ]
+        );
+    }
 
     #[test]
     fn normalize_action_maps_the_three_odrl_spellings_to_one() {

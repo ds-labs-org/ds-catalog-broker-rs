@@ -7,9 +7,12 @@
 //! before the listener closes.
 //!
 //! It does not wait for the first cycle when there is no crawler, or when a
-//! holder is configured: a DCP or OID4VP crawl needs the remote side to call
-//! back into `/dsp/holder/*` on this broker, which a readiness-gated load
-//! balancer would block, failing that very cycle.
+//! participant uses `credentialProtocol` `dcp` or `oid4vp`: that crawl needs
+//! the remote side to call back into `/dsp/holder/*` on this broker, which a
+//! readiness-gated load balancer would block, failing that very cycle. A
+//! configured holder alone does not skip the wait: with every participant on
+//! `none` no callback happens, and answering 200 before the first crawl would
+//! send traffic to an empty catalog.
 //!
 //! Probes carry no token, so `/ready` always answers. With OAuth2 on, the
 //! per-participant details (ids, upstream error text) are shown only to a
@@ -69,7 +72,7 @@ pub(super) async fn ready(State(state): State<AppState>, headers: HeaderMap) -> 
     let show_details =
         state.oauth2.is_none() || matches!(check_oauth2_bearer(&state, &headers), Ok(Some(_)));
     let snapshot = state.crawl_status.as_ref().map(SharedCrawlStatus::snapshot);
-    let waits_for_first_cycle = state.holder.is_none();
+    let waits_for_first_cycle = !state.crawl_needs_holder_callbacks;
     let (code, status) = match &snapshot {
         _ if stopping => (StatusCode::SERVICE_UNAVAILABLE, "stopping"),
         Some(crawl) if crawl.cycles_completed == 0 && waits_for_first_cycle => {

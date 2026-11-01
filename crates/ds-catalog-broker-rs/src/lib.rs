@@ -14,6 +14,7 @@ pub mod oauth2;
 pub mod odrl_filter;
 mod routes;
 pub mod serving;
+pub mod signals;
 mod state;
 #[cfg(test)]
 mod tests;

@@ -48,15 +48,15 @@ use crate::config::{self, BrokerSettings};
 use std::collections::BTreeSet;
 
 use catalog_core::{
-    Constraint as CoreConstraint, Dataset, LogicalConstraint, Policy as CorePolicy,
-    PolicyKind as CorePolicyKind, Rule as CoreRule,
+    Constraint as CoreConstraint, Dataset, LogicalConstraint, MAX_CONSTRAINT_DEPTH,
+    Policy as CorePolicy, PolicyKind as CorePolicyKind, Rule as CoreRule,
 };
 use chrono::Utc;
 use engine::wire::WireActionDecl;
 use engine::{
     Behaviour, ClaimValue, Claims, ConflictStrategy, Constraint as EngineConstraint, DutyMode,
-    MAX_CONSTRAINT_DEPTH, Operator, Request as EngineRequest, RequestConfig, Rule as EngineRule,
-    WireDecision, WirePolicy, evaluate_request,
+    Operator, Request as EngineRequest, RequestConfig, Rule as EngineRule, WireDecision,
+    WirePolicy, evaluate_request,
 };
 
 // --- Configuration (gap analysis §3.4's "driven by a new, explicit runtime
@@ -466,7 +466,7 @@ fn normalize_left_operand(left_operand: &str) -> String {
 /// [`catalog_constraint_to_engine_constraint`]'s actual recursion, with an
 /// explicit depth counter this crate's own public signature has no room
 /// for. Bounded by the same [`MAX_CONSTRAINT_DEPTH`] the crawler's own
-/// parsing already bounds itself by (gap analysis \u{a7}3.4's own note on
+/// parsing already bounds itself by (shared from `catalog_core`) (gap analysis \u{a7}3.4's own note on
 /// why the two are kept in step) - a harvested `Constraint` reaching this
 /// function has already been through that bound once, so this is a
 /// defense-in-depth guard against a `Constraint` value built some other
@@ -809,6 +809,13 @@ pub fn dataset_is_visible(
 mod tests {
     use super::*;
     use catalog_core::PolicyKind;
+
+    /// The shared bound must stay equal to the engine's own, or a policy the
+    /// crawler and store accept could be refused at evaluation.
+    #[test]
+    fn the_shared_constraint_depth_equals_the_engines() {
+        assert_eq!(MAX_CONSTRAINT_DEPTH, engine::MAX_CONSTRAINT_DEPTH);
+    }
 
     #[test]
     fn policy_filter_config_reads_ttl_values() {

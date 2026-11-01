@@ -8,7 +8,10 @@
 | `GET /ready` | `503` with `"status":"starting"` until the crawler has finished its first cycle, then `200` with `"status":"ready"`, and `503` with `"status":"stopping"` once shutdown has begun. | Readiness: keep traffic away from a broker that has not crawled yet or is stopping. |
 
 `/ready` does not wait for the first cycle when there is no
-`broker:participant`, or when a `broker:holder` is configured. A `dcp` or
+`broker:participant`, or when a participant uses `credentialProtocol` `dcp`
+or `oid4vp`. A configured `broker:holder` alone does not skip the wait: with
+every participant on `none` no callback happens, and `/ready` would answer
+`200` before any crawl while the catalog is still empty. A `dcp` or
 `oid4vp` crawl needs the participant to call back into this broker
 (`/dsp/holder/did.json`, `/dsp/holder/presentations/query`), and a load
 balancer that holds traffic until `/ready` passes would block those calls

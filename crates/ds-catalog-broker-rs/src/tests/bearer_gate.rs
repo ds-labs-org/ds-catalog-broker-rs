@@ -311,3 +311,21 @@ async fn sparql_post_route_200s_with_the_real_body_for_a_fully_valid_token() {
             .contains("DATASET-A")
     );
 }
+
+/// RFC 7235: the auth scheme is case-insensitive, so `bearer <token>` passes.
+#[tokio::test]
+async fn catalog_route_accepts_a_lowercase_bearer_scheme() {
+    let (state, key) = oauth2_catalog_state(|_| {}).await;
+    let token = sign_es256(&key, base_claims());
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/catalog?node_id=sample-participant")
+                .header("Authorization", format!("bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}

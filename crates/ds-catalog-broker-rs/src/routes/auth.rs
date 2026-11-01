@@ -43,13 +43,7 @@ pub(super) fn check_oauth2_bearer(
         return Ok(None);
     };
 
-    let token = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|token| !token.is_empty());
-    let Some(token) = token else {
+    let Some(token) = bearer_token(headers) else {
         return Err(Box::new(unauthorized_bearer_response()));
     };
 
@@ -71,6 +65,18 @@ pub(super) fn check_oauth2_bearer(
     }
 }
 
+/// The token of an `Authorization: Bearer <token>` header. The scheme is
+/// matched case-insensitively (RFC 7235 section 2.1). `None` for a missing
+/// header, another scheme, or an empty token.
+pub(super) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    Some(token.trim()).filter(|token| !token.is_empty())
+}
+
 pub(super) fn unauthorized_bearer_response() -> axum::response::Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -80,4 +86,30 @@ pub(super) fn unauthorized_bearer_response() -> axum::response::Response {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        for value in ["Bearer abc", "bearer abc", "BEARER abc", "bEaReR  abc "] {
+            assert_eq!(bearer_token(&headers(value)), Some("abc"), "{value}");
+        }
+    }
+
+    #[test]
+    fn other_schemes_and_empty_tokens_give_no_token() {
+        for value in ["Basic abc", "Bearer", "Bearer ", "Bearerabc", "abc"] {
+            assert_eq!(bearer_token(&headers(value)), None, "{value}");
+        }
+        assert_eq!(bearer_token(&HeaderMap::new()), None);
+    }
 }

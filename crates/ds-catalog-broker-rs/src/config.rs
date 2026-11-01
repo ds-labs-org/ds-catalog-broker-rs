@@ -13,8 +13,9 @@
 //! - **a plain path or a `file:///` URL to a file**: that Turtle document itself;
 //! - **an `https://` URL**: a Turtle document fetched once at startup. A non-2xx
 //!   answer is an error, not an empty config. Relative IRIs in it resolve against the URL.
-//!   Plain `http://` is accepted only for `localhost` or a loopback address, since the config
-//!   decides where the crawler sends its credential.
+//!   Plain `http://` is accepted only for a loopback IP address (`127.0.0.0/8`, `::1`); the
+//!   host name `localhost` is rejected, since the config decides where the crawler sends its
+//!   credential and a name is not trusted as loopback.
 //!
 //! Unset, the location is `contreforts-config`'s per-user default, `<os-data-dir>/config_store`.
 //! No setting is read from the environment.
