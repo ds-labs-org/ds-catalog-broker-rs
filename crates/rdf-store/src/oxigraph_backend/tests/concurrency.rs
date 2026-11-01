@@ -1,13 +1,14 @@
 // --- Concurrent reads during upserts (#26) ----------------------------
 
 use super::*;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::time::Instant;
 
 /// A catalog for `node` with `datasets` datasets, each tagged with
 /// `generation`, so a read can tell which upsert it saw.
 fn generation_catalog(node: &str, generation: &str, datasets: usize) -> Catalog {
-    let mut catalog = Catalog::new(format!("cat-{generation}"), NodeId::new(node));
+    let mut catalog = Catalog::new(format!("cat-{node}-{generation}"), NodeId::new(node));
     catalog.participant_id = Some(format!("did:example:{generation}"));
     for index in 0..datasets {
         let mut properties = BTreeMap::new();
@@ -30,11 +31,50 @@ fn generation_catalog(node: &str, generation: &str, datasets: usize) -> Catalog 
     catalog
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
-        .block_on(future)
+}
+
+/// Sets the flag when dropped, so reader threads stop even if the
+/// writer panics.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Run `readers` threads calling `read` in a loop while `write` runs on
+/// this thread. Every reader has finished at least one read before
+/// `write` starts, and they all keep reading until it returns.
+fn race(readers: usize, read: impl Fn() + Send + Sync + 'static, write: impl FnOnce()) {
+    let read = Arc::new(read);
+    let done = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(Barrier::new(readers + 1));
+    let handles: Vec<_> = (0..readers)
+        .map(|_| {
+            let (read, done, started) =
+                (Arc::clone(&read), Arc::clone(&done), Arc::clone(&started));
+            std::thread::spawn(move || {
+                read();
+                started.wait();
+                while !done.load(Ordering::Relaxed) {
+                    read();
+                }
+            })
+        })
+        .collect();
+    {
+        let _stop = StopOnDrop(Arc::clone(&done));
+        started.wait();
+        write();
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }
 
 /// Readers running while the same participant is upserted over and over
@@ -45,46 +85,91 @@ fn concurrent_reads_never_see_a_partial_upsert() {
     let cache = Arc::new(cache());
     let old = generation_catalog("node-race", "old", 40);
     let new = generation_catalog("node-race", "new", 40);
-    block_on(cache.upsert(old.clone())).unwrap();
+    let rt = runtime();
+    rt.block_on(cache.upsert(old.clone())).unwrap();
 
-    let done = Arc::new(AtomicBool::new(false));
-    let readers: Vec<_> = (0..4)
-        .map(|_| {
-            let cache = Arc::clone(&cache);
-            let done = Arc::clone(&done);
-            let (old, new) = (old.clone(), new.clone());
-            std::thread::spawn(move || {
-                let mut reads = 0usize;
-                while !done.load(Ordering::Relaxed) {
-                    let by_node = block_on(cache.query(CatalogQuery {
-                        origin_node: Some(NodeId::new("node-race")),
-                        ..CatalogQuery::all()
-                    }));
-                    let all = block_on(cache.query(CatalogQuery::all()));
-                    for result in [by_node, all] {
-                        let catalogs = result
-                            .unwrap_or_else(|err| panic!("read failed during an upsert: {err}"));
-                        assert_eq!(catalogs.len(), 1, "the catalog went missing");
-                        assert!(
-                            catalogs[0] == old || catalogs[0] == new,
-                            "read a catalog that is neither the old nor the new one: {:?}",
-                            catalogs[0].id
-                        );
-                    }
-                    reads += 1;
-                }
-                reads
-            })
-        })
-        .collect();
+    let reader_cache = Arc::clone(&cache);
+    let (expected_old, expected_new) = (old.clone(), new.clone());
+    race(
+        4,
+        move || {
+            let rt = runtime();
+            let by_node =
+                rt.block_on(reader_cache.query(CatalogQuery::for_node(NodeId::new("node-race"))));
+            let all = rt.block_on(reader_cache.query(CatalogQuery::all()));
+            for result in [by_node, all] {
+                let catalogs =
+                    result.unwrap_or_else(|err| panic!("read failed during an upsert: {err}"));
+                assert_eq!(catalogs.len(), 1, "the catalog went missing");
+                assert!(
+                    catalogs[0] == expected_old || catalogs[0] == expected_new,
+                    "read a catalog that is neither the old nor the new one: {:?}",
+                    catalogs[0].id
+                );
+            }
+        },
+        || {
+            for round in 0..300 {
+                let next = if round % 2 == 0 { &new } else { &old };
+                rt.block_on(cache.upsert(next.clone())).unwrap();
+            }
+        },
+    );
+}
 
-    for round in 0..300 {
-        let next = if round % 2 == 0 { &new } else { &old };
-        block_on(cache.upsert(next.clone())).unwrap();
+/// One `query(CatalogQuery::all())` reads every participant from the
+/// same store state. For each generation the writer upserts A, then B,
+/// so a consistent read shows A at B's generation or one ahead of it.
+/// Large participants that never change make each read slow, so writes
+/// land mid-read.
+#[test]
+fn reading_all_catalogs_sees_one_store_state() {
+    let cache = Arc::new(cache());
+    let rt = runtime();
+    for node in ["node-big-1", "node-big-2", "node-big-3", "node-big-4"] {
+        rt.block_on(cache.upsert(generation_catalog(node, "static", 300)))
+            .unwrap();
     }
-    done.store(true, Ordering::Relaxed);
-    let reads: usize = readers.into_iter().map(|r| r.join().unwrap()).sum();
-    assert!(reads > 0, "the readers never ran");
+    let generations: Vec<String> = (0..2000).map(|g| format!("{g:04}")).collect();
+    let catalogs = |g: &str| {
+        (
+            generation_catalog("node-a", g, 2),
+            generation_catalog("node-b", g, 2),
+        )
+    };
+    let (a, b) = catalogs(&generations[0]);
+    rt.block_on(cache.upsert(a)).unwrap();
+    rt.block_on(cache.upsert(b)).unwrap();
+
+    let reader_cache = Arc::clone(&cache);
+    race(
+        4,
+        move || {
+            let all = runtime()
+                .block_on(reader_cache.query(CatalogQuery::all()))
+                .unwrap();
+            let generation = |node: &str| {
+                all.iter()
+                    .find(|c| c.origin_node == NodeId::new(node))
+                    .and_then(|c| c.participant_id.as_deref())
+                    .and_then(|id| id.strip_prefix("did:example:"))
+                    .and_then(|g| g.parse::<u32>().ok())
+                    .unwrap_or_else(|| panic!("{node} went missing"))
+            };
+            let (a, b) = (generation("node-a"), generation("node-b"));
+            assert!(
+                a == b || a == b + 1,
+                "read node-a at generation {a} and node-b at {b}"
+            );
+        },
+        || {
+            for g in &generations[1..] {
+                let (a, b) = catalogs(g);
+                rt.block_on(cache.upsert(a)).unwrap();
+                rt.block_on(cache.upsert(b)).unwrap();
+            }
+        },
+    );
 }
 
 /// `delete` racing an upsert of the same participant leaves the graph
@@ -92,20 +177,28 @@ fn concurrent_reads_never_see_a_partial_upsert() {
 #[test]
 fn delete_racing_upsert_leaves_a_whole_catalog_or_none() {
     let catalog = generation_catalog("node-del", "only", 200);
-    for _ in 0..30 {
+    let graph = node_iri(&NodeId::new("node-del"));
+    let rt = runtime();
+
+    // Spread the deletes across the length of one upsert, so some of them
+    // land while it is writing whatever the machine's speed.
+    let timing = cache();
+    let started = Instant::now();
+    rt.block_on(timing.upsert(catalog.clone())).unwrap();
+    let upsert_time = started.elapsed();
+
+    for step in 0..40u32 {
         let cache = Arc::new(cache());
-        block_on(cache.upsert(catalog.clone())).unwrap();
+        rt.block_on(cache.upsert(catalog.clone())).unwrap();
         let writer = {
             let cache = Arc::clone(&cache);
             let catalog = catalog.clone();
-            std::thread::spawn(move || block_on(cache.upsert(catalog)).unwrap())
+            std::thread::spawn(move || runtime().block_on(cache.upsert(catalog)).unwrap())
         };
-        // Delete while the upsert is (most likely) writing.
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        block_on(cache.delete(&NodeId::new("node-del"))).unwrap();
+        std::thread::sleep(upsert_time * step / 40);
+        rt.block_on(cache.delete(&NodeId::new("node-del"))).unwrap();
         writer.join().unwrap();
-        let catalogs = block_on(cache.query(CatalogQuery::all())).unwrap();
-        let graph = node_iri(&NodeId::new("node-del"));
+        let catalogs = rt.block_on(cache.query(CatalogQuery::all())).unwrap();
         let leftover = cache
             .store
             .inner()
@@ -113,8 +206,7 @@ fn delete_racing_upsert_leaves_a_whole_catalog_or_none() {
             .count();
         assert!(
             (catalogs.is_empty() && leftover == 0) || catalogs == vec![catalog.clone()],
-            "left {} quads behind with {} catalogs readable",
-            leftover,
+            "left {leftover} quads behind with {} catalogs readable",
             catalogs.len()
         );
     }
