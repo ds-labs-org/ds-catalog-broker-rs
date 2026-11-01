@@ -6,9 +6,7 @@ use super::*;
 /// the config lists a `broker:participant`: a real Oxigraph-backed cache, with
 /// `AppState::sparql` pointed at that same store so `/sparql` is live.
 pub(super) fn sparql_test_state() -> AppState {
-    let store = Arc::new(rdf_store::oxigraph_backend::OxigraphCatalogCache::in_memory().unwrap());
-    let cache: Arc<dyn CatalogCache> = store.clone();
-    AppState::new(cache).with_sparql(Some(store))
+    test_state()
 }
 
 /// A small but real per-participant catalog - same shape as

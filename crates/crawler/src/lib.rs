@@ -836,7 +836,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
     use rdf_store::CatalogQuery;
-    use rdf_store::memory::InMemoryCatalogCache;
+    use rdf_store::oxigraph_backend::OxigraphCatalogCache;
     use serde_json::json;
 
     fn participant(id: &str) -> ParticipantEntry {
@@ -1416,7 +1416,7 @@ mod tests {
         // is guaranteed to fail at the transport level without needing a
         // real server.
         let participants = vec![participant("unreachable-participant")];
-        let cache = InMemoryCatalogCache::new();
+        let cache = OxigraphCatalogCache::in_memory().unwrap();
         let http = reqwest::Client::new();
 
         let summary = crawl_once(&http, &participants, None, &cache, &CrawlLimits::default()).await;
@@ -1576,7 +1576,7 @@ mod tests {
 
         let participants = vec![oid4vp_participant];
         let http = reqwest::Client::new();
-        let cache = InMemoryCatalogCache::new();
+        let cache = OxigraphCatalogCache::in_memory().unwrap();
 
         let summary = crawl_once(
             &http,
@@ -1622,7 +1622,7 @@ mod tests {
 
         let participants = vec![oid4vp_participant];
         let http = reqwest::Client::new();
-        let cache = InMemoryCatalogCache::new();
+        let cache = OxigraphCatalogCache::in_memory().unwrap();
 
         let summary = crawl_once(
             &http,
@@ -1706,7 +1706,7 @@ mod tests {
             concurrency: 3,
             ..CrawlLimits::default()
         };
-        let cache = InMemoryCatalogCache::new();
+        let cache = OxigraphCatalogCache::in_memory().unwrap();
 
         let summary = crawl_once(
             &reqwest::Client::new(),
@@ -1738,7 +1738,7 @@ mod tests {
             participant_timeout: Duration::from_millis(200),
             ..CrawlLimits::default()
         };
-        let cache = InMemoryCatalogCache::new();
+        let cache = OxigraphCatalogCache::in_memory().unwrap();
 
         let started = std::time::Instant::now();
         let summary = crawl_once(
@@ -1766,7 +1766,7 @@ mod tests {
         let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let mut entry = participant("flaky");
         entry.catalog_request_url = spawn_switchable_catalog_server(up.clone()).await;
-        let cache: Arc<dyn CatalogCache> = Arc::new(InMemoryCatalogCache::new());
+        let cache: Arc<dyn CatalogCache> = Arc::new(OxigraphCatalogCache::in_memory().unwrap());
         let limits = CrawlLimits {
             max_catalog_age: Duration::from_millis(300),
             ..CrawlLimits::default()

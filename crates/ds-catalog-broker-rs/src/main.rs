@@ -6,10 +6,9 @@ use ds_catalog_broker_rs::config::{self, BrokerSettings};
 use ds_catalog_broker_rs::oauth2::{OAuth2Config, OAuth2Verifier};
 use ds_catalog_broker_rs::odrl_filter::PolicyFilterConfig;
 use ds_catalog_broker_rs::{
-    AppState, SparqlLimitsConfig, build_router, crawl_limits_from_settings, seed_sample_catalog,
+    AppState, SparqlLimitsConfig, build_router, crawl_limits_from_settings,
 };
-use rdf_store::CatalogCache;
-use rdf_store::memory::InMemoryCatalogCache;
+use rdf_store::oxigraph_backend::OxigraphCatalogCache;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
@@ -86,35 +85,14 @@ async fn main() {
         "oauth2 bearer gating configuration resolved (oauth2JwksUri unset means both /catalog and /sparql stay unauthenticated)"
     );
 
-    // No broker:participant in the config: a plain in-memory HashMap cache,
-    // seeded with one placeholder sample catalog, no crawler started.
-    //
-    // At least one broker:participant: this connector now works the way EDC's own
-    // federated catalog does - a periodic, config-driven crawl populates a
-    // real RDF (Oxigraph) store, which the DSP catalog endpoint then
-    // serves. In-memory only, same as EDC's own federated-catalog cache:
-    // there is no on-disk persistence option here either, by design, not
-    // as a gap - see `rdf_store::oxigraph_backend`'s module doc for the
-    // backend itself and `crates/crawler`'s doc comments for the crawl
-    // loop. `InMemoryCatalogCache` (a plain `HashMap`, not backed by RDF
-    // at all) stays the default when no participant is configured.
-    type CacheHolderSparql = (
-        Arc<dyn CatalogCache>,
-        Option<Arc<HolderIdentity>>,
-        Option<Arc<rdf_store::oxigraph_backend::OxigraphCatalogCache>>,
-    );
-    let (cache, holder, sparql): CacheHolderSparql = match settings.crawler().cloned() {
+    // One serving mode: an in-memory Oxigraph store backs `GET /catalog`, the
+    // management API and `/sparql`. In-memory only, like EDC's own
+    // federated-catalog cache: there is no on-disk persistence, by design.
+    // With at least one broker:participant, the scheduled crawler fills it;
+    // with none, it stays empty and every route answers from an empty store.
+    let cache = Arc::new(OxigraphCatalogCache::in_memory().expect("open in-memory Oxigraph store"));
+    let holder = match settings.crawler().cloned() {
         Some(config) => {
-            // Kept as a concrete `Arc<OxigraphCatalogCache>` (not just the
-            // `Arc<dyn CatalogCache>` coercion below) purely so `AppState`
-            // can also wire up `/sparql` against it - see
-            // `AppState::sparql`'s own doc comment for why that can't be
-            // recovered from the trait object alone.
-            let store = Arc::new(
-                rdf_store::oxigraph_backend::OxigraphCatalogCache::in_memory()
-                    .expect("open in-memory Oxigraph store"),
-            );
-            let cache: Arc<dyn CatalogCache> = store.clone();
             let holder = config.holder.as_ref().map(build_holder);
             let limits = crawl_limits_from_settings(&settings);
             tracing::info!(
@@ -124,7 +102,7 @@ async fn main() {
                 timeout_ms = limits.participant_timeout.as_millis() as u64,
                 concurrency = limits.concurrency,
                 max_catalog_age_secs = limits.max_catalog_age.as_secs(),
-                "starting scheduled catalog crawler; serving from an in-memory Oxigraph store, with /sparql enabled"
+                "starting scheduled catalog crawler"
             );
             crawler::spawn_scheduler(
                 cache.clone(),
@@ -133,25 +111,16 @@ async fn main() {
                 holder.clone(),
                 limits,
             );
-            (cache, holder, Some(store))
+            holder
         }
         None => {
-            // No crawler configured: the plain in-memory cache, seeded
-            // with one sample catalog - this stands in for a real crawl
-            // result until a broker:participant is configured. No SPARQL backend
-            // either (see `AppState::sparql`'s doc comment): `/sparql`
-            // answers 501 until a real Oxigraph-backed crawl is running.
-            let cache: Arc<dyn CatalogCache> = Arc::new(InMemoryCatalogCache::new());
-            seed_sample_catalog(&*cache)
-                .await
-                .expect("seeding sample catalog failed");
-            (cache, None, None)
+            tracing::info!("no broker:participant configured; the catalog stays empty");
+            None
         }
     };
 
     let mut state = AppState::new(cache)
         .with_holder(holder)
-        .with_sparql(sparql)
         .with_oauth2(oauth2_verifier)
         .with_policy_filter(PolicyFilterConfig::from_settings(&settings))
         .with_sparql_limits(SparqlLimitsConfig::from_settings(&settings));

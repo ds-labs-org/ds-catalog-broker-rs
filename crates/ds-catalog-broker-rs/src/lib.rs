@@ -13,7 +13,6 @@ pub mod config;
 pub mod oauth2;
 pub mod odrl_filter;
 mod routes;
-mod sample;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -21,5 +20,4 @@ mod tests;
 pub use dcp_core::HolderIdentity;
 pub use oauth2::{OAuth2Config, OAuth2Verifier, VerifyError};
 pub use routes::build_router;
-pub use sample::seed_sample_catalog;
 pub use state::{AppState, SparqlLimitsConfig, crawl_limits_from_settings};

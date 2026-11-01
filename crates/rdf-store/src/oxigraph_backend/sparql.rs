@@ -12,21 +12,10 @@ impl OxigraphCatalogCache {
     ///
     /// ## Why this lives here, not on the `CatalogCache` trait
     ///
-    /// SPARQL evaluation is an Oxigraph-specific capability with no
-    /// equivalent in [`crate::memory::InMemoryCatalogCache`] (a plain
-    /// `HashMap`, not an RDF store at all) - forcing every backend to
-    /// implement it would mean either a panic/`Err` stub on the
-    /// in-memory side or inventing a query language the in-memory
-    /// backend could actually serve, neither of which is worth it for
-    /// a backend that exists only to unblock tests and the
-    /// no-crawler-configured default (see this crate's module doc).
-    /// So this is an inherent method on the concrete
-    /// [`OxigraphCatalogCache`] type instead - additive, doesn't touch
-    /// the trait's signature at all. The HTTP layer holds an
-    /// `Option<Arc<OxigraphCatalogCache>>` alongside its
-    /// `Arc<dyn CatalogCache>` and answers "SPARQL not available" (501)
-    /// when it's `None`, i.e. whenever the in-memory backend is
-    /// running.
+    /// SPARQL evaluation is an Oxigraph-specific capability, and the
+    /// `CatalogCache` trait is what the crawler writes through, so this is
+    /// an inherent method on [`OxigraphCatalogCache`] instead - the HTTP
+    /// layer holds the concrete `Arc<OxigraphCatalogCache>`.
     ///
     /// ## Why the whole store, not one named graph, by default
     ///

@@ -4,18 +4,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rdf_store::CatalogCache;
 use rdf_store::oxigraph_backend::OxigraphCatalogCache;
 
 use crate::oauth2::OAuth2Verifier;
 use crate::{HolderIdentity, config, odrl_filter};
 
-/// Shared application state: the cache, behind a trait object so the
-/// concrete backend (in-memory today, RDF-backed later) is an
-/// implementation detail of `main`, not of the router.
+/// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
-    pub cache: Arc<dyn CatalogCache>,
+    /// The Oxigraph store every route serves from: `GET /catalog`, the
+    /// management API and `/sparql` (through
+    /// `OxigraphCatalogCache::sparql_query_json`, which is not on the
+    /// `CatalogCache` trait). The crawler writes into the same store; with
+    /// no participant configured it simply stays empty.
+    pub cache: Arc<OxigraphCatalogCache>,
     /// Shared HTTP client for this connector's own DCP *holder* role's
     /// outbound calls - `reqwest::Client` is cheap to clone (internally
     /// `Arc`-backed) and reuses connection pooling, so one instance lives
@@ -26,16 +28,6 @@ pub struct AppState {
     /// `None` means this connector presents no credential of its own and
     /// the two `/dsp/holder/*` routes (`routes::holder`) 404.
     pub holder: Option<Arc<HolderIdentity>>,
-    /// The concrete Oxigraph-backed cache, held *in addition to* the
-    /// type-erased `cache` field above, purely so `GET`/`POST /sparql` can
-    /// reach `OxigraphCatalogCache::sparql_query_json` - a capability that
-    /// exists on that concrete type, not on the `CatalogCache` trait (see
-    /// that method's own doc comment for why). `Some` exactly when `cache`
-    /// is backed by Oxigraph (i.e. a `broker:participant` is configured, see
-    /// `main.rs`); `None` when it's the plain in-memory backend, in which
-    /// case `/sparql` answers 501 rather than pretending to support a
-    /// query language that backend doesn't implement.
-    pub sparql: Option<Arc<OxigraphCatalogCache>>,
     /// The OAuth2 Bearer resource-server gate for `GET /catalog` and
     /// `GET`/`POST /sparql` - see `oauth2`'s module doc and
     /// `docs/oauth2-bearer-gating-2026-08-28.md`. `Some` means gating is
@@ -124,12 +116,11 @@ pub fn crawl_limits_from_settings(settings: &config::BrokerSettings) -> crawler:
 }
 
 impl AppState {
-    pub fn new(cache: Arc<dyn CatalogCache>) -> Self {
+    pub fn new(cache: Arc<OxigraphCatalogCache>) -> Self {
         Self {
             cache,
             http: reqwest::Client::new(),
             holder: None,
-            sparql: None,
             oauth2: None,
             policy_filter: odrl_filter::PolicyFilterConfig::default(),
             sparql_limits: SparqlLimitsConfig::default(),
@@ -140,13 +131,6 @@ impl AppState {
     /// See the `holder` field's doc comment.
     pub fn with_holder(mut self, holder: Option<Arc<HolderIdentity>>) -> Self {
         self.holder = holder;
-        self
-    }
-
-    /// Builder-style setter wiring up the SPARQL endpoint against a real
-    /// Oxigraph-backed cache. See the `sparql` field's doc comment.
-    pub fn with_sparql(mut self, sparql: Option<Arc<OxigraphCatalogCache>>) -> Self {
-        self.sparql = sparql;
         self
     }
 

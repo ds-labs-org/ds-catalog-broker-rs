@@ -252,7 +252,7 @@
 //!   if `DataService.endpoint_description` is `Some`. Stored as a plain
 //!   literal rather than an IRI even though DCAT's formal range for this
 //!   property is also `rdfs:Resource`: this domain field holds free text
-//!   (e.g. `"dataspace-protocol-http:1.0"`, see `seed_sample_catalog`), not
+//!   (e.g. `"dataspace-protocol-http:1.0"`), not
 //!   a URL, and DCAT's own usage note allows literal values in practice.
 //!
 //! ### Generic properties (`Catalog.properties` / `Dataset.properties`)

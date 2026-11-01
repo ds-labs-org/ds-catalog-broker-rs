@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 use crawler::{CrawlLimits, crawl_once};
 use ds_catalog_broker_rs::config::BrokerSettings;
-use rdf_store::memory::InMemoryCatalogCache;
+use rdf_store::oxigraph_backend::OxigraphCatalogCache;
 use rdf_store::{CatalogCache, CatalogQuery};
 
 const FIXTURE_CONFIG: &str =
@@ -47,7 +47,7 @@ async fn crawls_three_real_edc_instances_and_aggregates_all_seeded_datasets() {
         "expected exactly the three real-EDC participants"
     );
 
-    let cache = InMemoryCatalogCache::new();
+    let cache = OxigraphCatalogCache::in_memory().unwrap();
     let http = reqwest::Client::new();
 
     let summary = crawl_once(
