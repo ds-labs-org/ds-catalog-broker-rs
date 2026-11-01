@@ -43,6 +43,9 @@ pub struct OAuth2Config {
     pub required_scope: Option<String>,
 }
 
+/// The most bytes of JWKS response the verifier reads.
+const MAX_JWKS_BYTES: usize = 1024 * 1024;
+
 /// Failure fetching or parsing the JWKS at [`OAuth2Config::jwks_uri`] -
 /// returned by [`OAuth2Verifier::fetch`]. `main.rs` panics on any of
 /// these at startup, the same failure posture as a bad
@@ -59,8 +62,15 @@ pub enum JwksError {
     Parse {
         uri: String,
         #[source]
-        source: reqwest::Error,
+        source: serde_json::Error,
     },
+    #[error(
+        "JWKS URI {uri} is not allowed: the keys that gate access are fetched over https, or \
+         plain http to a loopback address"
+    )]
+    InsecureUri { uri: String },
+    #[error("JWKS response from {uri} is larger than {limit} bytes")]
+    TooLarge { uri: String, limit: usize },
     #[error(
         "JWKS at {uri} contained no usable key: every entry was either missing a kid, a \
          symmetric (oct) key (never accepted here - see the module doc), or used an \
@@ -139,6 +149,9 @@ impl OAuth2Verifier {
     /// survives that filtering (`JwksError::NoUsableKeys`).
     pub async fn fetch(client: &reqwest::Client, config: OAuth2Config) -> Result<Self, JwksError> {
         let uri = config.jwks_uri.clone();
+        if !reqwest::Url::parse(&uri).is_ok_and(|url| crawler::remote_allowed(&url)) {
+            return Err(JwksError::InsecureUri { uri });
+        }
         let response = client
             .get(&uri)
             .send()
@@ -153,10 +166,23 @@ impl OAuth2Verifier {
                 uri: uri.clone(),
                 source,
             })?;
-        let jwk_set: JwkSet = response.json().await.map_err(|source| JwksError::Parse {
-            uri: uri.clone(),
-            source,
-        })?;
+        let bytes = crawler::read_body_limited(response, MAX_JWKS_BYTES)
+            .await
+            .map_err(|err| match err {
+                crawler::BodyError::Transport(source) => JwksError::Fetch {
+                    uri: uri.clone(),
+                    source,
+                },
+                crawler::BodyError::TooLarge { limit } => JwksError::TooLarge {
+                    uri: uri.clone(),
+                    limit,
+                },
+            })?;
+        let jwk_set: JwkSet =
+            serde_json::from_slice(&bytes).map_err(|source| JwksError::Parse {
+                uri: uri.clone(),
+                source,
+            })?;
 
         let mut keys = HashMap::new();
         for jwk in &jwk_set.keys {
@@ -851,5 +877,35 @@ mod tests {
             .expect(
                 "an RSA JWK with no alg field must be inferred as RS256 and admitted, not skipped",
             );
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_a_jwks_uri_over_plain_http_to_a_named_host() {
+        let err = OAuth2Verifier::fetch(
+            &reqwest::Client::new(),
+            config("http://idp.internal/jwks.json".to_string()),
+        )
+        .await
+        .expect_err("plain http to a named host");
+        assert!(
+            matches!(err, JwksError::InsecureUri { .. }),
+            "expected InsecureUri, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_an_oversized_jwks_response() {
+        let key = generate_key("k1");
+        let padding = "x".repeat(2 * 1024 * 1024);
+        let mut jwk = ec_jwk(&key, None);
+        jwk["padding"] = json!(padding);
+        let jwks_uri = spawn_jwks(json!({"keys": [jwk]})).await;
+        let err = OAuth2Verifier::fetch(&reqwest::Client::new(), config(jwks_uri))
+            .await
+            .expect_err("a JWKS above the size limit");
+        assert!(
+            matches!(err, JwksError::TooLarge { .. }),
+            "expected TooLarge, got {err:?}"
+        );
     }
 }

@@ -77,8 +77,9 @@ Every setting is optional.
 | `broker:crawlIntervalSecs` | `300` | Seconds between the starts of two crawl cycles. Positive integer. |
 | `broker:crawlTimeoutMs` | `30000` | How long one participant's crawl may take, credential presentation and response body included, before it counts as failed. Positive integer. |
 | `broker:crawlConcurrency` | `8` | How many participants are crawled at the same time. Positive integer. |
+| `broker:crawlMaxResponseBytes` | `16777216` | The most bytes of one participant's catalog response the crawler reads (the body is read in chunks and the crawl of that participant fails once it exceeds this). Positive integer. |
 | `broker:catalogMaxAgeSecs` | `86400` | A participant's cached catalog is removed once its last successful crawl is older than this, so a participant that stays down stops being served. A failed crawl keeps the previous catalog until then. Positive integer. |
-| `broker:oauth2JwksUri` | unset | JWKS endpoint for OAuth2 Bearer gating of `/catalog` and `/sparql`. Unset leaves both unauthenticated. See [oauth2-bearer-gating-2026-08-28.md](oauth2-bearer-gating-2026-08-28.md). |
+| `broker:oauth2JwksUri` | unset | JWKS endpoint for OAuth2 Bearer gating of `/catalog` and `/sparql`. Unset leaves both unauthenticated. Must be https, or plain http to a loopback IP address, or the broker does not start; the response is capped at 1 MiB. See [oauth2-bearer-gating-2026-08-28.md](oauth2-bearer-gating-2026-08-28.md). |
 | `broker:oauth2Issuer` | unset | Expected `iss` claim; checked only if set. |
 | `broker:oauth2Audience` | unset | Expected `aud` claim; checked only if set. |
 | `broker:oauth2RequiredScope` | unset | One scope the token's `scope` claim must contain; checked only if set. |
@@ -124,6 +125,13 @@ resource typed `broker:Holder`. Either can be an IRI or a blank node:
     broker:credentialJwsFile "/run/secrets/holder.jws" ;
     broker:requiredScope "org.eclipse.dspace.dcp.vc.type:FederatedCatalogAccessCredential:read" .
 ```
+
+The broker's outbound HTTP client (catalog requests, OID4VP presentations and
+the JWKS fetch) follows a redirect only to the same origin (scheme, host and
+port) as the request that was redirected, and only to https or plain http to
+a loopback address. Any other redirect fails that request, so a redirect
+cannot carry a bearer token or a `vp_token` to another host or down to plain
+http.
 
 Every value is a string literal, except that `broker:catalogRequestUrl` and
 `broker:oid4vpResponseUri` may also be IRIs and `broker:credentialJwsFile`
