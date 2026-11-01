@@ -593,18 +593,14 @@ fn visibility_catalog(visibility: &str, title: &str) -> Catalog {
 }
 
 /// The allow-list a caller who may see only `public` datasets gets.
-fn public_only(catalogs: &[Catalog]) -> BTreeSet<String> {
-    catalogs
+fn public_only(catalog: &Catalog) -> BTreeSet<String> {
+    catalog
+        .datasets
         .iter()
-        .flat_map(|catalog| {
-            catalog
-                .datasets
-                .iter()
-                .filter(|dataset| {
-                    dataset.properties.get("visibility").map(String::as_str) == Some("public")
-                })
-                .map(|dataset| dataset_resource_iri(&catalog.origin_node, &dataset.id))
+        .filter(|dataset| {
+            dataset.properties.get("visibility").map(String::as_str) == Some("public")
         })
+        .map(|dataset| dataset_resource_iri(&catalog.origin_node, &dataset.id))
         .collect()
 }
 
@@ -621,6 +617,7 @@ fn policy_filtered_query_does_not_show_new_data_through_an_old_allow_list() {
     let body = cache
         .sparql_query_json_policy_filtered(
             "SELECT ?o WHERE { ?s ?p ?o }",
+            "k",
             |catalogs| {
                 let allow = public_only(catalogs);
                 if !interleaved {
@@ -652,6 +649,7 @@ fn policy_filtered_query_with_no_overlapping_write_runs_once() {
     let body = cache
         .sparql_query_json_policy_filtered(
             "SELECT ?o WHERE { ?s ?p ?o }",
+            "k",
             |catalogs| {
                 calls += 1;
                 public_only(catalogs)
@@ -674,6 +672,7 @@ fn policy_filtered_query_gives_up_when_the_store_keeps_changing() {
     let mut calls = 0;
     let result = cache.sparql_query_json_policy_filtered(
         "SELECT ?o WHERE { ?s ?p ?o }",
+        "k",
         |catalogs| {
             calls += 1;
             let allow = public_only(catalogs);
@@ -708,6 +707,7 @@ fn policy_filtered_query_waits_out_a_slow_write_without_using_attempts() {
     let body = cache
         .sparql_query_json_policy_filtered(
             "SELECT ?o WHERE { ?s ?p ?o }",
+            "k",
             |catalogs| {
                 calls += 1;
                 public_only(catalogs)
@@ -735,6 +735,7 @@ fn policy_filtered_query_stops_waiting_when_cancelled() {
     };
     let result = cache.sparql_query_json_policy_filtered(
         "SELECT ?o WHERE { ?s ?p ?o }",
+        "k",
         public_only,
         &limits,
     );
@@ -782,6 +783,7 @@ fn policy_filtered_query_cancelled_during_an_attempt_is_not_retried() {
     let mut attempts = 0;
     let result = cache.sparql_query_json_policy_filtered(
         "SELECT ?a ?o WHERE { VALUES ?a { 1 } OPTIONAL { ?s <urn:test:absent> ?o } }",
+        "k",
         |catalogs| {
             attempts += 1;
             public_only(catalogs)
@@ -803,6 +805,7 @@ fn policy_filtered_query_reports_a_storage_failure_during_evaluation_as_a_store_
     install_lookup_hook(|| Some(StorageError::Io(std::io::Error::other("disk gone"))));
     let result = cache.sparql_query_json_policy_filtered(
         "SELECT ?o WHERE { ?s ?p ?o }",
+        "k",
         public_only,
         &SparqlLimits::default(),
     );
@@ -850,6 +853,7 @@ fn policy_filtered_query_does_not_join_old_and_new_graphs_across_a_mid_evaluatio
         .sparql_query_json_policy_filtered(
             "SELECT ?t1 ?t2 WHERE { ?s ?p ?t1 . ?s ?p ?t2 . \
              FILTER(STRSTARTS(STR(?t1), \"title-\") && STRSTARTS(STR(?t2), \"title-\")) }",
+            "k",
             public_only,
             &SparqlLimits::default(),
         )
@@ -897,4 +901,402 @@ fn deleting_a_stored_node_advances_the_write_sequence() {
             .load(std::sync::atomic::Ordering::SeqCst)
             > before
     );
+}
+
+// --- allow-list cache and cancellation (#35) ----------------------------
+
+const TITLES: &str = "SELECT ?o WHERE { ?s ?p ?o }";
+
+/// A second query by the same caller, with no write between, reuses the
+/// allow-list instead of decoding the store again.
+#[test]
+fn policy_filtered_query_reuses_the_allow_list_while_the_store_is_unchanged() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let mut calls = 0;
+    for _ in 0..3 {
+        let body = cache
+            .sparql_query_json_policy_filtered(
+                TITLES,
+                "caller-a",
+                |catalog| {
+                    calls += 1;
+                    public_only(catalog)
+                },
+                &SparqlLimits::default(),
+            )
+            .unwrap();
+        assert!(binding_values(&body).iter().any(|v| v == "title-v1"));
+    }
+    assert_eq!(calls, 1);
+}
+
+/// A write invalidates every cached allow-list, and the rebuilt one
+/// reflects the new policy.
+#[test]
+fn policy_filtered_query_rebuilds_the_allow_list_after_a_write() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let run = |cache: &OxigraphCatalogCache| {
+        binding_values(
+            &cache
+                .sparql_query_json_policy_filtered(
+                    TITLES,
+                    "caller-a",
+                    public_only,
+                    &SparqlLimits::default(),
+                )
+                .unwrap(),
+        )
+    };
+    assert!(run(&cache).iter().any(|v| v == "title-v1"));
+    cache
+        .store_catalog(visibility_catalog("private", "title-v2"))
+        .unwrap();
+    let values = run(&cache);
+    assert!(
+        !values.iter().any(|v| v.starts_with("title-")),
+        "{values:?}"
+    );
+}
+
+/// Allow-lists are per key: one caller's list is never served to another.
+#[test]
+fn policy_filtered_query_does_not_share_allow_lists_between_keys() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let mut calls = 0;
+    for key in ["caller-a", "caller-b"] {
+        cache
+            .sparql_query_json_policy_filtered(
+                TITLES,
+                key,
+                |catalog| {
+                    calls += 1;
+                    if key == "caller-a" {
+                        public_only(catalog)
+                    } else {
+                        BTreeSet::new()
+                    }
+                },
+                &SparqlLimits::default(),
+            )
+            .unwrap();
+    }
+    assert_eq!(calls, 2);
+}
+
+/// Building the allow-list stops between catalogs once cancelled.
+#[test]
+fn policy_filtered_query_stops_building_the_allow_list_when_cancelled() {
+    let cache = cache();
+    for node in ["node-1", "node-2", "node-3"] {
+        let mut catalog = visibility_catalog("public", "t");
+        catalog.origin_node = NodeId::new(node);
+        cache.store_catalog(catalog).unwrap();
+    }
+    let token = CancellationToken::new();
+    let limits = SparqlLimits {
+        cancellation: Some(token.clone()),
+        ..SparqlLimits::default()
+    };
+    let mut calls = 0;
+    let result = cache.sparql_query_json_policy_filtered(
+        TITLES,
+        "k",
+        |catalog| {
+            calls += 1;
+            // The second catalog is still being decided when the request
+            // is cancelled, so its answer is not kept.
+            if calls == 2 {
+                token.cancel();
+            }
+            public_only(catalog)
+        },
+        &limits,
+    );
+    assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+    assert_eq!(calls, 2);
+    // The partial list was not cached as a complete one; the next build
+    // resumes and decides only the catalogs not yet fully decided.
+    let mut again = 0;
+    cache
+        .sparql_query_json_policy_filtered(
+            TITLES,
+            "k",
+            |catalog| {
+                again += 1;
+                public_only(catalog)
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(again, 2);
+}
+
+/// A cached allow-list expires, since policy decisions can depend on the
+/// clock.
+#[test]
+fn policy_filtered_query_allow_list_expires() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    cache
+        .sparql_query_json_policy_filtered(TITLES, "k", public_only, &SparqlLimits::default())
+        .unwrap();
+    for entry in cache.allow_lists.lock().unwrap().values_mut() {
+        entry.built_at -= ALLOW_LIST_CACHE_TTL;
+    }
+    let mut calls = 0;
+    cache
+        .sparql_query_json_policy_filtered(
+            TITLES,
+            "k",
+            |catalog| {
+                calls += 1;
+                public_only(catalog)
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(calls, 1);
+}
+
+/// A build slower than the request time limit finishes over several
+/// requests: each cancelled attempt keeps its progress, and the final one
+/// caches the complete list.
+#[test]
+fn policy_filtered_query_finishes_a_slow_build_across_cancelled_requests() {
+    let cache = cache();
+    for node in ["node-1", "node-2", "node-3"] {
+        let mut catalog = visibility_catalog("public", "t");
+        catalog.origin_node = NodeId::new(node);
+        cache.store_catalog(catalog).unwrap();
+    }
+    let mut decided = 0;
+    // Each request fully decides one catalog, then is cancelled while
+    // deciding the next one, whose answer is discarded.
+    for attempt in 0..3 {
+        let token = CancellationToken::new();
+        let limits = SparqlLimits {
+            cancellation: Some(token.clone()),
+            ..SparqlLimits::default()
+        };
+        let mut calls_this_request = 0;
+        let result = cache.sparql_query_json_policy_filtered(
+            TITLES,
+            "slow",
+            |catalog| {
+                decided += 1;
+                calls_this_request += 1;
+                if calls_this_request == 2 {
+                    token.cancel();
+                }
+                public_only(catalog)
+            },
+            &limits,
+        );
+        if attempt < 2 {
+            assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+        }
+    }
+    // 2 + 2 + 1: the cancelled catalog of the first two requests is decided
+    // again by the next one.
+    assert_eq!(decided, 5);
+    // The list is now complete and cached: no further decoding.
+    let mut after = 0;
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            TITLES,
+            "slow",
+            |catalog| {
+                after += 1;
+                public_only(catalog)
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(after, 0);
+    assert!(binding_values(&body).iter().any(|v| v == "t"));
+}
+
+/// Progress from a cancelled build is dropped when a write lands.
+#[test]
+fn policy_filtered_query_drops_partial_progress_after_a_write() {
+    let cache = cache();
+    for node in ["node-1", "node-2"] {
+        let mut catalog = visibility_catalog("public", "t");
+        catalog.origin_node = NodeId::new(node);
+        cache.store_catalog(catalog).unwrap();
+    }
+    let token = CancellationToken::new();
+    let limits = SparqlLimits {
+        cancellation: Some(token.clone()),
+        ..SparqlLimits::default()
+    };
+    let _ = cache.sparql_query_json_policy_filtered(
+        TITLES,
+        "k",
+        |catalog| {
+            token.cancel();
+            public_only(catalog)
+        },
+        &limits,
+    );
+    let mut catalog = visibility_catalog("public", "t");
+    catalog.origin_node = NodeId::new("node-3");
+    cache.store_catalog(catalog).unwrap();
+    let mut calls = 0;
+    cache
+        .sparql_query_json_policy_filtered(
+            TITLES,
+            "k",
+            |catalog| {
+                calls += 1;
+                public_only(catalog)
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(calls, 3);
+}
+
+/// A catalog with `count` public datasets titled `d-0`, `d-1`, ...
+fn many_datasets_catalog(count: usize) -> Catalog {
+    let mut catalog = Catalog::new("cat-many", NodeId::new("node-many"));
+    for index in 0..count {
+        let mut properties = BTreeMap::new();
+        properties.insert("title".to_string(), format!("d-{index}"));
+        catalog.datasets.push(Dataset {
+            id: format!("ds-{index}"),
+            properties,
+            distributions: Vec::new(),
+            policies: Vec::new(),
+        });
+    }
+    catalog
+}
+
+/// An allow-list callback that, like the broker's, stops deciding datasets
+/// once `cancelled` is true and returns what it has so far.
+fn allow_until_cancelled(catalog: &Catalog, cancelled: &dyn Fn() -> bool) -> BTreeSet<String> {
+    let mut visible = BTreeSet::new();
+    for dataset in &catalog.datasets {
+        if cancelled() {
+            return visible;
+        }
+        visible.insert(dataset_resource_iri(&catalog.origin_node, &dataset.id));
+    }
+    visible
+}
+
+/// A request cancelled while one catalog is being decided gets a partial
+/// result for it. That catalog must not be recorded as decided: the
+/// resumed build, same key and write sequence, has to decide it again.
+#[test]
+fn policy_filtered_query_resumes_a_catalog_cancelled_mid_decision() {
+    let cache = cache();
+    cache.store_catalog(many_datasets_catalog(6)).unwrap();
+    let token = CancellationToken::new();
+    let limits = SparqlLimits {
+        cancellation: Some(token.clone()),
+        ..SparqlLimits::default()
+    };
+    let seen = std::cell::Cell::new(0);
+    let cancelled = || {
+        seen.set(seen.get() + 1);
+        if seen.get() > 3 {
+            token.cancel();
+        }
+        token.is_cancelled()
+    };
+    let result = cache.sparql_query_json_policy_filtered(
+        TITLES,
+        "k",
+        |catalog| allow_until_cancelled(catalog, &cancelled),
+        &limits,
+    );
+    assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            TITLES,
+            "k",
+            |catalog| allow_until_cancelled(catalog, &|| false),
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    let values = binding_values(&body);
+    for index in 0..6 {
+        assert!(
+            values.iter().any(|v| v == &format!("d-{index}")),
+            "d-{index} missing: {values:?}"
+        );
+    }
+}
+
+/// Runs one filtered query for `key`, so the allow-list is cached under it.
+fn query_as(cache: &OxigraphCatalogCache, key: &str) {
+    cache
+        .sparql_query_json_policy_filtered(TITLES, key, public_only, &SparqlLimits::default())
+        .unwrap();
+}
+
+/// A caller with many distinct keys fills the cache. It must evict one
+/// entry (the oldest), not flush every other caller's.
+#[test]
+fn allow_list_cache_evicts_one_entry_when_full() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    for index in 0..64 {
+        query_as(&cache, &format!("key-{index}"));
+        // Distinct build times, so "oldest" is well defined.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    query_as(&cache, "key-64");
+    let entries = cache.allow_lists.lock().unwrap();
+    assert_eq!(entries.len(), 64);
+    assert!(!entries.contains_key("key-0"));
+    for index in 1..=64 {
+        assert!(entries.contains_key(&format!("key-{index}")), "key-{index}");
+    }
+}
+
+/// The same for the resume cache of cancelled builds.
+#[test]
+fn partial_cache_evicts_one_entry_when_full() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    for index in 0..65 {
+        let token = CancellationToken::new();
+        let limits = SparqlLimits {
+            cancellation: Some(token.clone()),
+            ..SparqlLimits::default()
+        };
+        let result = cache.sparql_query_json_policy_filtered(
+            TITLES,
+            &format!("key-{index}"),
+            |catalog| {
+                token.cancel();
+                public_only(catalog)
+            },
+            &limits,
+        );
+        assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let partials = cache.partial_allow_lists.lock().unwrap();
+    assert_eq!(partials.len(), 64);
+    assert!(!partials.contains_key("key-0"));
+    assert!(partials.contains_key("key-64"));
 }

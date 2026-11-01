@@ -132,8 +132,8 @@ pub(super) fn service_is_visible(
     used_by_visible.contains(service_id) || !used_by_any.contains(service_id)
 }
 
-/// What the caller identified by `engine_claims` may see across every
-/// harvested `catalogs`, as resource IRIs spelled exactly as
+/// What the caller identified by `engine_claims` may see in one harvested
+/// `catalog`, as resource IRIs spelled exactly as
 /// `rdf_store::oxigraph_backend::dataset_resource_iri`/`service_resource_iri`
 /// (and therefore a real SPARQL binding) would spell them. Visibility is
 /// the same per-dataset decision [`filter_catalogs_by_policy`] already
@@ -142,46 +142,49 @@ pub(super) fn service_is_visible(
 ///
 /// Returns the visible datasets plus every data service a visible
 /// dataset's distribution uses, or that no dataset uses at all
-/// ([`service_is_visible`]): the allow-list
-/// `OxigraphCatalogCache::sparql_query_json_policy_filtered` evaluates over.
+/// ([`service_is_visible`]). The union over every catalog is the
+/// allow-list `OxigraphCatalogCache::sparql_query_json_policy_filtered`
+/// evaluates over.
+///
+/// `cancelled` is checked before each dataset; once it returns true the
+/// result is partial and the caller discards it.
 pub(super) fn visible_resource_iris(
-    catalogs: &[Catalog],
+    catalog: &Catalog,
     engine_claims: &engine::Claims,
     state: &AppState,
+    cancelled: &dyn Fn() -> bool,
 ) -> BTreeSet<String> {
     let mut visible_resources = BTreeSet::new();
-    for catalog in catalogs {
-        let node = &catalog.origin_node;
-        let visible: Vec<&Dataset> = catalog
-            .datasets
-            .iter()
-            .filter(|dataset| {
-                odrl_filter::dataset_is_visible(
-                    dataset,
-                    engine_claims,
-                    CATALOG_VISIBILITY_ACTION,
-                    &state.policy_filter,
-                )
-            })
-            .collect();
-        for dataset in &visible {
-            visible_resources.insert(rdf_store::oxigraph_backend::dataset_resource_iri(
-                node,
-                &dataset.id,
-            ));
+    let node = &catalog.origin_node;
+    let mut visible: Vec<&Dataset> = Vec::new();
+    for dataset in &catalog.datasets {
+        if cancelled() {
+            return visible_resources;
         }
-        let used_by_any = services_used_by(catalog.datasets.iter());
-        let used_by_visible = services_used_by(visible.into_iter());
-        visible_resources.extend(
-            catalog
-                .data_services
-                .iter()
-                .filter(|service| service_is_visible(&service.id, &used_by_any, &used_by_visible))
-                .map(|service| {
-                    rdf_store::oxigraph_backend::service_resource_iri(node, &service.id)
-                }),
-        );
+        if odrl_filter::dataset_is_visible(
+            dataset,
+            engine_claims,
+            CATALOG_VISIBILITY_ACTION,
+            &state.policy_filter,
+        ) {
+            visible.push(dataset);
+        }
     }
+    for dataset in &visible {
+        visible_resources.insert(rdf_store::oxigraph_backend::dataset_resource_iri(
+            node,
+            &dataset.id,
+        ));
+    }
+    let used_by_any = services_used_by(catalog.datasets.iter());
+    let used_by_visible = services_used_by(visible.into_iter());
+    visible_resources.extend(
+        catalog
+            .data_services
+            .iter()
+            .filter(|service| service_is_visible(&service.id, &used_by_any, &used_by_visible))
+            .map(|service| rdf_store::oxigraph_backend::service_resource_iri(node, &service.id)),
+    );
     visible_resources
 }
 

@@ -40,6 +40,18 @@ Three serving surfaces, all non-DSP:
   doc comment for the full contract. Each query is stopped with `503`
   after `broker:sparqlQueryTimeoutMs` (default 10000), and a result over
   `broker:sparqlMaxRows` rows (default 10000) is rejected with `400`.
+  A caller's policy allow-list is cached for up to 5 seconds
+  (`ALLOW_LIST_CACHE_TTL`), so repeated queries do not decode the store
+  each time. The cache key is the claim set the policy engine receives,
+  without `jti`, `iat`, `exp` and `nbf`, so a client that rotates tokens
+  keeps its entry. A crawl write does not remove entries: it raises the
+  store's write sequence, so older entries stop matching and stay until
+  they expire or are evicted (64 entries; a new key evicts the oldest).
+  A build that is cancelled by the time limit keeps the catalogs it fully
+  decided for 30 seconds (`PARTIAL_ALLOW_LIST_TTL`), under the same caller
+  key and write sequence, and the next request resumes from them. Resume
+  saves the per-catalog policy evaluation only; every attempt still scans
+  the whole store.
 - **`POST /api/management/v4/catalogs/request`** — wire-compatible with
   real EDC Federated Catalog UI tooling
   (`edc-federated-catalog-client`'s `list_offers`/`get_offer_by_dataset_id`):
