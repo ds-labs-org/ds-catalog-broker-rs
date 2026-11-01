@@ -52,14 +52,14 @@ fn crawl_limits_come_from_the_broker_config() {
     let settings = config::BrokerSettings::from_values([
         ("crawlTimeoutMs".to_string(), "1500".to_string()),
         ("crawlConcurrency".to_string(), "2".to_string()),
-        ("catalogMaxAgeSecs".to_string(), "0".to_string()),
-    ]);
+    ])
+    .unwrap();
     let limits = crawl_limits_from_settings(&settings);
     assert_eq!(limits.participant_timeout, Duration::from_millis(1500));
     assert_eq!(limits.concurrency, 2);
     assert_eq!(
         limits.max_catalog_age,
         crawler::CrawlLimits::default().max_catalog_age,
-        "a non-positive value falls back to the default"
+        "an unset value is the default"
     );
 }

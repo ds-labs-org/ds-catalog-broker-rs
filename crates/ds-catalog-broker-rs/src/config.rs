@@ -23,7 +23,15 @@
 //! same graph, linked from `broker:BrokerConfig` with `broker:participant` (any number) and
 //! `broker:holder` (at most one); see [`BrokerSettings::crawler`]. They are read strictly: a
 //! missing required property, a value that doesn't parse, or a link to a resource of the wrong
-//! type stops the broker, unlike a bad scalar setting, which falls back to its default.
+//! type stops the broker.
+//!
+//! # Every value is checked when it is read
+//!
+//! Each [`Setting`] has a [`SettingKind`]. A value that does not fit it (a non-positive
+//! integer, an unknown enum value, a boolean spelled `yes`) is a
+//! [`BrokerConfigError::InvalidValue`], and a `broker:` property the broker does not know, on
+//! any resource, is a [`BrokerConfigError::UnknownProperty`]: the broker refuses to start
+//! rather than run with a default the operator did not ask for.
 //!
 //! # No config store at all is not an error
 //!
@@ -39,7 +47,7 @@
 //! `config_graph.ttl` from its `.bak.N` backups - both writes - see
 //! [`BrokerSettings::from_location`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use contreforts_config::{ConfigStore, ConfigStoreConfig, ConfigStoreError};
@@ -60,40 +68,96 @@ pub const CONFIG_GRAPH_FILE: &str = "config_graph.ttl";
 /// `contreforts-config`'s own datadir override (private to that crate, so spelled again here).
 pub const CONFIG_STORE_PATH_ENV: &str = "CONFIG_STORE_PATH";
 
+/// What a [`Setting`]'s value must look like. Checked when the config is read, so a value
+/// that does not parse stops the broker instead of silently becoming the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingKind {
+    /// Any string.
+    Text,
+    /// An integer greater than zero.
+    PositiveInteger,
+    /// `true`, `false`, `1` or `0` (the `xsd:boolean` lexical forms).
+    Boolean,
+    /// One of the listed strings, exactly.
+    OneOf(&'static [&'static str]),
+}
+
 /// One configuration setting: a property in [`BROKER_NS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Setting {
     pub property: &'static str,
+    pub kind: SettingKind,
 }
 
 impl Setting {
-    const fn new(property: &'static str) -> Self {
-        Self { property }
+    const fn new(property: &'static str, kind: SettingKind) -> Self {
+        Self { property, kind }
     }
 
     /// The property's full IRI.
     pub fn iri(&self) -> String {
         format!("{BROKER_NS}{}", self.property)
     }
+
+    /// Check `value` against [`Self::kind`]; the error is the reason it does not fit.
+    pub fn check(&self, value: &str) -> Result<(), String> {
+        match self.kind {
+            SettingKind::Text => Ok(()),
+            SettingKind::PositiveInteger => parse_positive_integer(value)
+                .map(drop)
+                .ok_or_else(|| "expected a positive integer".to_string()),
+            SettingKind::Boolean => parse_boolean(value)
+                .map(drop)
+                .ok_or_else(|| BOOLEAN_REASON.to_string()),
+            SettingKind::OneOf(allowed) if allowed.contains(&value) => Ok(()),
+            SettingKind::OneOf(allowed) => Err(format!("expected one of {}", allowed.join(", "))),
+        }
+    }
 }
 
-pub const HTTP_API_ADDR: Setting = Setting::new("httpApiAddr");
-pub const CRAWL_INTERVAL_SECS: Setting = Setting::new("crawlIntervalSecs");
-pub const CRAWL_TIMEOUT_MS: Setting = Setting::new("crawlTimeoutMs");
-pub const CRAWL_CONCURRENCY: Setting = Setting::new("crawlConcurrency");
-pub const CATALOG_MAX_AGE_SECS: Setting = Setting::new("catalogMaxAgeSecs");
-pub const OAUTH2_JWKS_URI: Setting = Setting::new("oauth2JwksUri");
-pub const OAUTH2_ISSUER: Setting = Setting::new("oauth2Issuer");
-pub const OAUTH2_AUDIENCE: Setting = Setting::new("oauth2Audience");
-pub const OAUTH2_REQUIRED_SCOPE: Setting = Setting::new("oauth2RequiredScope");
-pub const SPARQL_QUERY_TIMEOUT_MS: Setting = Setting::new("sparqlQueryTimeoutMs");
-pub const SPARQL_MAX_ROWS: Setting = Setting::new("sparqlMaxRows");
-pub const POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION: Setting =
-    Setting::new("policyFilterUnmappableConstraintAction");
-pub const POLICY_FILTER_NO_POLICY_VISIBILITY: Setting =
-    Setting::new("policyFilterNoPolicyVisibility");
+fn parse_positive_integer(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok().filter(|n| *n > 0)
+}
+
+/// The `xsd:boolean` lexical forms.
+fn parse_boolean(value: &str) -> Option<bool> {
+    match value.trim() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// The values of `broker:policyFilterUnmappableConstraintAction`.
+pub const UNMAPPABLE_CONSTRAINT_ACTIONS: &[&str] = &["skip", "drop_policy", "hide_dataset"];
+/// The values of `broker:policyFilterNoPolicyVisibility`.
+pub const NO_POLICY_VISIBILITIES: &[&str] = &["open", "closed"];
+
+pub const HTTP_API_ADDR: Setting = Setting::new("httpApiAddr", SettingKind::Text);
+pub const CRAWL_INTERVAL_SECS: Setting =
+    Setting::new("crawlIntervalSecs", SettingKind::PositiveInteger);
+pub const CRAWL_TIMEOUT_MS: Setting = Setting::new("crawlTimeoutMs", SettingKind::PositiveInteger);
+pub const CRAWL_CONCURRENCY: Setting =
+    Setting::new("crawlConcurrency", SettingKind::PositiveInteger);
+pub const CATALOG_MAX_AGE_SECS: Setting =
+    Setting::new("catalogMaxAgeSecs", SettingKind::PositiveInteger);
+pub const OAUTH2_JWKS_URI: Setting = Setting::new("oauth2JwksUri", SettingKind::Text);
+pub const OAUTH2_ISSUER: Setting = Setting::new("oauth2Issuer", SettingKind::Text);
+pub const OAUTH2_AUDIENCE: Setting = Setting::new("oauth2Audience", SettingKind::Text);
+pub const OAUTH2_REQUIRED_SCOPE: Setting = Setting::new("oauth2RequiredScope", SettingKind::Text);
+pub const SPARQL_QUERY_TIMEOUT_MS: Setting =
+    Setting::new("sparqlQueryTimeoutMs", SettingKind::PositiveInteger);
+pub const SPARQL_MAX_ROWS: Setting = Setting::new("sparqlMaxRows", SettingKind::PositiveInteger);
+pub const POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION: Setting = Setting::new(
+    "policyFilterUnmappableConstraintAction",
+    SettingKind::OneOf(UNMAPPABLE_CONSTRAINT_ACTIONS),
+);
+pub const POLICY_FILTER_NO_POLICY_VISIBILITY: Setting = Setting::new(
+    "policyFilterNoPolicyVisibility",
+    SettingKind::OneOf(NO_POLICY_VISIBILITIES),
+);
 pub const POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED: Setting =
-    Setting::new("policyFilterRunWhenOauth2Disabled");
+    Setting::new("policyFilterRunWhenOauth2Disabled", SettingKind::Boolean);
 
 /// Every setting this broker reads, in `docs/configuration.md`'s order.
 pub const ALL_SETTINGS: &[Setting] = &[
@@ -112,6 +176,23 @@ pub const ALL_SETTINGS: &[Setting] = &[
     POLICY_FILTER_NO_POLICY_VISIBILITY,
     POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED,
 ];
+
+/// The settings that only matter when there is a participant to crawl.
+const CRAWLER_SETTINGS: &[Setting] = &[
+    CRAWL_INTERVAL_SECS,
+    CRAWL_TIMEOUT_MS,
+    CRAWL_CONCURRENCY,
+    CATALOG_MAX_AGE_SECS,
+];
+
+/// The `broker:` classes this broker reads.
+const KNOWN_CLASSES: &[&str] = &["BrokerConfig", "Participant", "Holder"];
+
+/// Why a value is not a boolean.
+const BOOLEAN_REASON: &str = "expected true, false, 1 or 0";
+
+/// How error messages name the `broker:BrokerConfig` resource.
+const CONFIG_RESOURCE: &str = "the broker:BrokerConfig resource";
 
 /// The crawl interval when `broker:crawlIntervalSecs` is unset.
 pub const DEFAULT_CRAWL_INTERVAL_SECS: u64 = 300;
@@ -161,6 +242,15 @@ pub enum BrokerConfigError {
         property: String,
         count: usize,
     },
+    #[error("{resource} has broker:{property}, which this broker does not know")]
+    UnknownProperty { resource: String, property: String },
+    #[error(
+        "{resource} uses broker:{term}, but is neither the broker:BrokerConfig resource nor a \
+         participant or holder linked from it"
+    )]
+    Unattached { resource: String, term: String },
+    #[error("{resource} is typed broker:{class}, which this broker does not know")]
+    UnknownClass { resource: String, class: String },
     #[error("{resource} has no broker:{property}, which is required")]
     MissingProperty { resource: String, property: String },
     #[error("broker:{property} on {resource} is {value:?}: {reason}")]
@@ -248,7 +338,7 @@ impl std::fmt::Display for ConfigLocation {
 /// The settings read from the Turtle file, keyed by [`Setting::property`].
 #[derive(Debug, Clone, Default)]
 pub struct BrokerSettings {
-    values: HashMap<String, String>,
+    values: BTreeMap<String, String>,
     /// The participant registry and holder; `None` when the config lists no participant.
     crawler: Option<ParticipantsConfig>,
     /// Where the values came from. `None` when no config was read.
@@ -379,24 +469,43 @@ impl BrokerSettings {
     /// from `store`'s [`CONFIG_GRAPH`].
     fn from_graph(store: &Store) -> Result<Self, BrokerConfigError> {
         let graph = ConfigGraph::new(store);
+        graph.reject_unknown_classes()?;
         let mut configs = graph.subjects_of_type("BrokerConfig")?;
         if configs.len() > 1 {
             return Err(BrokerConfigError::MultipleConfigResources(configs.len()));
         }
         let Some(config) = configs.pop() else {
+            graph.reject_unattached(&[])?;
             return Ok(Self::default());
         };
 
-        let resource = "the broker:BrokerConfig resource".to_string();
+        let resource = CONFIG_RESOURCE.to_string();
         let mut properties = graph.properties(&config)?;
         let participants = properties.remove(PARTICIPANT_LINK).unwrap_or_default();
         let holders = properties.remove(HOLDER_LINK).unwrap_or_default();
         let known: Vec<&str> = ALL_SETTINGS.iter().map(|s| s.property).collect();
         let values = single_values(&resource, properties, &known)?
             .into_iter()
-            .map(|(property, term)| (property, term_value(&term)));
-        let mut settings = Self::from_values(values);
-        settings.crawler = settings.read_crawler(&graph, &resource, participants, holders)?;
+            .map(|(property, term)| match term {
+                Term::BlankNode(node) => Err(BrokerConfigError::InvalidValue {
+                    resource: resource.clone(),
+                    property,
+                    value: node.to_string(),
+                    reason: "expected a literal or an IRI".to_string(),
+                }),
+                term => Ok((property, term_value(&term))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut settings = Self::from_values(values)?;
+        settings.crawler =
+            settings.read_crawler(&graph, &resource, participants.clone(), holders.clone())?;
+
+        // Every `broker:` triple must have been read above; one on any other subject would
+        // otherwise be ignored without a word.
+        let mut attached = vec![Term::from(config)];
+        attached.extend(participants);
+        attached.extend(holders);
+        graph.reject_unattached(&attached)?;
         Ok(settings)
     }
 
@@ -418,16 +527,7 @@ impl BrokerSettings {
                 count: holders.len(),
             });
         }
-        if participants.is_empty() {
-            if !holders.is_empty() || self.get(CRAWL_INTERVAL_SECS).is_some() {
-                tracing::warn!(
-                    "broker:holder or broker:crawlIntervalSecs is set but no broker:participant \
-                     is; the crawler stays off"
-                );
-            }
-            return Ok(None);
-        }
-
+        // Read the holder even when there is no participant, so a bad one is still an error.
         let holder = match holders.into_iter().next() {
             Some(term) => Some(read_holder(
                 graph,
@@ -435,6 +535,23 @@ impl BrokerSettings {
             )?),
             None => None,
         };
+        if participants.is_empty() {
+            let inert: Vec<&str> = CRAWLER_SETTINGS
+                .iter()
+                .filter(|setting| self.get(**setting).is_some())
+                .map(|setting| setting.property)
+                .chain(holder.as_ref().map(|_| HOLDER_LINK))
+                .collect();
+            if !inert.is_empty() {
+                tracing::warn!(
+                    properties = ?inert,
+                    "crawler properties are set but no broker:participant is; the crawler \
+                     stays off and they have no effect"
+                );
+            }
+            return Ok(None);
+        }
+
         let mut entries = participants
             .into_iter()
             .map(|term| {
@@ -455,24 +572,36 @@ impl BrokerSettings {
         )?))
     }
 
-    /// Build from already-read values, keyed by [`Setting::property`]. Warns about any
-    /// property this broker doesn't know - a typo'd property should be visible in the logs,
-    /// not silently ignored.
-    pub fn from_values(values: impl IntoIterator<Item = (String, String)>) -> Self {
-        let values: HashMap<String, String> = values.into_iter().collect();
-        for property in values.keys() {
-            if !ALL_SETTINGS.iter().any(|s| s.property == property) {
-                tracing::warn!(
-                    property,
-                    "unknown broker:{property} in the config graph; ignored"
-                );
-            }
+    /// Build from already-read values, keyed by [`Setting::property`]. A property this broker
+    /// doesn't know, or a value that doesn't fit its [`SettingKind`], is an error.
+    pub fn from_values(
+        values: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, BrokerConfigError> {
+        let values: BTreeMap<String, String> = values.into_iter().collect();
+        // A `BTreeMap`, so that with several bad values the same one is reported every time.
+        for (property, value) in &values {
+            let resource = || CONFIG_RESOURCE.to_string();
+            let setting = ALL_SETTINGS
+                .iter()
+                .find(|s| s.property == property)
+                .ok_or_else(|| BrokerConfigError::UnknownProperty {
+                    resource: resource(),
+                    property: property.clone(),
+                })?;
+            setting
+                .check(value)
+                .map_err(|reason| BrokerConfigError::InvalidValue {
+                    resource: resource(),
+                    property: property.clone(),
+                    value: value.clone(),
+                    reason,
+                })?;
         }
-        Self {
+        Ok(Self {
             values,
             crawler: None,
             source: None,
-        }
+        })
     }
 
     /// The participant registry and holder identity, or `None` when the config lists no
@@ -486,21 +615,16 @@ impl BrokerSettings {
         self.values.get(setting.property).cloned()
     }
 
-    /// `setting` as a positive integer; `None` when unset, or (with a warning) when it is not
-    /// one.
+    /// `setting` as a positive integer; `None` when unset. The value was checked when it was
+    /// read, so `None` also covers asking for a setting of another [`SettingKind`].
     pub fn positive_integer(&self, setting: Setting) -> Option<usize> {
-        let value = self.get(setting)?;
-        match value.trim().parse::<usize>() {
-            Ok(parsed) if parsed > 0 => Some(parsed),
-            _ => {
-                tracing::warn!(
-                    property = setting.property,
-                    value,
-                    "expected a positive integer; falling back to the default"
-                );
-                None
-            }
-        }
+        parse_positive_integer(self.values.get(setting.property)?)
+    }
+
+    /// `setting` as a boolean; `None` when unset. The value was checked when it was read, so
+    /// `None` also covers asking for a setting of another [`SettingKind`].
+    pub fn boolean(&self, setting: Setting) -> Option<bool> {
+        parse_boolean(self.values.get(setting.property)?)
     }
 
     /// Where the values were read from, if anywhere.
@@ -559,6 +683,58 @@ impl<'a> ConfigGraph<'a> {
             Some(Err(err)) => Err(BrokerConfigError::Query(err.to_string())),
             found => Ok(found.is_some()),
         }
+    }
+
+    /// Fail on an `rdf:type broker:<class>` this broker does not read.
+    fn reject_unknown_classes(&self) -> Result<(), BrokerConfigError> {
+        for quad in
+            self.store
+                .quads_for_pattern(None, Some(rdf::TYPE), None, Some(self.graph_name()))
+        {
+            let quad = quad.map_err(|err| BrokerConfigError::Query(err.to_string()))?;
+            let Term::NamedNode(class) = &quad.object else {
+                continue;
+            };
+            if let Some(local) = class.as_str().strip_prefix(BROKER_NS)
+                && !KNOWN_CLASSES.contains(&local)
+            {
+                return Err(BrokerConfigError::UnknownClass {
+                    resource: describe(self, &quad.subject),
+                    class: local.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail on a subject outside `attached` that has a `broker:` property or class.
+    fn reject_unattached(&self, attached: &[Term]) -> Result<(), BrokerConfigError> {
+        for quad in self
+            .store
+            .quads_for_pattern(None, None, None, Some(self.graph_name()))
+        {
+            let quad = quad.map_err(|err| BrokerConfigError::Query(err.to_string()))?;
+            let term = match (
+                quad.predicate.as_str().strip_prefix(BROKER_NS),
+                &quad.object,
+            ) {
+                (Some(local), _) => local.to_string(),
+                (None, Term::NamedNode(class)) if quad.predicate == rdf::TYPE => {
+                    match class.as_str().strip_prefix(BROKER_NS) {
+                        Some(local) => local.to_string(),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if !attached.contains(&Term::from(quad.subject.clone())) {
+                return Err(BrokerConfigError::Unattached {
+                    resource: describe(self, &quad.subject),
+                    term,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// `subject`'s `broker:` properties, keyed by local name, with every value of each.
@@ -638,8 +814,7 @@ fn reject_unlinked(
     Ok(())
 }
 
-/// Drop, with a warning, every property not in `known`, whatever its values; reject a known
-/// one with more than one value.
+/// Reject a property not in `known`, and a known one with more than one value.
 fn single_values(
     resource: &str,
     properties: BTreeMap<String, Vec<Term>>,
@@ -647,18 +822,13 @@ fn single_values(
 ) -> Result<BTreeMap<String, Term>, BrokerConfigError> {
     properties
         .into_iter()
-        .filter(|(property, _)| {
-            let is_known = known.contains(&property.as_str());
-            if !is_known {
-                tracing::warn!(
-                    property,
-                    resource,
-                    "unknown broker:{property} on {resource}; ignored"
-                );
-            }
-            is_known
-        })
         .map(|(property, mut terms)| {
+            if !known.contains(&property.as_str()) {
+                return Err(BrokerConfigError::UnknownProperty {
+                    resource: resource.to_string(),
+                    property,
+                });
+            }
             if terms.len() > 1 {
                 return Err(BrokerConfigError::MultipleValues {
                     resource: resource.to_string(),
@@ -736,6 +906,74 @@ impl Properties {
         }
     }
 
+    /// `property` as a non-blank string.
+    fn non_empty(&self, property: &str) -> Result<String, BrokerConfigError> {
+        let value = self.required(property)?;
+        if value.trim().is_empty() {
+            return Err(self.invalid(property, value, "empty".to_string()));
+        }
+        Ok(value)
+    }
+
+    /// `property` as an absolute `http(s)` URL, if set.
+    fn optional_http_url(&self, property: &str) -> Result<Option<String>, BrokerConfigError> {
+        let Some(value) = self.optional(property)? else {
+            return Ok(None);
+        };
+        match Url::parse(&value) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(Some(value)),
+            _ => Err(self.invalid(
+                property,
+                value,
+                "expected an absolute http or https URL".to_string(),
+            )),
+        }
+    }
+
+    /// `property` as a DID (`did:<method>:<method-specific id>`), if set.
+    fn optional_did(&self, property: &str) -> Result<Option<String>, BrokerConfigError> {
+        let Some(value) = self.optional(property)? else {
+            return Ok(None);
+        };
+        let is_did = value
+            .strip_prefix("did:")
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(method, id)| {
+                !method.is_empty()
+                    && method
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    && !id.is_empty()
+            });
+        if !is_did {
+            return Err(self.invalid(
+                property,
+                value,
+                "expected a DID (did:<method>:<id>)".to_string(),
+            ));
+        }
+        Ok(Some(value))
+    }
+
+    /// Fail when `property` is set but `protocol` is not the one that reads it.
+    fn only_for(
+        &self,
+        property: &str,
+        value: &Option<String>,
+        protocol: &CredentialProtocol,
+        wanted: CredentialProtocol,
+        wanted_name: &str,
+    ) -> Result<(), BrokerConfigError> {
+        match value {
+            Some(value) if *protocol != wanted => Err(self.invalid(
+                property,
+                value.clone(),
+                format!("only read when broker:{CREDENTIAL_PROTOCOL} is \"{wanted_name}\""),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn required(&self, property: &str) -> Result<String, BrokerConfigError> {
         self.optional(property)?
             .ok_or_else(|| BrokerConfigError::MissingProperty {
@@ -808,13 +1046,37 @@ fn read_participant(
             .map_err(|err| props.invalid(CREDENTIAL_PROTOCOL, raw, err.to_string()))?,
         None => CredentialProtocol::None,
     };
+    let id = props.non_empty(PARTICIPANT_ID)?;
+    let name = props.non_empty(PARTICIPANT_NAME)?;
+    let catalog_request_url = props
+        .optional_http_url(CATALOG_REQUEST_URL)?
+        .ok_or_else(|| BrokerConfigError::MissingProperty {
+            resource: props.resource.clone(),
+            property: CATALOG_REQUEST_URL.to_string(),
+        })?;
+    let provider_did = props.optional_did(PROVIDER_DID)?;
+    props.only_for(
+        PROVIDER_DID,
+        &provider_did,
+        &credential_protocol,
+        CredentialProtocol::Dcp,
+        "dcp",
+    )?;
+    let oid4vp_response_uri = props.optional_http_url(OID4VP_RESPONSE_URI)?;
+    props.only_for(
+        OID4VP_RESPONSE_URI,
+        &oid4vp_response_uri,
+        &credential_protocol,
+        CredentialProtocol::Oid4Vp,
+        "oid4vp",
+    )?;
     Ok(ParticipantEntry {
-        id: props.required(PARTICIPANT_ID)?,
-        name: props.required(PARTICIPANT_NAME)?,
-        catalog_request_url: props.required(CATALOG_REQUEST_URL)?,
+        id,
+        name,
+        catalog_request_url,
         credential_protocol,
-        provider_did: props.optional(PROVIDER_DID)?,
-        oid4vp_response_uri: props.optional(OID4VP_RESPONSE_URI)?,
+        provider_did,
+        oid4vp_response_uri,
     })
 }
 
@@ -825,11 +1087,8 @@ fn read_holder(
     let props = Properties::read(graph, node, "Holder", HOLDER_PROPERTIES)?;
     let insecure_http = match props.optional(INSECURE_HTTP)? {
         None => false,
-        Some(raw) => match raw.trim() {
-            "true" | "1" => true,
-            "false" | "0" => false,
-            _ => return Err(props.invalid(INSECURE_HTTP, raw, "expected a boolean".to_string())),
-        },
+        Some(raw) => parse_boolean(&raw)
+            .ok_or_else(|| props.invalid(INSECURE_HTTP, raw, BOOLEAN_REASON.to_string()))?,
     };
     let credential_jws_file = props.credential_file()?;
     Ok(HolderConfig {
@@ -1175,15 +1434,46 @@ mod tests {
     }
 
     #[test]
-    fn unknown_properties_are_ignored_even_with_several_values() {
-        let crawler = crawler_from(
-            "<urn:c> a broker:BrokerConfig ; broker:tag \"a\", \"b\" ; broker:participant <urn:p> .\n\
+    fn an_unknown_config_property_is_an_error() {
+        let err =
+            crawler_from("<urn:c> a broker:BrokerConfig ; broker:sparqlMaxRow 5 .\n").unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownProperty { property, .. } if property == "sparqlMaxRow"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_participant_property_is_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
              <urn:p> a broker:Participant ; broker:participantId \"p\" ; broker:tag \"a\", \"b\" ;\n\
                broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" .\n",
         )
-        .unwrap()
-        .unwrap();
-        assert_eq!(crawler.participants[0].id, "p");
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownProperty { property, resource } if property == "tag" && resource.contains("urn:p")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_holder_property_is_an_error() {
+        let err =
+            crawler_from(&holder_with_file("\"/h.jws\" ; broker:ownDidHots \"h\"")).unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownProperty { property, .. } if property == "ownDidHots"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_value_passed_directly_is_an_error() {
+        let err = BrokerSettings::from_values([("nope".to_string(), "1".to_string())]).unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownProperty { property, .. } if property == "nope"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1203,16 +1493,6 @@ mod tests {
         let store = ConfigStore::open(dir.path()).unwrap();
         let settings = BrokerSettings::from_store(&store).unwrap();
         assert!(ALL_SETTINGS.iter().all(|s| settings.get(*s).is_none()));
-    }
-
-    #[test]
-    fn triples_on_other_subjects_are_ignored() {
-        let (_dir, store) = store_with(&format!(
-            "@prefix broker: <{BROKER_NS}> .\n\
-             <urn:not-a-config> broker:httpApiAddr \"0.0.0.0:9000\" .\n"
-        ));
-        let settings = BrokerSettings::from_store(&store).unwrap();
-        assert_eq!(settings.get(HTTP_API_ADDR), None);
     }
 
     #[test]
@@ -1240,14 +1520,98 @@ mod tests {
         ));
     }
 
+    fn invalid_property(values: &[(&str, &str)]) -> String {
+        let err = BrokerSettings::from_values(
+            values
+                .iter()
+                .map(|(property, value)| (property.to_string(), value.to_string())),
+        )
+        .unwrap_err();
+        match err {
+            BrokerConfigError::InvalidValue { property, .. } => property,
+            other => panic!("expected InvalidValue, got {other}"),
+        }
+    }
+
     #[test]
-    fn non_positive_integers_fall_back() {
-        let settings = BrokerSettings::from_values([
-            ("sparqlMaxRows".to_string(), "0".to_string()),
-            ("sparqlQueryTimeoutMs".to_string(), "soon".to_string()),
-        ]);
-        assert_eq!(settings.positive_integer(SPARQL_MAX_ROWS), None);
-        assert_eq!(settings.positive_integer(SPARQL_QUERY_TIMEOUT_MS), None);
+    fn a_value_that_is_not_a_positive_integer_is_an_error() {
+        for setting in ALL_SETTINGS
+            .iter()
+            .filter(|s| s.kind == SettingKind::PositiveInteger)
+        {
+            for bad in ["0", "-3", "soon", "1.5", ""] {
+                assert_eq!(
+                    invalid_property(&[(setting.property, bad)]),
+                    setting.property,
+                    "broker:{} {bad:?}",
+                    setting.property
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_enum_value_is_an_error() {
+        assert_eq!(
+            invalid_property(&[("policyFilterUnmappableConstraintAction", "nope")]),
+            "policyFilterUnmappableConstraintAction"
+        );
+        assert_eq!(
+            invalid_property(&[("policyFilterNoPolicyVisibility", "Open")]),
+            "policyFilterNoPolicyVisibility"
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_boolean_is_an_error() {
+        for bad in ["yes", "no", "TRUE", ""] {
+            assert_eq!(
+                invalid_property(&[("policyFilterRunWhenOauth2Disabled", bad)]),
+                "policyFilterRunWhenOauth2Disabled",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_value_in_the_turtle_stops_the_read() {
+        let err = crawler_from("<urn:c> a broker:BrokerConfig ; broker:crawlConcurrency 0 .\n")
+            .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::InvalidValue { property, value, .. } if property == "crawlConcurrency" && value == "0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn valid_values_of_every_kind_are_read() {
+        let settings = BrokerSettings::from_values(
+            [
+                ("sparqlMaxRows", " 42 "),
+                ("policyFilterNoPolicyVisibility", "closed"),
+                ("policyFilterRunWhenOauth2Disabled", "0"),
+                ("httpApiAddr", "anything"),
+            ]
+            .map(|(p, v)| (p.to_string(), v.to_string())),
+        )
+        .unwrap();
+        assert_eq!(settings.positive_integer(SPARQL_MAX_ROWS), Some(42));
+        assert_eq!(
+            settings.boolean(POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED),
+            Some(false)
+        );
+        assert_eq!(settings.positive_integer(CRAWL_CONCURRENCY), None);
+        for (value, expected) in [("true", true), ("1", true), ("false", false)] {
+            let settings = BrokerSettings::from_values([(
+                "policyFilterRunWhenOauth2Disabled".to_string(),
+                value.to_string(),
+            )])
+            .unwrap();
+            assert_eq!(
+                settings.boolean(POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED),
+                Some(expected)
+            );
+        }
     }
 
     const ONE_SETTING: &str = "@prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .\n\
@@ -1367,5 +1731,174 @@ mod tests {
             Err(BrokerConfigError::Parse { .. })
         ));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "not turtle");
+    }
+
+    #[test]
+    fn a_misspelled_config_class_is_an_error() {
+        let err =
+            crawler_from("<urn:c> a broker:BrokerConfg ; broker:oauth2JwksUri \"http://j\" .\n")
+                .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownClass { class, .. } if class == "BrokerConfg"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_participant_class_is_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig .\n<urn:q> a broker:Particpant ; broker:participantId \"q\" .\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownClass { class, .. } if class == "Particpant"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn broker_triples_on_an_unattached_subject_are_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig .\n<urn:x> broker:oauth2JwksUri \"http://j\" .\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::Unattached { resource, term } if resource.contains("urn:x") && term == "oauth2JwksUri"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn broker_triples_without_any_config_resource_are_an_error() {
+        let err = crawler_from(OPEN_PARTICIPANT).unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::Unattached { resource, .. } if resource.contains("urn:p")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn other_vocabularies_are_left_alone() {
+        let settings = BrokerSettings::from_turtle(
+            format!(
+                "{PREFIX}@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+                 <urn:c> a broker:BrokerConfig ; rdfs:label \"broker\" .\n\
+                 <urn:other> rdfs:label \"unrelated\" .\n"
+            )
+            .as_bytes(),
+            None,
+            "test",
+        );
+        assert!(settings.is_ok(), "{:?}", settings.err());
+    }
+
+    #[test]
+    fn a_holder_is_checked_even_without_participants() {
+        let err =
+            crawler_from("<urn:c> a broker:BrokerConfig ; broker:holder \"x\" .\n").unwrap_err();
+        assert!(
+            matches!(err, BrokerConfigError::NotAResource { .. }),
+            "{err}"
+        );
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:holder <urn:h> .\n\
+             <urn:h> a broker:Holder ; broker:ownDidHost \"h\" ; broker:requiredScope \"s\" ;\n\
+               broker:credentialJwsFile \"/h.jws\" ; broker:bogus 1 .\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownProperty { property, .. } if property == "bogus"),
+            "{err}"
+        );
+    }
+
+    fn participant_error(properties: &str) -> String {
+        let err = crawler_from(&format!(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; {properties} .\n"
+        ))
+        .unwrap_err();
+        match err {
+            BrokerConfigError::InvalidValue { property, .. } => property,
+            other => panic!("expected InvalidValue for {properties}, got {other}"),
+        }
+    }
+
+    const ID_NAME_URL: &str = "broker:participantId \"p\" ; broker:participantName \"P\" ; \
+         broker:catalogRequestUrl \"http://h/c\"";
+
+    #[test]
+    fn participant_values_that_do_not_parse_are_errors() {
+        let url = "broker:catalogRequestUrl \"http://h/c\"";
+        assert_eq!(
+            participant_error(&format!(
+                "broker:participantId \" \" ; broker:participantName \"P\" ; {url}"
+            )),
+            PARTICIPANT_ID
+        );
+        assert_eq!(
+            participant_error(&format!(
+                "broker:participantId \"p\" ; broker:participantName \"\" ; {url}"
+            )),
+            PARTICIPANT_NAME
+        );
+        for bad in ["\"not a url\"", "\"ftp://h/c\"", "<file:///etc/c>"] {
+            assert_eq!(
+                participant_error(&format!(
+                    "broker:participantId \"p\" ; broker:participantName \"P\" ; \
+                     broker:catalogRequestUrl {bad}"
+                )),
+                CATALOG_REQUEST_URL,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            participant_error(&format!(
+                "{ID_NAME_URL} ; broker:credentialProtocol \"dcp\" ; broker:providerDid \"gated\""
+            )),
+            PROVIDER_DID
+        );
+        assert_eq!(
+            participant_error(&format!(
+                "{ID_NAME_URL} ; broker:credentialProtocol \"oid4vp\" ; \
+                 broker:oid4vpResponseUri \"/response\""
+            )),
+            OID4VP_RESPONSE_URI
+        );
+    }
+
+    #[test]
+    fn credential_properties_for_another_protocol_are_errors() {
+        assert_eq!(
+            participant_error(&format!("{ID_NAME_URL} ; broker:providerDid \"did:web:h\"")),
+            PROVIDER_DID
+        );
+        assert_eq!(
+            participant_error(&format!(
+                "{ID_NAME_URL} ; broker:credentialProtocol \"dcp\" ; \
+                 broker:providerDid \"did:web:h\" ; broker:oid4vpResponseUri \"http://h/r\""
+            )),
+            OID4VP_RESPONSE_URI
+        );
+    }
+
+    #[test]
+    fn a_blank_node_setting_is_an_error() {
+        let err =
+            crawler_from("<urn:c> a broker:BrokerConfig ; broker:oauth2Issuer [] .\n").unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::InvalidValue { property, .. } if property == "oauth2Issuer"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_first_invalid_setting_in_name_order_is_reported() {
+        for _ in 0..32 {
+            assert_eq!(
+                invalid_property(&[("sparqlMaxRows", "-1"), ("crawlConcurrency", "0")]),
+                "crawlConcurrency"
+            );
+        }
     }
 }

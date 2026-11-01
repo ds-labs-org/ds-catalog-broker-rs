@@ -84,9 +84,8 @@ impl Default for SparqlLimitsConfig {
 
 impl SparqlLimitsConfig {
     /// Reads `broker:sparqlQueryTimeoutMs` and `broker:sparqlMaxRows` (positive
-    /// integers) from the broker config. Unset falls back
-    /// to the default silently; a value that is not a positive integer falls back to it with a
-    /// warning.
+    /// integers) from the broker config. Unset is the default; any other value was checked
+    /// when the config was read.
     pub fn from_settings(settings: &config::BrokerSettings) -> Self {
         let default = Self::default();
         let timeout_ms = settings
@@ -103,9 +102,8 @@ impl SparqlLimitsConfig {
 
 /// Reads `broker:crawlTimeoutMs`, `broker:crawlConcurrency` and
 /// `broker:catalogMaxAgeSecs` (positive integers) from the broker config into
-/// the crawler's [`crawler::CrawlLimits`]. Unset falls back to the default
-/// silently; a value that is not a positive integer falls back to it with a
-/// warning.
+/// the crawler's [`crawler::CrawlLimits`]. Unset is the default; any other
+/// value was checked when the config was read.
 pub fn crawl_limits_from_settings(settings: &config::BrokerSettings) -> crawler::CrawlLimits {
     let default = crawler::CrawlLimits::default();
     crawler::CrawlLimits {

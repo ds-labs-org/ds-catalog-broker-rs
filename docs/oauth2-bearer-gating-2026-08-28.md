@@ -44,8 +44,7 @@ protected by their own DCP-based check, unrelated to this one).
 ## Config (opt-in, mirrors the `sparql`/`holder` pattern)
 
 Set as properties of the broker's Turtle config (see
-[configuration.md](configuration.md)); these were `OAUTH2_*` env vars when
-this document was written.
+[configuration.md](configuration.md)).
 
 | Property | Required to enable | Meaning |
 |---|---|---|
@@ -83,7 +82,7 @@ spec-tested JWT library is for.
   should never be configured with a shared HMAC secret it would need to
   keep as confidential as the authorization server's own signing key.
 - Standard claim checks: `exp` (and `nbf` if present) always; `iss`/`aud`
-  when configured; `scope` contains `OAUTH2_REQUIRED_SCOPE` when
+  when configured; `scope` contains `broker:oauth2RequiredScope` when
   configured.
 
 ## Response shape
@@ -98,7 +97,7 @@ spec-tested JWT library is for.
 Landed exactly as scoped above, with one clarification and one addition
 found during implementation, neither a behavior change:
 
-- `OAUTH2_AUDIENCE` unset must mean "don't check `aud` at all" (as this
+- `broker:oauth2Audience` unset must mean "don't check `aud` at all" (as this
   document already said), not "reject any token that happens to carry an
   `aud` claim" — `jsonwebtoken::Validation` defaults to the latter once no
   expected audience is set, so `OAuth2Verifier::verify` explicitly sets
@@ -113,11 +112,11 @@ crypto correctness, route coverage) found the algorithm-confusion guard,
 key selection, `exp`/`nbf` handling, and route wiring all sound, but the
 fix pass it triggered caught one real gap the reviewers themselves missed:
 `OAuth2Verifier::verify` called `set_issuer`/`set_audience` when
-`OAUTH2_ISSUER`/`OAUTH2_AUDIENCE` were configured, but `jsonwebtoken` only
+`broker:oauth2Issuer`/`broker:oauth2Audience` were configured, but `jsonwebtoken` only
 checks those claims *if present* on the token — it never required them to
 be present at all. A validly-signed token from the configured JWKS that
 simply omitted `iss`/`aud` sailed through unchecked, defeating the point of
-setting those env vars. Reproduced RED first
+setting those properties. Reproduced RED first
 (`verify_rejects_a_token_with_no_{aud,iss}_claim_at_all_when_{audience,issuer}_is_configured`),
 then fixed by adding `"iss"`/`"aud"` to `validation.required_spec_claims`
 whenever the corresponding config is set — commit `95290e9`.
@@ -138,17 +137,17 @@ router can answer `403` instead of `401`.
 `load_oauth2_config` reads the four `broker:oauth2*` settings from the config
 table above and fetches the verifier eagerly, before `AppState` is built;
 a configured-but-bad JWKS panics at boot with a clear message (same
-posture as `CRAWLER_CONFIG_PATH`).
+posture as an invalid participant or holder in the config).
 
 **Response/status-code shapes, exactly as implemented** (both gated
 routes, identical behavior):
 
 | Condition | Status | Notes |
 |---|---|---|
-| `AppState::oauth2` is `None` (env var unset) | unchanged | Every pre-existing test for both routes passes unmodified. |
+| `AppState::oauth2` is `None` (`broker:oauth2JwksUri` unset) | unchanged | Every pre-existing test for both routes passes unmodified. |
 | No `Authorization` header, or not a `Bearer` token | `401` | `WWW-Authenticate: Bearer` header set (RFC 6750). |
 | Token fails to parse/verify (bad signature, unknown `kid`, expired, wrong `iss`/`aud` when configured) | `401` | Same `WWW-Authenticate: Bearer` header. |
-| Token verifies, but its `scope` claim doesn't contain `OAUTH2_REQUIRED_SCOPE` | `403` | No `WWW-Authenticate` header — this is an authorization failure, not an authentication one. |
+| Token verifies, but its `scope` claim doesn't contain `broker:oauth2RequiredScope` | `403` | No `WWW-Authenticate` header — this is an authorization failure, not an authentication one. |
 | Token verifies and (if configured) carries the required scope | route's normal response | e.g. `200` with the real catalog/SPARQL body. |
 
 **Tests:** the `ds-catalog-broker-rs` crate's own unit test binary grew

@@ -43,8 +43,20 @@ All settings are properties of a single `broker:BrokerConfig` resource, in
 the `https://catalog-broker.ds-labs.org/ontologies/config#` namespace. The
 subject IRI is up to you. Two `broker:BrokerConfig` resources, or two values
 for one setting (anything but `broker:participant`, which repeats), stop the
-broker at startup. An unknown `broker:` property is logged as a warning and
-ignored, however many values it has.
+broker at startup. So does anything in the `broker:` namespace that the
+broker would otherwise skip without a word, since a typo there would leave
+a setting at its default without anyone noticing:
+
+- an unknown `broker:` property, on this resource or on a participant or
+  the holder;
+- an `rdf:type` in the `broker:` namespace other than `broker:BrokerConfig`,
+  `broker:Participant` or `broker:Holder` (a misspelled class);
+- a `broker:` property or class on any subject that is neither the
+  `broker:BrokerConfig` resource nor a participant or holder linked from
+  it, including a file with `broker:` triples but no `broker:BrokerConfig`;
+- a blank node as a setting's value.
+
+Triples in other vocabularies (`rdfs:label`, comments as data) are ignored.
 
 The crawler's participants and its holder identity are separate resources,
 linked from `broker:BrokerConfig`; see [Participants and holder](#participants-and-holder).
@@ -57,30 +69,31 @@ keeps it in step with the code.
 
 Every setting is optional.
 
-| Property | Default | Meaning | Replaces env var |
-|---|---|---|---|
-| `broker:httpApiAddr` | `127.0.0.1:8080` | Address the HTTP API listens on. | `HTTP_API_ADDR` |
-| `broker:participant` | none | A `broker:Participant` to crawl; repeat for each. With none, the broker serves one sample catalog from an in-memory cache, with no crawler and `/sparql` answering 501. | `CRAWLER_CONFIG_PATH` (with its TOML file) |
-| `broker:holder` | unset | The crawler's `broker:Holder` identity. Required when a participant uses the `dcp` or `oid4vp` credential protocol. | |
-| `broker:crawlIntervalSecs` | `300` | Seconds between the starts of two crawl cycles. Positive integer. | |
-| `broker:crawlTimeoutMs` | `30000` | How long one participant's crawl may take, credential presentation and response body included, before it counts as failed. Positive integer. | |
-| `broker:crawlConcurrency` | `8` | How many participants are crawled at the same time. Positive integer. | |
-| `broker:catalogMaxAgeSecs` | `86400` | A participant's cached catalog is removed once its last successful crawl is older than this, so a participant that stays down stops being served. A failed crawl keeps the previous catalog until then. Positive integer. | |
-| `broker:oauth2JwksUri` | unset | JWKS endpoint for OAuth2 Bearer gating of `/catalog` and `/sparql`. Unset leaves both unauthenticated. See [oauth2-bearer-gating-2026-08-28.md](oauth2-bearer-gating-2026-08-28.md). | `OAUTH2_JWKS_URI` |
-| `broker:oauth2Issuer` | unset | Expected `iss` claim; checked only if set. | `OAUTH2_ISSUER` |
-| `broker:oauth2Audience` | unset | Expected `aud` claim; checked only if set. | `OAUTH2_AUDIENCE` |
-| `broker:oauth2RequiredScope` | unset | One scope the token's `scope` claim must contain; checked only if set. | `OAUTH2_REQUIRED_SCOPE` |
-| `broker:sparqlQueryTimeoutMs` | `10000` | A `/sparql` evaluation running longer is stopped with `503`. Positive integer. | `SPARQL_QUERY_TIMEOUT_MS` |
-| `broker:sparqlMaxRows` | `10000` | A `/sparql` `SELECT` result with more rows is rejected with `400`. Positive integer. | `SPARQL_MAX_ROWS` |
-| `broker:policyFilterUnmappableConstraintAction` | `hide_dataset` | `skip`, `drop_policy` or `hide_dataset`: what ODRL filtering does with a constraint it cannot evaluate. | `POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION` |
-| `broker:policyFilterNoPolicyVisibility` | `open` | `open` or `closed`: whether a dataset with no permissions is visible. | `POLICY_FILTER_NO_POLICY_VISIBILITY` |
-| `broker:policyFilterRunWhenOauth2Disabled` | `true` | `false` turns ODRL filtering off when OAuth2 gating is off. | `POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED` |
+| Property | Default | Meaning |
+|---|---|---|
+| `broker:httpApiAddr` | `127.0.0.1:8080` | Address the HTTP API listens on. |
+| `broker:participant` | none | A `broker:Participant` to crawl; repeat for each. With none, the broker serves one sample catalog from an in-memory cache, with no crawler and `/sparql` answering 501. |
+| `broker:holder` | unset | The crawler's `broker:Holder` identity. Required when a participant uses the `dcp` or `oid4vp` credential protocol. |
+| `broker:crawlIntervalSecs` | `300` | Seconds between the starts of two crawl cycles. Positive integer. |
+| `broker:crawlTimeoutMs` | `30000` | How long one participant's crawl may take, credential presentation and response body included, before it counts as failed. Positive integer. |
+| `broker:crawlConcurrency` | `8` | How many participants are crawled at the same time. Positive integer. |
+| `broker:catalogMaxAgeSecs` | `86400` | A participant's cached catalog is removed once its last successful crawl is older than this, so a participant that stays down stops being served. A failed crawl keeps the previous catalog until then. Positive integer. |
+| `broker:oauth2JwksUri` | unset | JWKS endpoint for OAuth2 Bearer gating of `/catalog` and `/sparql`. Unset leaves both unauthenticated. See [oauth2-bearer-gating-2026-08-28.md](oauth2-bearer-gating-2026-08-28.md). |
+| `broker:oauth2Issuer` | unset | Expected `iss` claim; checked only if set. |
+| `broker:oauth2Audience` | unset | Expected `aud` claim; checked only if set. |
+| `broker:oauth2RequiredScope` | unset | One scope the token's `scope` claim must contain; checked only if set. |
+| `broker:sparqlQueryTimeoutMs` | `10000` | A `/sparql` evaluation running longer is stopped with `503`. Positive integer. |
+| `broker:sparqlMaxRows` | `10000` | A `/sparql` `SELECT` result with more rows is rejected with `400`. Positive integer. |
+| `broker:policyFilterUnmappableConstraintAction` | `hide_dataset` | `skip`, `drop_policy` or `hide_dataset`: what ODRL filtering does with a constraint it cannot evaluate. |
+| `broker:policyFilterNoPolicyVisibility` | `open` | `open` or `closed`: whether a dataset with no permissions is visible. |
+| `broker:policyFilterRunWhenOauth2Disabled` | `true` | Boolean. `false` turns ODRL filtering off when OAuth2 gating is off. |
 
-A value that does not parse (a non-positive integer, an unknown enum value)
-is logged as a warning and the default is used. Integers and booleans can
-be written as plain Turtle literals (`10000`, `true`) or as strings.
-
-The old environment variables in the last column are no longer read.
+A value that does not parse stops the broker at startup, with an error that
+names the property and the value; the default is used only when a setting
+is absent. "Positive integer" means a whole number greater than zero.
+Booleans are `true`, `false`, `1` or `0`. The enum values above are matched
+exactly, case included. Integers and booleans can be written as plain
+Turtle literals (`10000`, `true`) or as strings.
 
 ## Participants and holder
 
@@ -140,8 +153,8 @@ that isn't `file:`, a blank node, or an empty string is rejected. The file is re
 once at startup, with surrounding whitespace trimmed; a missing or empty
 file stops the broker. Protect it with file permissions.
 
-Unlike the scalar settings above, these resources are read strictly. Each of
-the following stops the broker at startup:
+Like the settings above, these resources are read strictly. Each of the
+following stops the broker at startup:
 
 - a missing required property, two values for one property, or a value of
   the wrong kind (see above);
@@ -152,15 +165,23 @@ the following stops the broker at startup:
 - more than one `broker:holder`;
 - an unknown `broker:credentialProtocol` or a non-boolean
   `broker:insecureHttp`;
+- a blank `broker:participantId` or `broker:participantName`;
+- a `broker:catalogRequestUrl` or `broker:oid4vpResponseUri` that is not an
+  absolute `http` or `https` URL (a relative IRI resolves against the
+  config's location, so it usually becomes a `file:` IRI and is rejected);
+- a `broker:providerDid` that is not a DID (`did:<method>:<id>`);
+- `broker:providerDid` on a participant whose protocol is not `dcp`, or
+  `broker:oid4vpResponseUri` on one whose protocol is not `oid4vp`;
 - two participants with the same `broker:participantId`;
 - a `dcp` participant without `broker:providerDid`, an `oid4vp` participant
   without `broker:oid4vpResponseUri`, or either one without a
   `broker:holder`.
 
-An unknown `broker:` property on a participant or the holder is logged as a
-warning and ignored, however many values it has. Errors name a blank-node
-participant by its `broker:participantId`. `broker:holder` or `broker:crawlIntervalSecs` without
-any participant is logged as a warning; the crawler stays off.
+The holder is checked the same way even when there is no participant.
+Errors name a blank-node participant by its `broker:participantId`. With no
+participant the crawler stays off, and a `broker:holder` or any `broker:crawl*`
+or `broker:catalogMaxAgeSecs` setting is logged as a warning, since it has no
+effect.
 
 These replace the participant registry TOML file that
 `broker:crawlerConfigPath` used to name. That property is no longer read.
