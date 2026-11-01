@@ -5,9 +5,19 @@
 | Route | Answers | Use it for |
 |---|---|---|
 | `GET /health` | `200 {"status":"ok"}` as soon as the process serves. | Liveness. |
-| `GET /ready` | `503` with `"status":"starting"` until the crawler has finished its first cycle, then `200` with `"status":"ready"`. With no `broker:participant`, `200` at once. | Readiness: keep traffic away from a broker that has not crawled yet. |
+| `GET /ready` | `503` with `"status":"starting"` until the crawler has finished its first cycle, then `200` with `"status":"ready"`, and `503` with `"status":"stopping"` once shutdown has begun. | Readiness: keep traffic away from a broker that has not crawled yet or is stopping. |
 
-Neither route is gated by OAuth2, since probes carry no token.
+`/ready` does not wait for the first cycle when there is no
+`broker:participant`, or when a `broker:holder` is configured. A `dcp` or
+`oid4vp` crawl needs the participant to call back into this broker
+(`/dsp/holder/did.json`, `/dsp/holder/presentations/query`), and a load
+balancer that holds traffic until `/ready` passes would block those calls
+and fail the very cycle readiness waits for.
+
+Both routes answer without a token, since probes carry none. With
+`broker:oauth2JwksUri` set, `/ready` lists `participants` only for a caller
+with a valid token; everyone else gets `status` and `cycles_completed`,
+since participant ids and upstream error text describe the deployment.
 
 `/ready` also reports the crawler's state. A cycle counts as finished
 whatever its outcome, so a broker whose participants are all down still
@@ -46,18 +56,30 @@ becomes ready; the per-participant fields say why nothing is cached.
 
 ## Shutdown
 
-On `SIGTERM` or `SIGINT` the broker stops accepting connections, lets
-requests in flight finish, and stops the crawler. A crawl cycle in flight
-is interrupted: its HTTP requests are dropped, and a catalog already being
-written completes first. Nothing is persisted, so nothing else needs
-flushing. Give the process a termination grace period longer than your
-slowest request; `/sparql` evaluations are bounded by
-`broker:sparqlQueryTimeoutMs`.
+On `SIGTERM` or `SIGINT`:
+
+1. `/ready` starts answering `503 stopping`, and the crawler stops. A crawl
+   cycle in flight is interrupted: its HTTP requests are dropped, and a
+   catalog already being written completes first.
+2. After `broker:shutdownDelaySecs` (unset: none), the listener closes and
+   requests in flight are allowed to finish. The delay gives load balancers
+   time to notice `/ready` and stop routing new requests; the image is
+   distroless, so a `preStop` `sleep` hook is not available.
+3. The process exits with status 0.
+
+A second `SIGTERM` or `SIGINT` exits at once with status 130, without
+draining. Nothing is persisted, so nothing needs flushing. Give the
+process a termination grace period longer than the delay plus your slowest
+request; `/sparql` evaluations are bounded by `broker:sparqlQueryTimeoutMs`.
+
+If the crawl scheduler stops on its own (a panic), the broker exits with
+status 1 rather than keep serving catalogs that would no longer be
+refreshed or expired, so the supervisor restarts it.
 
 ## Container image
 
 The repository's [`Dockerfile`](../Dockerfile) builds a two-stage image: the
-release binary on `rust:1.97-bookworm`, run on
+release binary on `rust:1-bookworm` (the stable toolchain, like CI), run on
 `gcr.io/distroless/cc-debian12:nonroot` as an unprivileged user. CI builds
 it on every pull request (the `image` job) without pushing it.
 

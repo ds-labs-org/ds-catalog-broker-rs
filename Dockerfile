@@ -10,7 +10,8 @@
 #   git submodule update --init vendor/contreforts-*
 #   docker build -t ds-catalog-broker-rs .
 
-FROM rust:1.97-bookworm AS build
+# The stable toolchain, like CI's other jobs.
+FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

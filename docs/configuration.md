@@ -86,6 +86,7 @@ Every setting is optional.
 | `broker:sparqlMaxRows` | `10000` | A `/sparql` `SELECT` result with more rows is rejected with `400`. Positive integer. |
 | `broker:policyFilterUnmappableConstraintAction` | `hide_dataset` | `skip`, `drop_policy` or `hide_dataset`: what ODRL filtering does with a constraint it cannot evaluate. |
 | `broker:policyFilterNoPolicyVisibility` | `open` | `open` or `closed`: whether a dataset with no permissions is visible. |
+| `broker:shutdownDelaySecs` | unset (no delay) | Seconds between a shutdown signal and closing the listener, while `/ready` already answers `503`. See [operations.md](operations.md#shutdown). Positive integer. |
 | `broker:policyFilterRunWhenOauth2Disabled` | `true` | Boolean. `false` turns ODRL filtering off when OAuth2 gating is off. |
 
 A value that does not parse stops the broker at startup, with an error that
