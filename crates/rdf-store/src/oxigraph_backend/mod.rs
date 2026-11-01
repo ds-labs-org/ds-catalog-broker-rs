@@ -45,17 +45,20 @@
 //! nesting reuses the exact same resource-naming scheme at every depth -
 //! carrying its own `fcns:sequenceIndex` (its position among its
 //! siblings) and, recursively, either shape again. A constraint resource
-//! therefore carries **at most one** of `odrl:leftOperand` or one of the
-//! four logical predicates, never both - `load_constraint` reads whichever
-//! is present, atomic taking precedence should a hand-crafted graph
-//! (outside this store's own writes) carry both.
+//! therefore carries **at most one** of `odrl:leftOperand` or
+//! `fcns:logicalOperator` (which names the group's logical predicate, so
+//! an empty group still reads back as that group), never both -
+//! `load_constraint` reads whichever is present, atomic taking precedence
+//! should a hand-crafted graph (outside this store's own writes) carry
+//! both.
 //!
 //! Recursion depth - both writing and reading - is bounded by
 //! `MAX_CONSTRAINT_DEPTH` (64), the exact same bound and rationale as
 //! `crawler::MAX_CONSTRAINT_DEPTH` and
 //! `ds-odrl-engine-rs::engine::constraint::MAX_CONSTRAINT_DEPTH`: a
-//! constraint nested past the bound is dropped (not written, with no
-//! dangling triple left behind) on write, the same way
+//! constraint nested past the bound is dropped on write (no link to it and
+//! none of its own triples; the group above it is kept, so it reads back
+//! with fewer children, or empty), the same way
 //! `crawler::parse_constraint` drops one past its own bound rather than
 //! growing a parser's call stack unboundedly - and reading back a graph
 //! that somehow carries one anyway (not producible by this store's own
@@ -205,7 +208,10 @@
 //!     compared against, not an identifier for another resource, so
 //!     giving it the IRI-or-literal treatment would change its RDF shape
 //!     based on incidental string content rather than ODRL semantics.
-//! - [`Logical`](catalog_core::Constraint::Logical) - exactly one of:
+//! - [`Logical`](catalog_core::Constraint::Logical) -
+//!   `<constraint> fcns:logicalOperator <op> .`, where `<op>` is the IRI of
+//!   the predicate below (`odrl:and`, ...), always written so a group with
+//!   no children round-trips; then exactly one of:
 //!   - `<constraint> odrl:and <child> .` - one per
 //!     [`LogicalConstraint::And`]
 //!     child, in order.
@@ -289,7 +295,7 @@
 //! against): `rdf:type`, `dcat:dataset`, `dcat:service`,
 //! `dcat:distribution`, `dcat:accessService`, `dcat:endpointURL`,
 //! `dcat:endpointDescription`, `dct:format`, `fcns:participantId`,
-//! `fcns:sequenceIndex`, and (new with the ODRL mapping above)
+//! `fcns:sequenceIndex`, `fcns:logicalOperator`, and (new with the ODRL mapping above)
 //! `odrl:hasPolicy` for `Dataset.properties`. The rest of the ODRL mapping's
 //! own structural predicates - `odrl:permission`, `odrl:prohibition`,
 //! `odrl:obligation`, `odrl:action`, `odrl:constraint`,
