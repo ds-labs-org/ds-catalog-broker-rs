@@ -60,40 +60,74 @@ pub const CONFIG_GRAPH_FILE: &str = "config_graph.ttl";
 /// `contreforts-config`'s own datadir override (private to that crate, so spelled again here).
 pub const CONFIG_STORE_PATH_ENV: &str = "CONFIG_STORE_PATH";
 
+/// What a [`Setting`]'s value must look like. Checked when the config is read, so a value
+/// that does not parse stops the broker instead of silently becoming the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingKind {
+    /// Any string.
+    Text,
+    /// An integer greater than zero.
+    PositiveInteger,
+    /// `true`, `false`, `1` or `0` (the `xsd:boolean` lexical forms).
+    Boolean,
+    /// One of the listed strings, exactly.
+    OneOf(&'static [&'static str]),
+}
+
 /// One configuration setting: a property in [`BROKER_NS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Setting {
     pub property: &'static str,
+    pub kind: SettingKind,
 }
 
 impl Setting {
-    const fn new(property: &'static str) -> Self {
-        Self { property }
+    const fn new(property: &'static str, kind: SettingKind) -> Self {
+        Self { property, kind }
     }
 
     /// The property's full IRI.
     pub fn iri(&self) -> String {
         format!("{BROKER_NS}{}", self.property)
     }
+
+    /// Check `value` against [`Self::kind`]; the error is the reason it does not fit.
+    pub fn check(&self, value: &str) -> Result<(), String> {
+        let _ = value;
+        todo!()
+    }
 }
 
-pub const HTTP_API_ADDR: Setting = Setting::new("httpApiAddr");
-pub const CRAWL_INTERVAL_SECS: Setting = Setting::new("crawlIntervalSecs");
-pub const CRAWL_TIMEOUT_MS: Setting = Setting::new("crawlTimeoutMs");
-pub const CRAWL_CONCURRENCY: Setting = Setting::new("crawlConcurrency");
-pub const CATALOG_MAX_AGE_SECS: Setting = Setting::new("catalogMaxAgeSecs");
-pub const OAUTH2_JWKS_URI: Setting = Setting::new("oauth2JwksUri");
-pub const OAUTH2_ISSUER: Setting = Setting::new("oauth2Issuer");
-pub const OAUTH2_AUDIENCE: Setting = Setting::new("oauth2Audience");
-pub const OAUTH2_REQUIRED_SCOPE: Setting = Setting::new("oauth2RequiredScope");
-pub const SPARQL_QUERY_TIMEOUT_MS: Setting = Setting::new("sparqlQueryTimeoutMs");
-pub const SPARQL_MAX_ROWS: Setting = Setting::new("sparqlMaxRows");
-pub const POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION: Setting =
-    Setting::new("policyFilterUnmappableConstraintAction");
-pub const POLICY_FILTER_NO_POLICY_VISIBILITY: Setting =
-    Setting::new("policyFilterNoPolicyVisibility");
+/// The values of `broker:policyFilterUnmappableConstraintAction`.
+pub const UNMAPPABLE_CONSTRAINT_ACTIONS: &[&str] = &["skip", "drop_policy", "hide_dataset"];
+/// The values of `broker:policyFilterNoPolicyVisibility`.
+pub const NO_POLICY_VISIBILITIES: &[&str] = &["open", "closed"];
+
+pub const HTTP_API_ADDR: Setting = Setting::new("httpApiAddr", SettingKind::Text);
+pub const CRAWL_INTERVAL_SECS: Setting =
+    Setting::new("crawlIntervalSecs", SettingKind::PositiveInteger);
+pub const CRAWL_TIMEOUT_MS: Setting = Setting::new("crawlTimeoutMs", SettingKind::PositiveInteger);
+pub const CRAWL_CONCURRENCY: Setting =
+    Setting::new("crawlConcurrency", SettingKind::PositiveInteger);
+pub const CATALOG_MAX_AGE_SECS: Setting =
+    Setting::new("catalogMaxAgeSecs", SettingKind::PositiveInteger);
+pub const OAUTH2_JWKS_URI: Setting = Setting::new("oauth2JwksUri", SettingKind::Text);
+pub const OAUTH2_ISSUER: Setting = Setting::new("oauth2Issuer", SettingKind::Text);
+pub const OAUTH2_AUDIENCE: Setting = Setting::new("oauth2Audience", SettingKind::Text);
+pub const OAUTH2_REQUIRED_SCOPE: Setting = Setting::new("oauth2RequiredScope", SettingKind::Text);
+pub const SPARQL_QUERY_TIMEOUT_MS: Setting =
+    Setting::new("sparqlQueryTimeoutMs", SettingKind::PositiveInteger);
+pub const SPARQL_MAX_ROWS: Setting = Setting::new("sparqlMaxRows", SettingKind::PositiveInteger);
+pub const POLICY_FILTER_UNMAPPABLE_CONSTRAINT_ACTION: Setting = Setting::new(
+    "policyFilterUnmappableConstraintAction",
+    SettingKind::OneOf(UNMAPPABLE_CONSTRAINT_ACTIONS),
+);
+pub const POLICY_FILTER_NO_POLICY_VISIBILITY: Setting = Setting::new(
+    "policyFilterNoPolicyVisibility",
+    SettingKind::OneOf(NO_POLICY_VISIBILITIES),
+);
 pub const POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED: Setting =
-    Setting::new("policyFilterRunWhenOauth2Disabled");
+    Setting::new("policyFilterRunWhenOauth2Disabled", SettingKind::Boolean);
 
 /// Every setting this broker reads, in `docs/configuration.md`'s order.
 pub const ALL_SETTINGS: &[Setting] = &[
@@ -161,6 +195,8 @@ pub enum BrokerConfigError {
         property: String,
         count: usize,
     },
+    #[error("{resource} has broker:{property}, which this broker does not know")]
+    UnknownProperty { resource: String, property: String },
     #[error("{resource} has no broker:{property}, which is required")]
     MissingProperty { resource: String, property: String },
     #[error("broker:{property} on {resource} is {value:?}: {reason}")]
@@ -395,7 +431,7 @@ impl BrokerSettings {
         let values = single_values(&resource, properties, &known)?
             .into_iter()
             .map(|(property, term)| (property, term_value(&term)));
-        let mut settings = Self::from_values(values);
+        let mut settings = Self::from_values(values)?;
         settings.crawler = settings.read_crawler(&graph, &resource, participants, holders)?;
         Ok(settings)
     }
@@ -458,7 +494,9 @@ impl BrokerSettings {
     /// Build from already-read values, keyed by [`Setting::property`]. Warns about any
     /// property this broker doesn't know - a typo'd property should be visible in the logs,
     /// not silently ignored.
-    pub fn from_values(values: impl IntoIterator<Item = (String, String)>) -> Self {
+    pub fn from_values(
+        values: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, BrokerConfigError> {
         let values: HashMap<String, String> = values.into_iter().collect();
         for property in values.keys() {
             if !ALL_SETTINGS.iter().any(|s| s.property == property) {
@@ -468,11 +506,11 @@ impl BrokerSettings {
                 );
             }
         }
-        Self {
+        Ok(Self {
             values,
             crawler: None,
             source: None,
-        }
+        })
     }
 
     /// The participant registry and holder identity, or `None` when the config lists no
@@ -501,6 +539,12 @@ impl BrokerSettings {
                 None
             }
         }
+    }
+
+    /// `setting` as a boolean; `None` when unset.
+    pub fn boolean(&self, setting: Setting) -> Option<bool> {
+        let _ = setting;
+        todo!()
     }
 
     /// Where the values were read from, if anywhere.
@@ -1175,15 +1219,46 @@ mod tests {
     }
 
     #[test]
-    fn unknown_properties_are_ignored_even_with_several_values() {
-        let crawler = crawler_from(
-            "<urn:c> a broker:BrokerConfig ; broker:tag \"a\", \"b\" ; broker:participant <urn:p> .\n\
+    fn an_unknown_config_property_is_an_error() {
+        let err =
+            crawler_from("<urn:c> a broker:BrokerConfig ; broker:sparqlMaxRow 5 .\n").unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownProperty { property, .. } if property == "sparqlMaxRow"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_participant_property_is_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
              <urn:p> a broker:Participant ; broker:participantId \"p\" ; broker:tag \"a\", \"b\" ;\n\
                broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" .\n",
         )
-        .unwrap()
-        .unwrap();
-        assert_eq!(crawler.participants[0].id, "p");
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownProperty { property, resource } if property == "tag" && resource.contains("urn:p")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_holder_property_is_an_error() {
+        let err =
+            crawler_from(&holder_with_file("\"/h.jws\" ; broker:ownDidHots \"h\"")).unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownProperty { property, .. } if property == "ownDidHots"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_value_passed_directly_is_an_error() {
+        let err = BrokerSettings::from_values([("nope".to_string(), "1".to_string())]).unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownProperty { property, .. } if property == "nope"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1240,14 +1315,98 @@ mod tests {
         ));
     }
 
+    fn invalid_property(values: &[(&str, &str)]) -> String {
+        let err = BrokerSettings::from_values(
+            values
+                .iter()
+                .map(|(property, value)| (property.to_string(), value.to_string())),
+        )
+        .unwrap_err();
+        match err {
+            BrokerConfigError::InvalidValue { property, .. } => property,
+            other => panic!("expected InvalidValue, got {other}"),
+        }
+    }
+
     #[test]
-    fn non_positive_integers_fall_back() {
-        let settings = BrokerSettings::from_values([
-            ("sparqlMaxRows".to_string(), "0".to_string()),
-            ("sparqlQueryTimeoutMs".to_string(), "soon".to_string()),
-        ]);
-        assert_eq!(settings.positive_integer(SPARQL_MAX_ROWS), None);
-        assert_eq!(settings.positive_integer(SPARQL_QUERY_TIMEOUT_MS), None);
+    fn a_value_that_is_not_a_positive_integer_is_an_error() {
+        for setting in ALL_SETTINGS
+            .iter()
+            .filter(|s| s.kind == SettingKind::PositiveInteger)
+        {
+            for bad in ["0", "-3", "soon", "1.5", ""] {
+                assert_eq!(
+                    invalid_property(&[(setting.property, bad)]),
+                    setting.property,
+                    "broker:{} {bad:?}",
+                    setting.property
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_enum_value_is_an_error() {
+        assert_eq!(
+            invalid_property(&[("policyFilterUnmappableConstraintAction", "nope")]),
+            "policyFilterUnmappableConstraintAction"
+        );
+        assert_eq!(
+            invalid_property(&[("policyFilterNoPolicyVisibility", "Open")]),
+            "policyFilterNoPolicyVisibility"
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_boolean_is_an_error() {
+        for bad in ["yes", "no", "TRUE", ""] {
+            assert_eq!(
+                invalid_property(&[("policyFilterRunWhenOauth2Disabled", bad)]),
+                "policyFilterRunWhenOauth2Disabled",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_value_in_the_turtle_stops_the_read() {
+        let err = crawler_from("<urn:c> a broker:BrokerConfig ; broker:crawlConcurrency 0 .\n")
+            .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::InvalidValue { property, value, .. } if property == "crawlConcurrency" && value == "0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn valid_values_of_every_kind_are_read() {
+        let settings = BrokerSettings::from_values(
+            [
+                ("sparqlMaxRows", " 42 "),
+                ("policyFilterNoPolicyVisibility", "closed"),
+                ("policyFilterRunWhenOauth2Disabled", "0"),
+                ("httpApiAddr", "anything"),
+            ]
+            .map(|(p, v)| (p.to_string(), v.to_string())),
+        )
+        .unwrap();
+        assert_eq!(settings.positive_integer(SPARQL_MAX_ROWS), Some(42));
+        assert_eq!(
+            settings.boolean(POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED),
+            Some(false)
+        );
+        assert_eq!(settings.positive_integer(CRAWL_CONCURRENCY), None);
+        for (value, expected) in [("true", true), ("1", true), ("false", false)] {
+            let settings = BrokerSettings::from_values([(
+                "policyFilterRunWhenOauth2Disabled".to_string(),
+                value.to_string(),
+            )])
+            .unwrap();
+            assert_eq!(
+                settings.boolean(POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED),
+                Some(expected)
+            );
+        }
     }
 
     const ONE_SETTING: &str = "@prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .\n\

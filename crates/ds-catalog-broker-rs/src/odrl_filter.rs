@@ -812,7 +812,8 @@ mod tests {
                 "policyFilterNoPolicyVisibility".to_string(),
                 "closed".to_string(),
             ),
-        ]);
+        ])
+        .unwrap();
         let config = PolicyFilterConfig::from_settings(&settings);
         assert_eq!(
             config.unmappable_constraint_action,
@@ -823,17 +824,8 @@ mod tests {
     }
 
     #[test]
-    fn policy_filter_config_unrecognized_values_fall_back_to_defaults() {
-        let settings = BrokerSettings::from_values([
-            (
-                "policyFilterUnmappableConstraintAction".to_string(),
-                "nope".to_string(),
-            ),
-            (
-                "policyFilterNoPolicyVisibility".to_string(),
-                "ajar".to_string(),
-            ),
-        ]);
+    fn policy_filter_config_unset_values_are_the_defaults() {
+        let settings = BrokerSettings::from_values([]).unwrap();
         let config = PolicyFilterConfig::from_settings(&settings);
         assert_eq!(
             config.unmappable_constraint_action,
@@ -841,6 +833,39 @@ mod tests {
         );
         assert_eq!(config.no_policy_visibility, NoPolicyVisibility::Open);
         assert!(config.filter_when_oauth2_disabled);
+    }
+
+    #[test]
+    fn policy_filter_config_reads_every_accepted_value() {
+        let read = |property: &str, value: &str| {
+            PolicyFilterConfig::from_settings(
+                &BrokerSettings::from_values([(property.to_string(), value.to_string())]).unwrap(),
+            )
+        };
+        let actions: Vec<_> = config::UNMAPPABLE_CONSTRAINT_ACTIONS
+            .iter()
+            .map(|value| {
+                read("policyFilterUnmappableConstraintAction", value).unmappable_constraint_action
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                UnmappableConstraintAction::SkipConstraint,
+                UnmappableConstraintAction::DropPolicy,
+                UnmappableConstraintAction::HideDataset
+            ]
+        );
+        let visibilities: Vec<_> = config::NO_POLICY_VISIBILITIES
+            .iter()
+            .map(|value| read("policyFilterNoPolicyVisibility", value).no_policy_visibility)
+            .collect();
+        assert_eq!(
+            visibilities,
+            [NoPolicyVisibility::Open, NoPolicyVisibility::Closed]
+        );
+        assert!(read("policyFilterRunWhenOauth2Disabled", "1").filter_when_oauth2_disabled);
+        assert!(!read("policyFilterRunWhenOauth2Disabled", "0").filter_when_oauth2_disabled);
     }
 
     fn dataset_with_policies(policies: Vec<CorePolicy>) -> Dataset {
