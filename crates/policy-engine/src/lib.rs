@@ -208,55 +208,71 @@ pub struct EvaluateResponse {
     pub reason: String,
 }
 
-/// A rule's constraints all match the claims map — a plain AND across
-/// `Rule.constraints` (ODRL's flat-rule model has no OR-within-a-rule; see
-/// the design doc's "Within-rule constraint matching" note). An empty
-/// `constraints` list vacuously satisfies `all()` and so counts as "all
-/// match" — an unconditional rule — exactly as the design doc specifies
-/// for both permissions and prohibitions.
-fn rule_matches(rule: &Rule, claims: &BTreeMap<String, ClaimValue>) -> bool {
-    rule.constraints
-        .iter()
-        .all(|constraint| constraint_matches(constraint, claims))
+/// The result of resolving a constraint or a rule against the claims map.
+///
+/// `Unevaluable` means the engine cannot tell whether the constraint holds:
+/// the claim is absent or the operator is not one of `eq`/`neq`/`isAnyOf`.
+/// A permission needs a definite `Match` to allow. A prohibition applies on
+/// `Match` or `Unevaluable`, so a constraint the engine cannot read never
+/// switches a prohibition off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Match,
+    Miss,
+    Unevaluable,
+}
+
+/// Combine the constraints of one rule with AND. A definite `Miss` makes the
+/// rule a `Miss` whatever the others say, otherwise any `Unevaluable`
+/// constraint makes the rule `Unevaluable`. An empty `constraints` list is
+/// an unconditional rule and is a `Match`, for permissions and prohibitions
+/// alike.
+fn rule_outcome(rule: &Rule, claims: &BTreeMap<String, ClaimValue>) -> Outcome {
+    let mut outcome = Outcome::Match;
+    for constraint in &rule.constraints {
+        match constraint_outcome(constraint, claims) {
+            Outcome::Miss => return Outcome::Miss,
+            Outcome::Unevaluable => outcome = Outcome::Unevaluable,
+            Outcome::Match => {}
+        }
+    }
+    outcome
 }
 
 /// Resolve one atomic constraint against the claims map.
 ///
-/// Per the design doc's "leftOperand-to-claim mapping" section: exact
-/// string-key lookup of `left_operand`; a key that isn't present in the
-/// claims map is **always** a miss (`false`), regardless of `operator` —
-/// including for `neq`, which does not treat "claim absent" as vacuously
-/// satisfied. This matches EDC's own posture for an unbound leftOperand
-/// key outside any registered scope (see the design doc's "Prior art"
-/// section).
-///
-/// An `operator` string outside the supported set (`eq`/`neq`/`isAnyOf`)
-/// degrades safely to `false` (non-matching) rather than panicking or
-/// erroring — the design doc's "Explicitly not supported in v1" list
-/// (numeric/date comparisons, `isPartOf`, logical groups) names operators
-/// this engine has no comparator registered for at all; the safe reading
-/// consistent with the "miss, not an error" posture above is that a
-/// constraint this engine cannot evaluate can never contribute a match.
-fn constraint_matches(constraint: &Constraint, claims: &BTreeMap<String, ClaimValue>) -> bool {
+/// The claim is looked up by exact `left_operand` key. An absent claim is
+/// `Unevaluable` for every operator, `neq` included: it is not treated as
+/// vacuously satisfied. An operator outside `eq`/`neq`/`isAnyOf` (numeric
+/// and date comparisons, `isPartOf`, logical groups, misspellings) is
+/// `Unevaluable`. Never a panic or an error.
+fn constraint_outcome(constraint: &Constraint, claims: &BTreeMap<String, ClaimValue>) -> Outcome {
     let Some(value) = claims.get(&constraint.left_operand) else {
-        return false;
+        return Outcome::Unevaluable;
     };
-    match constraint.operator.as_str() {
+    let matched = match constraint.operator.as_str() {
         "eq" => value.contains(&constraint.right_operand),
         "neq" => !value.contains(&constraint.right_operand),
         "isAnyOf" => {
-            // Wire convention per the design doc: `right_operand` is this
-            // constraint's own comma-delimited list (catalog_core::
-            // Constraint.right_operand is a single String, so ODRL's
-            // normal JSON-LD array-on-rightOperand form isn't available
-            // here). Candidates are trimmed so "DE, FR, NL" and "DE,FR,NL"
-            // behave identically — a robustness allowance beyond the
-            // doc's literal example, not a semantic change to it.
-            let candidates: Vec<&str> =
-                constraint.right_operand.split(',').map(str::trim).collect();
+            // `right_operand` is a comma-delimited list because
+            // `catalog_core::Constraint.right_operand` is a single String.
+            // Candidates are trimmed, so "DE, FR" and "DE,FR" behave the
+            // same, and empty entries are dropped so an empty operand has
+            // no candidates and cannot match an empty-string claim.
+            let candidates: Vec<&str> = constraint
+                .right_operand
+                .split(',')
+                .map(str::trim)
+                .filter(|candidate| !candidate.is_empty())
+                .collect();
             value.contains_any(&candidates)
         }
-        _ => false,
+        _ => return Outcome::Unevaluable,
+    };
+    if matched {
+        Outcome::Match
+    } else {
+        Outcome::Miss
     }
 }
 
@@ -290,6 +306,9 @@ fn describe_rule(rule: &Rule) -> String {
 ///
 /// Deny-overrides at the top level:
 /// 1. Any matching prohibition, in any attached policy, denies outright.
+///    A prohibition with a constraint the engine cannot evaluate (absent
+///    claim, unsupported operator) and no definitely failing constraint
+///    also denies.
 /// 2. No attached policy has any permission rule at all → allow (open by
 ///    default).
 /// 3. Any matching permission, in any attached policy, allows.
@@ -297,12 +316,18 @@ fn describe_rule(rule: &Rule) -> String {
 pub fn evaluate(request: &EvaluateRequest) -> EvaluateResponse {
     for policy in &request.policies {
         for (idx, rule) in policy.prohibitions.iter().enumerate() {
-            if rule_matches(rule, &request.claims) {
+            let outcome = rule_outcome(rule, &request.claims);
+            if outcome != Outcome::Miss {
+                let verdict = if outcome == Outcome::Match {
+                    "matched"
+                } else {
+                    "could not be evaluated, failing closed"
+                };
                 return EvaluateResponse {
                     dataset_id: request.dataset_id.clone(),
                     decision: Decision::Deny,
                     reason: format!(
-                        "prohibition[{idx}] of policy '{}' matched: {}",
+                        "prohibition[{idx}] of policy '{}' {verdict}: {}",
                         policy_label(policy),
                         describe_rule(rule)
                     ),
@@ -323,7 +348,7 @@ pub fn evaluate(request: &EvaluateRequest) -> EvaluateResponse {
 
     for policy in &request.policies {
         for (idx, rule) in policy.permissions.iter().enumerate() {
-            if rule_matches(rule, &request.claims) {
+            if rule_outcome(rule, &request.claims) == Outcome::Match {
                 return EvaluateResponse {
                     dataset_id: request.dataset_id.clone(),
                     decision: Decision::Allow,

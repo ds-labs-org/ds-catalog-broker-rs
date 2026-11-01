@@ -55,12 +55,18 @@ use crate::{Decision, EvaluateRequest, EvaluateResponse};
 /// reconstructs the *same* `Vec<u8>` from `(ptr, len)` alone, which is
 /// only sound because of this invariant — negative `len` is clamped to 0
 /// so a hostile or buggy host can't turn a negative-to-usize cast into a
-/// huge allocation request.
+/// huge allocation request. A `len` the allocator cannot serve returns 0
+/// and the instance stays usable.
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn alloc(len: i32) -> i32 {
     let len = len.max(0) as usize;
-    let mut buf: Vec<u8> = Vec::with_capacity(len);
+    let mut buf: Vec<u8> = Vec::new();
+    // A request the allocator cannot serve returns 0 instead of panicking,
+    // which would trap the instance. The host must check for 0.
+    if buf.try_reserve_exact(len).is_err() {
+        return 0;
+    }
     let ptr = buf.as_mut_ptr();
     // SAFETY (not memory-unsafety, but a leak-by-design): ownership of
     // this allocation is being handed across the FFI boundary to the
