@@ -10,6 +10,7 @@ description = "The Federated Catalog Semantic Harvester's cache: a storage-agnos
 catalog-core = { path = "../catalog-core" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 # default-features = false: contreforts-kg's own `default = ["rocksdb"]`
 # feature (vendor/contreforts-kg/Cargo.toml) re-enables oxigraph's
 # RocksDB backend, which pulls in oxrocksdb-sys (a from-source C++/cmake

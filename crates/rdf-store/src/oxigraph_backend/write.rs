@@ -298,11 +298,8 @@ impl OxigraphCatalogCache {
     /// the combinator), then recurses into [`write_constraint`] for
     /// each child at `depth + 1` - see the `oxigraph_backend` module doc's "Logical
     /// constraint groups" note. Bounded by [`MAX_CONSTRAINT_DEPTH`]: a
-    /// child that would be written past the bound is skipped entirely,
-    /// including its link triple, so no dangling/incomplete constraint
-    /// resource is ever left in the graph - mirroring
-    /// `crawler::parse_constraint` dropping an over-deep entry from the
-    /// parsed `Vec` outright rather than including a truncated one.
+    /// constraint past the bound is an error, which fails the whole
+    /// upsert before anything reaches the store.
     pub(super) fn write_constraint(
         &self,
         constraint: &Constraint,
@@ -311,6 +308,15 @@ impl OxigraphCatalogCache {
         depth: usize,
         graph: &mut GraphWrite,
     ) -> StoreResult<()> {
+        // Refused rather than truncated: dropping a child would loosen the
+        // policy (an emptied `and` matches everything). Writes only fill
+        // the buffer, so the upsert fails before its transaction starts.
+        if depth > MAX_CONSTRAINT_DEPTH {
+            return Err(StoreError::Backend(format!(
+                "{} is nested past the maximum supported logical constraint depth ({MAX_CONSTRAINT_DEPTH})",
+                constraint_node.as_str()
+            )));
+        }
         self.insert(
             constraint_node,
             &sequence_index_pred(),
@@ -339,14 +345,6 @@ impl OxigraphCatalogCache {
                 )?;
             }
             Constraint::Logical(logical) => {
-                // A child would be written at `depth + 1`; skip the
-                // whole remaining sibling list once that would exceed
-                // the bound (uniform across siblings - see this fn's
-                // own doc comment) rather than writing a partially
-                // truncated group.
-                if depth >= MAX_CONSTRAINT_DEPTH {
-                    return Ok(());
-                }
                 let (predicate, children): (NamedNode, &[Constraint]) = match logical {
                     LogicalConstraint::And(children) => (odrl_and_pred(), children),
                     LogicalConstraint::Or(children) => (odrl_or_pred(), children),
@@ -355,6 +353,13 @@ impl OxigraphCatalogCache {
                         (odrl_and_sequence_pred(), children)
                     }
                 };
+                // Always written, so an empty group reads back as itself.
+                self.insert(
+                    constraint_node,
+                    &logical_operator_pred(),
+                    &Term::from(predicate.clone()),
+                    graph,
+                )?;
                 for (child_index, child) in children.iter().enumerate() {
                     let child_node = constraint_iri(constraint_node.as_str(), child_index);
                     self.insert(

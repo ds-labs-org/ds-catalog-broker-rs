@@ -268,9 +268,10 @@ impl OxigraphCatalogCache {
     /// [`write_constraint`]'s own numbering). Dispatches on which
     /// shape `subject` actually carries: `odrl:leftOperand` present
     /// means atomic (the existing, pre-logical-support behavior,
-    /// unchanged); otherwise, whichever of
-    /// [`logical_constraint_preds`]'s four predicates `subject` carries
-    /// means logical, with that predicate's linked children loaded
+    /// unchanged); otherwise the group's `fcns:logicalOperator` marker
+    /// names its predicate (or, without a marker, the first of
+    /// [`logical_constraint_preds`] that links a child), with that
+    /// predicate's linked children loaded
     /// recursively (sorted by their own `fcns:sequenceIndex`, the same
     /// ordering bookkeeping every other list in this store uses - see
     /// the `oxigraph_backend` module doc's "Ordering" section) and re-wrapped in the
@@ -319,26 +320,47 @@ impl OxigraphCatalogCache {
             ));
         }
 
+        let marker = self.first_object(subject, &logical_operator_pred(), graph)?;
+        let mut chosen: Option<(NamedNode, LogicalConstraintBuilder, Vec<Quad>)> = None;
         for (predicate, build) in logical_constraint_preds() {
-            let child_quads = self.quads(Some(subject), Some(&predicate), None, graph)?;
-            if child_quads.is_empty() {
-                continue;
+            let is_marker = matches!(&marker, Some(Term::NamedNode(m)) if *m == predicate);
+            let links = self.quads(Some(subject), Some(&predicate), None, graph)?;
+            if marker.is_some() && !is_marker && !links.is_empty() {
+                return Err(StoreError::Backend(format!(
+                    "{} has fcns:logicalOperator {} but links its children with {}",
+                    subject.as_str(),
+                    marker.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    predicate
+                )));
             }
-            let mut child_entries = Vec::new();
-            for quad in child_quads {
-                let child_subject =
-                    expect_named_node(quad.object, "a logical constraint child reference")?;
-                child_entries.push(self.load_constraint(&child_subject, graph, depth + 1)?);
+            // With the marker, its predicate wins even with no links (an
+            // empty group). Without it, the first predicate in precedence
+            // order that links any child does, as `crawler` would parse it.
+            if chosen.is_none() && (is_marker || (marker.is_none() && !links.is_empty())) {
+                chosen = Some((predicate, build, links));
             }
-            child_entries.sort_by_key(|(index, _)| *index);
-            let children = child_entries.into_iter().map(|(_, c)| c).collect();
-            return Ok((index, build(children)));
         }
-
-        Err(StoreError::Backend(format!(
-            "{} is missing odrl:leftOperand and carries none of odrl:and/odrl:or/odrl:xone/odrl:andSequence",
-            subject.as_str()
-        )))
+        let Some((_, build, child_quads)) = chosen else {
+            return Err(StoreError::Backend(match &marker {
+                None => format!(
+                    "{} has neither odrl:leftOperand nor fcns:logicalOperator",
+                    subject.as_str()
+                ),
+                Some(operator) => format!(
+                    "{} has fcns:logicalOperator {operator}, which is none of odrl:and/odrl:or/odrl:xone/odrl:andSequence",
+                    subject.as_str()
+                ),
+            }));
+        };
+        let mut child_entries = Vec::new();
+        for quad in child_quads {
+            let child_subject =
+                expect_named_node(quad.object, "a logical constraint child reference")?;
+            child_entries.push(self.load_constraint(&child_subject, graph, depth + 1)?);
+        }
+        child_entries.sort_by_key(|(index, _)| *index);
+        let children = child_entries.into_iter().map(|(_, c)| c).collect();
+        Ok((index, build(children)))
     }
 
     pub(super) fn load_distribution(

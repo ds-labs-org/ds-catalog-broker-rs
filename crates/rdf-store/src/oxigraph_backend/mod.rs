@@ -45,19 +45,25 @@
 //! nesting reuses the exact same resource-naming scheme at every depth -
 //! carrying its own `fcns:sequenceIndex` (its position among its
 //! siblings) and, recursively, either shape again. A constraint resource
-//! therefore carries **at most one** of `odrl:leftOperand` or one of the
-//! four logical predicates, never both - `load_constraint` reads whichever
-//! is present, atomic taking precedence should a hand-crafted graph
-//! (outside this store's own writes) carry both.
+//! therefore carries **at most one** of `odrl:leftOperand` or
+//! `fcns:logicalOperator` (which names the group's logical predicate, so
+//! an empty group still reads back as that group), never both -
+//! `load_constraint` reads whichever is present, atomic taking precedence
+//! should a hand-crafted graph (outside this store's own writes) carry
+//! both. A group whose marker is missing is read from its link triples,
+//! taking the first of `odrl:xone`, `odrl:or`, `odrl:and` and
+//! `odrl:andSequence` that links a child (the precedence `crawler` parses
+//! with); a group whose links use a predicate other than its marker is
+//! an error.
 //!
 //! Recursion depth - both writing and reading - is bounded by
 //! `MAX_CONSTRAINT_DEPTH` (64), the exact same bound and rationale as
 //! `crawler::MAX_CONSTRAINT_DEPTH` and
 //! `ds-odrl-engine-rs::engine::constraint::MAX_CONSTRAINT_DEPTH`: a
-//! constraint nested past the bound is dropped (not written, with no
-//! dangling triple left behind) on write, the same way
-//! `crawler::parse_constraint` drops one past its own bound rather than
-//! growing a parser's call stack unboundedly - and reading back a graph
+//! catalog holding a constraint nested past the bound is refused on
+//! upsert, and nothing of it is written: dropping the over-deep child
+//! instead would loosen the policy, since an emptied `odrl:and` group
+//! matches everything. Reading back a graph
 //! that somehow carries one anyway (not producible by this store's own
 //! write path, but defended against regardless, e.g. a hand-written
 //! fixture or a future non-`crawler` producer) errors out rather than
@@ -205,7 +211,10 @@
 //!     compared against, not an identifier for another resource, so
 //!     giving it the IRI-or-literal treatment would change its RDF shape
 //!     based on incidental string content rather than ODRL semantics.
-//! - [`Logical`](catalog_core::Constraint::Logical) - exactly one of:
+//! - [`Logical`](catalog_core::Constraint::Logical) -
+//!   `<constraint> fcns:logicalOperator <op> .`, where `<op>` is the IRI of
+//!   the predicate below (`odrl:and`, ...), always written so a group with
+//!   no children round-trips; then exactly one of:
 //!   - `<constraint> odrl:and <child> .` - one per
 //!     [`LogicalConstraint::And`]
 //!     child, in order.
@@ -222,11 +231,8 @@
 //!   Each `<child>` is itself a full constraint resource (see "Resource
 //!   IRIs" above), recursively either shape again - up to
 //!   `MAX_CONSTRAINT_DEPTH` (64) levels deep, matching
-//!   `crawler::MAX_CONSTRAINT_DEPTH`; a child nested past that bound is
-//!   dropped entirely (no `odrl:and`/`odrl:or`/`odrl:xone`/
-//!   `odrl:andSequence` link triple written for it, and none of its own
-//!   triples either) rather than growing this store's own recursive
-//!   write/read past a safe bound.
+//!   `crawler::MAX_CONSTRAINT_DEPTH`; an upsert holding a child nested
+//!   past that bound fails and writes nothing.
 //!
 //! For each distribution resource `<distribution>` (from
 //! `Dataset.distributions`):
@@ -295,7 +301,7 @@
 //! `odrl:obligation`, `odrl:action`, `odrl:constraint`,
 //! `odrl:leftOperand`, `odrl:operator`, `odrl:rightOperand`,
 //! `odrl:assigner`, `odrl:assignee`, `odrl:and`, `odrl:or`, `odrl:xone`,
-//! `odrl:andSequence`, and `fcns:policyId` - are reserved on
+//! `odrl:andSequence`, `fcns:logicalOperator`, and `fcns:policyId` - are reserved on
 //! `Policy`/`Rule`/`Constraint` resources the same way, but those types
 //! have no generic property map at all, so there is nothing for them to
 //! collide with today either way. Flagged rather than defended against,
@@ -634,8 +640,17 @@ impl OxigraphCatalogCache {
             None => {
                 for (graph_iri, graph) in self.snapshots(None)? {
                     let node = decode_node_id(&graph_iri)?;
-                    if let Some(catalog) = self.load_catalog(&node, &graph)? {
-                        results.push(catalog);
+                    // One unreadable graph must not hide every other
+                    // catalog: it is skipped with a warning here, and still
+                    // an error when asked for by its own node.
+                    match self.load_catalog(&node, &graph) {
+                        Ok(Some(catalog)) => results.push(catalog),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            node = %node,
+                            %error,
+                            "skipping a catalog that cannot be decoded"
+                        ),
                     }
                 }
             }
