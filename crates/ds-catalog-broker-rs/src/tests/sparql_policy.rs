@@ -482,6 +482,7 @@ async fn sparql_cancels_a_query_that_runs_past_its_time_limit_with_503() {
         SparqlLimitsConfig {
             timeout: Duration::from_millis(50),
             max_rows: usize::MAX,
+            ..Default::default()
         },
     )
     .await;
@@ -517,4 +518,76 @@ async fn sparql_answers_a_result_within_the_row_cap() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+/// A `SELECT` whose cost is all in-memory join work: oxigraph never reads
+/// the store while evaluating it, so cancellation cannot stop it. Takes a
+/// couple of seconds in a debug build.
+fn uncancellable_query() -> String {
+    let values: String = (0..2000).map(|i| format!("{i} ")).collect();
+    format!("SELECT (COUNT(*) AS ?n) WHERE {{ VALUES ?a {{ {values} }} VALUES ?b {{ {values} }} }}")
+}
+
+async fn sparql_status(app: &Router, query: &str) -> (StatusCode, String) {
+    let uri = format!("/sparql?query={}", urlencoding::encode(query));
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn sparql_answers_503_when_every_evaluation_slot_is_busy() {
+    let state = test_state().with_sparql_limits(SparqlLimitsConfig {
+        max_concurrent: 1,
+        ..Default::default()
+    });
+    let busy = Arc::clone(&state.sparql_slots).try_acquire_owned().unwrap();
+    let app = build_router(state);
+
+    let (status, body) = sparql_status(&app, "ASK { ?s ?p ?o }").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert!(body.contains("busy"), "body: {body}");
+
+    drop(busy);
+    let (status, body) = sparql_status(&app, "ASK { ?s ?p ?o }").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a freed slot serves again. body: {body}"
+    );
+}
+
+/// The 503 for a timed-out query goes out at once, but its evaluation
+/// keeps running on the blocking pool; it must keep its slot until then,
+/// or repeated slow queries would pile up blocking threads.
+#[tokio::test]
+async fn a_timed_out_sparql_query_keeps_its_slot_until_evaluation_stops() {
+    let state = test_state().with_sparql_limits(SparqlLimitsConfig {
+        timeout: Duration::from_millis(50),
+        max_concurrent: 1,
+        ..Default::default()
+    });
+    let slots = Arc::clone(&state.sparql_slots);
+    let app = build_router(state);
+
+    let (status, body) = sparql_status(&app, &uncancellable_query()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    let (status, body) = sparql_status(&app, "ASK { ?s ?p ?o }").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the timed-out evaluation still runs, so no slot is free. body: {body}"
+    );
+    assert!(body.contains("busy"), "body: {body}");
+
+    // Once the runaway evaluation ends, its slot comes back.
+    let _slot = tokio::time::timeout(Duration::from_secs(60), slots.acquire_owned())
+        .await
+        .expect("the slot was never released")
+        .unwrap();
 }

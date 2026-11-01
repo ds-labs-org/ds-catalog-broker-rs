@@ -49,6 +49,9 @@ pub struct AppState {
     /// Time and size bounds on every `/sparql` evaluation - see
     /// [`SparqlLimitsConfig`]. Defaults to `SparqlLimitsConfig::default()`.
     pub sparql_limits: SparqlLimitsConfig,
+    /// One permit per `/sparql` evaluation allowed to run at once
+    /// ([`SparqlLimitsConfig::max_concurrent`]); set with `sparql_limits`.
+    pub sparql_slots: Arc<tokio::sync::Semaphore>,
     /// What the crawler reports, for `GET /ready`. `None` when no crawler
     /// runs (no `broker:participant`), in which case the broker is ready
     /// as soon as it serves.
@@ -70,6 +73,13 @@ pub struct SparqlLimitsConfig {
     /// rejected with `400 Bad Request` rather than truncated. Default:
     /// 10,000.
     pub max_rows: usize,
+    /// How many evaluations may run at once. A query over the limit gets
+    /// `503 Service Unavailable` straight away. An evaluation keeps its
+    /// slot until it actually stops, which can be after its timeout:
+    /// oxigraph only checks for cancellation when it reads the store, so
+    /// in-memory work (a `VALUES` cross product, say) runs to the end.
+    /// Default: 4.
+    pub max_concurrent: usize,
 }
 
 impl Default for SparqlLimitsConfig {
@@ -77,13 +87,14 @@ impl Default for SparqlLimitsConfig {
         Self {
             timeout: Duration::from_secs(10),
             max_rows: 10_000,
+            max_concurrent: 4,
         }
     }
 }
 
 impl SparqlLimitsConfig {
-    /// Reads `broker:sparqlQueryTimeoutMs` and `broker:sparqlMaxRows` (positive
-    /// integers) from the broker config. Unset is the default; any other value was checked
+    /// Reads `broker:sparqlQueryTimeoutMs`, `broker:sparqlMaxRows` and
+    /// `broker:sparqlMaxConcurrent` (positive integers) from the broker config. Unset is the default; any other value was checked
     /// when the config was read.
     pub fn from_settings(settings: &config::BrokerSettings) -> Self {
         let default = Self::default();
@@ -95,6 +106,7 @@ impl SparqlLimitsConfig {
             max_rows: settings
                 .positive_integer(config::SPARQL_MAX_ROWS)
                 .unwrap_or(default.max_rows),
+            ..default
         }
     }
 }
@@ -138,6 +150,9 @@ impl AppState {
             holder: None,
             oauth2: None,
             policy_filter: odrl_filter::PolicyFilterConfig::default(),
+            sparql_slots: Arc::new(tokio::sync::Semaphore::new(
+                SparqlLimitsConfig::default().max_concurrent,
+            )),
             sparql_limits: SparqlLimitsConfig::default(),
             crawl_status: None,
             shutdown: None,
@@ -168,6 +183,7 @@ impl AppState {
     /// Builder-style setter for the `/sparql` limits. See the
     /// `sparql_limits` field's doc comment.
     pub fn with_sparql_limits(mut self, sparql_limits: SparqlLimitsConfig) -> Self {
+        self.sparql_slots = Arc::new(tokio::sync::Semaphore::new(sparql_limits.max_concurrent));
         self.sparql_limits = sparql_limits;
         self
     }
