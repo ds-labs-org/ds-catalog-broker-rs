@@ -152,11 +152,11 @@ pub(super) type LogicalConstraintBuilder = fn(Vec<Constraint>) -> Constraint;
 /// with the `catalog_core::Constraint` constructor for that combinator,
 /// in the same fixed precedence [`crawler::LOGICAL_CONSTRAINT_KEYS`]
 /// uses when parsing (`xone`, then `or`, then `and`, then
-/// `andSequence`): [`OxigraphCatalogCache::load_constraint`] checks
-/// them in this order, so a hand-crafted constraint resource carrying
-/// more than one (malformed - this store's own write path only ever
-/// emits one) is at least read back the same way `crawler` would parse
-/// the equivalent malformed JSON-LD, rather than an arbitrary one.
+/// `andSequence`). [`OxigraphCatalogCache::load_constraint`] reads a
+/// group's predicate from its `fcns:logicalOperator` marker; only when a
+/// hand-crafted resource lacks the marker does it fall back to this
+/// order, taking the first predicate that links a child, the way
+/// `crawler` would parse the equivalent JSON-LD.
 pub(super) fn logical_constraint_preds() -> [(NamedNode, LogicalConstraintBuilder); 4] {
     [
         (odrl_xone_pred(), Constraint::xone),

@@ -268,9 +268,10 @@ impl OxigraphCatalogCache {
     /// [`write_constraint`]'s own numbering). Dispatches on which
     /// shape `subject` actually carries: `odrl:leftOperand` present
     /// means atomic (the existing, pre-logical-support behavior,
-    /// unchanged); otherwise, whichever of
-    /// [`logical_constraint_preds`]'s four predicates `subject` carries
-    /// means logical, with that predicate's linked children loaded
+    /// unchanged); otherwise the group's `fcns:logicalOperator` marker
+    /// names its predicate (or, without a marker, the first of
+    /// [`logical_constraint_preds`] that links a child), with that
+    /// predicate's linked children loaded
     /// recursively (sorted by their own `fcns:sequenceIndex`, the same
     /// ordering bookkeeping every other list in this store uses - see
     /// the `oxigraph_backend` module doc's "Ordering" section) and re-wrapped in the

@@ -50,17 +50,20 @@
 //! an empty group still reads back as that group), never both -
 //! `load_constraint` reads whichever is present, atomic taking precedence
 //! should a hand-crafted graph (outside this store's own writes) carry
-//! both.
+//! both. A group whose marker is missing is read from its link triples,
+//! taking the first of `odrl:xone`, `odrl:or`, `odrl:and` and
+//! `odrl:andSequence` that links a child (the precedence `crawler` parses
+//! with); a group whose links use a predicate other than its marker is
+//! an error.
 //!
 //! Recursion depth - both writing and reading - is bounded by
 //! `MAX_CONSTRAINT_DEPTH` (64), the exact same bound and rationale as
 //! `crawler::MAX_CONSTRAINT_DEPTH` and
 //! `ds-odrl-engine-rs::engine::constraint::MAX_CONSTRAINT_DEPTH`: a
-//! constraint nested past the bound is dropped on write (no link to it and
-//! none of its own triples; the group above it is kept, so it reads back
-//! with fewer children, or empty), the same way
-//! `crawler::parse_constraint` drops one past its own bound rather than
-//! growing a parser's call stack unboundedly - and reading back a graph
+//! catalog holding a constraint nested past the bound is refused on
+//! upsert, and nothing of it is written: dropping the over-deep child
+//! instead would loosen the policy, since an emptied `odrl:and` group
+//! matches everything. Reading back a graph
 //! that somehow carries one anyway (not producible by this store's own
 //! write path, but defended against regardless, e.g. a hand-written
 //! fixture or a future non-`crawler` producer) errors out rather than
@@ -228,11 +231,8 @@
 //!   Each `<child>` is itself a full constraint resource (see "Resource
 //!   IRIs" above), recursively either shape again - up to
 //!   `MAX_CONSTRAINT_DEPTH` (64) levels deep, matching
-//!   `crawler::MAX_CONSTRAINT_DEPTH`; a child nested past that bound is
-//!   dropped entirely (no `odrl:and`/`odrl:or`/`odrl:xone`/
-//!   `odrl:andSequence` link triple written for it, and none of its own
-//!   triples either) rather than growing this store's own recursive
-//!   write/read past a safe bound.
+//!   `crawler::MAX_CONSTRAINT_DEPTH`; an upsert holding a child nested
+//!   past that bound fails and writes nothing.
 //!
 //! For each distribution resource `<distribution>` (from
 //! `Dataset.distributions`):
@@ -295,13 +295,13 @@
 //! against): `rdf:type`, `dcat:dataset`, `dcat:service`,
 //! `dcat:distribution`, `dcat:accessService`, `dcat:endpointURL`,
 //! `dcat:endpointDescription`, `dct:format`, `fcns:participantId`,
-//! `fcns:sequenceIndex`, `fcns:logicalOperator`, and (new with the ODRL mapping above)
+//! `fcns:sequenceIndex`, and (new with the ODRL mapping above)
 //! `odrl:hasPolicy` for `Dataset.properties`. The rest of the ODRL mapping's
 //! own structural predicates - `odrl:permission`, `odrl:prohibition`,
 //! `odrl:obligation`, `odrl:action`, `odrl:constraint`,
 //! `odrl:leftOperand`, `odrl:operator`, `odrl:rightOperand`,
 //! `odrl:assigner`, `odrl:assignee`, `odrl:and`, `odrl:or`, `odrl:xone`,
-//! `odrl:andSequence`, and `fcns:policyId` - are reserved on
+//! `odrl:andSequence`, `fcns:logicalOperator`, and `fcns:policyId` - are reserved on
 //! `Policy`/`Rule`/`Constraint` resources the same way, but those types
 //! have no generic property map at all, so there is nothing for them to
 //! collide with today either way. Flagged rather than defended against,

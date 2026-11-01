@@ -298,11 +298,8 @@ impl OxigraphCatalogCache {
     /// the combinator), then recurses into [`write_constraint`] for
     /// each child at `depth + 1` - see the `oxigraph_backend` module doc's "Logical
     /// constraint groups" note. Bounded by [`MAX_CONSTRAINT_DEPTH`]: a
-    /// child that would be written past the bound is skipped entirely,
-    /// including its link triple, so no dangling/incomplete constraint
-    /// resource is ever left in the graph - mirroring
-    /// `crawler::parse_constraint` dropping an over-deep entry from the
-    /// parsed `Vec` outright rather than including a truncated one.
+    /// constraint past the bound is an error, which fails the whole
+    /// upsert before anything reaches the store.
     pub(super) fn write_constraint(
         &self,
         constraint: &Constraint,
