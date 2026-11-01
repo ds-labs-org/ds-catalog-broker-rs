@@ -639,7 +639,19 @@ impl OxigraphCatalogCache {
             }
             None => {
                 for (graph_iri, graph) in self.snapshots(None)? {
-                    let node = decode_node_id(&graph_iri)?;
+                    // A graph this backend did not write (outside the node
+                    // namespace, or badly percent-encoded) is skipped too.
+                    let node = match decode_node_id(&graph_iri) {
+                        Ok(node) => node,
+                        Err(error) => {
+                            tracing::warn!(
+                                graph = %graph_iri,
+                                %error,
+                                "skipping a named graph whose name is not a node id"
+                            );
+                            continue;
+                        }
+                    };
                     // One unreadable graph must not hide every other
                     // catalog: it is skipped with a warning here, and still
                     // an error when asked for by its own node.
@@ -656,8 +668,10 @@ impl OxigraphCatalogCache {
             }
         }
 
-        // Deterministic ordering, so pagination is stable.
-        results.sort_by(|a, b| a.id.cmp(&b.id));
+        // Deterministic ordering, so pagination is stable. Participants may
+        // share a catalog id (EDC's default is often just "catalog"), and
+        // graphs come back in hash order, so the origin node breaks ties.
+        results.sort_by(|a, b| (&a.id, &a.origin_node).cmp(&(&b.id, &b.origin_node)));
 
         let skipped = results.into_iter().skip(query.offset);
         let limited: Vec<Catalog> = match query.limit {
