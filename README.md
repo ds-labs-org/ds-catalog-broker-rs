@@ -76,8 +76,8 @@ Rust crates rather than Java SPI modules, echoing EDC's `crawler-spi` /
   `Constraint` model (atomic `leftOperand`/`operator`/`rightOperand`
   constraints and nested `odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`
   logical groups alike).
-- `rdf-store` — the semantic cache: `CatalogCache` trait, in-memory and
-  Oxigraph-backed implementations. See ["The RDF backend"](#the-rdf-backend-semantic-cache).
+- `rdf-store` — the semantic cache: `CatalogCache` trait and its
+  Oxigraph-backed implementation. See ["The RDF backend"](#the-rdf-backend-semantic-cache).
 - `dcp-core` — DCP JWS sign/verify and `did:web` primitives, used by
   `crawler`'s **holder** role to present this participant's own
   credential to a gated Catalog Service.
@@ -105,8 +105,9 @@ implements it on [Oxigraph](https://crates.io/crates/oxigraph) (via
 catalog is naturally a set of named graphs and because SPARQL requires a
 real triple store. In-memory only, matching EDC's own federated-catalog
 cache — crawled data is repopulated on every restart, not durably
-stored. `ds-catalog-broker-rs` falls back to a plain `InMemoryCatalogCache`
-(a bare `HashMap`) when no harvester is configured.
+stored. It is the only backend: with no participant configured the broker
+serves an empty store, with `/sparql` enabled, and the tests run on the
+same in-memory Oxigraph store.
 
 **Real DCAT triples, not a JSON-blob bridge.** Each crawled `Catalog` is
 decomposed into `dcat:Catalog`/`dcat:Dataset`/`dcat:Distribution`/
@@ -181,7 +182,7 @@ participant/dataset scale (2 participants, 10 datasets).
 ```
 crates/
   catalog-core/           domain types
-  rdf-store/               CatalogCache trait + in-memory/Oxigraph implementations
+  rdf-store/               CatalogCache trait + Oxigraph implementation
   dcp-core/                DCP JWS/did:web primitives (crawler's holder role)
   crawler/                 crawl engine
   ds-catalog-broker-rs/    HTTP surface: /catalog, /sparql, management API, DCP holder routes

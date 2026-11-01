@@ -6,8 +6,8 @@
 //! whether RDF at all, vs. e.g. a plain document store) backs this is a
 //! decision being made iteratively - see the `dataspace` study repo's
 //! `docs/spikes/` for the exploration behind that choice - so this crate
-//! only fixes the shape of the trait plus one in-memory implementation
-//! good enough to unblock `ds-catalog-broker-rs` and its own tests.
+//! fixes the shape of the trait, implemented by
+//! [`oxigraph_backend::OxigraphCatalogCache`].
 //!
 //! The trait mirrors Eclipse EDC's `FederatedCatalogCache` SPI
 //! (`save`/`query`/`deleteExpired`/`expireAll`) but adapted to a
@@ -78,7 +78,6 @@
 //! `catalog_core::Constraint`.
 
 mod cache;
-pub mod memory;
 pub mod oxigraph_backend;
 
 pub use cache::{CatalogCache, CatalogQuery, StoreError, StoreResult};

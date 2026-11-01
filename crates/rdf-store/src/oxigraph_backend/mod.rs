@@ -252,7 +252,7 @@
 //!   if `DataService.endpoint_description` is `Some`. Stored as a plain
 //!   literal rather than an IRI even though DCAT's formal range for this
 //!   property is also `rdfs:Resource`: this domain field holds free text
-//!   (e.g. `"dataspace-protocol-http:1.0"`, see `seed_sample_catalog`), not
+//!   (e.g. `"dataspace-protocol-http:1.0"`), not
 //!   a URL, and DCAT's own usage note allows literal values in practice.
 //!
 //! ### Generic properties (`Catalog.properties` / `Dataset.properties`)
@@ -567,9 +567,8 @@ impl OxigraphCatalogCache {
 impl CatalogCache for OxigraphCatalogCache {
     async fn upsert(&self, catalog: Catalog) -> StoreResult<()> {
         let graph = node_iri(&catalog.origin_node);
-        // Insert-or-replace: clear any prior graph for this node first,
-        // matching the in-memory impl's `HashMap::insert` overwrite
-        // semantics (and EDC's upsert-by-origin-node-url behavior).
+        // Insert-or-replace: clear any prior graph for this node first
+        // (EDC's upsert-by-origin-node-url behavior).
         self.clear_named_graph(&graph)?;
         self.write_catalog(&catalog, &graph)?;
         Ok(())
@@ -604,8 +603,7 @@ impl CatalogCache for OxigraphCatalogCache {
             }
         }
 
-        // Same deterministic ordering + pagination as `memory`'s
-        // implementation, so the two backends are behavior-equivalent.
+        // Deterministic ordering, so pagination is stable.
         results.sort_by(|a, b| a.id.cmp(&b.id));
 
         let skipped = results.into_iter().skip(query.offset);

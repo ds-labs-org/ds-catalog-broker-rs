@@ -9,8 +9,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use rdf_store::CatalogQuery;
 use rdf_store::oxigraph_backend::{CancellationToken, SparqlError, SparqlLimits};
+use rdf_store::{CatalogCache, CatalogQuery};
 use serde::Deserialize;
 
 use super::ErrorResponse;
@@ -96,10 +96,6 @@ pub(super) fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 /// (read-only by construction, whole-store-by-default, real
 /// `application/sparql-results+json` output).
 ///
-/// - No `sparql` backend configured (`AppState::sparql` is `None`, i.e.
-///   the in-memory cache is running - see that field's doc comment): 501
-///   Not Implemented. This is a genuine backend limitation, not a
-///   not-yet-built route, hence 501 rather than 404.
 /// - `Accept` header present and none of its media ranges match
 ///   `application/sparql-results+json` (see `accepts_sparql_results_json`):
 ///   406 Not Acceptable.
@@ -137,16 +133,6 @@ pub(super) async fn sparql_route(
     let claims = match check_oauth2_bearer(&state, &headers) {
         Ok(claims) => claims,
         Err(response) => return *response,
-    };
-
-    let Some(sparql) = &state.sparql else {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "this instance is running the in-memory catalog cache, which has no SPARQL \
-             (Oxigraph) backend - configure a broker:participant to enable the SPARQL endpoint"
-                .to_string(),
-        )
-            .into_response();
     };
 
     if !accepts_sparql_results_json(&headers) {
@@ -195,9 +181,9 @@ pub(super) async fn sparql_route(
         cancellation: Some(cancellation.clone()),
         max_rows: Some(state.sparql_limits.max_rows),
     };
-    let sparql = Arc::clone(sparql);
+    let store = Arc::clone(&state.cache);
     let evaluation = tokio::task::spawn_blocking(move || {
-        sparql.sparql_query_json_limited(&query, visible_resources.as_ref(), &limits)
+        store.sparql_query_json_limited(&query, visible_resources.as_ref(), &limits)
     });
     let result = match tokio::time::timeout(state.sparql_limits.timeout, evaluation).await {
         Ok(Ok(result)) => result,

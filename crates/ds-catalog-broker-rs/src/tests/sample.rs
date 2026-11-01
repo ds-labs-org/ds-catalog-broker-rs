@@ -1,16 +1,10 @@
-//! The sample catalog a server started without a crawler serves.
+//! A fixed sample catalog for the router tests.
 
 use catalog_core::{Catalog, DataService, Dataset, Distribution, NodeId};
 use rdf_store::{CatalogCache, StoreResult};
 
-/// Seed `cache` with one sample catalog, so a freshly started server (or a
-/// test) has something real to serve from `GET /catalog` before any
-/// crawler exists to populate it.
-///
-/// This stands in for the not-yet-built crawler: it upserts exactly the
-/// same way a real crawl result would, through the public `CatalogCache`
-/// trait, so it exercises the same end-to-end path as production code
-/// rather than poking the cache's internals.
+/// Seed `cache` with one sample catalog. It upserts the same way a crawl
+/// result would, through the public `CatalogCache` trait.
 ///
 /// Dataset ids (`CAT0101`, `CAT0102`) are deliberately aligned with
 /// `vendor/eclipse-edc-connector`'s own DSP-TCK seed data
@@ -24,7 +18,7 @@ use rdf_store::{CatalogCache, StoreResult};
 /// implementations still diverge on everything else about how those
 /// datasets are represented on the wire (see that report's fidelity
 /// section).
-pub async fn seed_sample_catalog(cache: &dyn CatalogCache) -> StoreResult<()> {
+pub(super) async fn seed_sample_catalog(cache: &dyn CatalogCache) -> StoreResult<()> {
     let node = NodeId::new("sample-participant");
     let mut catalog = Catalog::new("sample-catalog", node);
     catalog.participant_id = Some("did:example:sample-participant".to_string());

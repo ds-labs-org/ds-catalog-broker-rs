@@ -146,7 +146,7 @@ use dcp_core::{
     verify_jws_signature,
 };
 use ds_catalog_broker_rs::{AppState, build_router};
-use rdf_store::memory::InMemoryCatalogCache;
+use rdf_store::oxigraph_backend::OxigraphCatalogCache;
 use rdf_store::{CatalogCache, CatalogQuery};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -207,7 +207,8 @@ async fn resolve_did_reaches_the_real_holder_dsp_did_route() {
     ));
     let holder_did = holder.key_pair.own_did.clone();
 
-    let state = AppState::new(Arc::new(InMemoryCatalogCache::new())).with_holder(Some(holder));
+    let state = AppState::new(Arc::new(OxigraphCatalogCache::in_memory().unwrap()))
+        .with_holder(Some(holder));
     let app = build_router(state);
     let _server = spawn(listener, app);
 
@@ -259,7 +260,8 @@ async fn credential_service_endpoint_is_the_real_reachable_presentation_api() {
         "published endpoint is the base URL"
     );
 
-    let state = AppState::new(Arc::new(InMemoryCatalogCache::new())).with_holder(Some(holder));
+    let state = AppState::new(Arc::new(OxigraphCatalogCache::in_memory().unwrap()))
+        .with_holder(Some(holder));
     let app = build_router(state);
     let _server = spawn(listener, app);
 
@@ -677,8 +679,8 @@ async fn spawn_holder(credential_jws_for: impl FnOnce(&str) -> String) -> Holder
     holder.credential_jws = credential_jws_for(&holder_did);
 
     let holder = Arc::new(holder);
-    let state =
-        AppState::new(Arc::new(InMemoryCatalogCache::new())).with_holder(Some(holder.clone()));
+    let state = AppState::new(Arc::new(OxigraphCatalogCache::in_memory().unwrap()))
+        .with_holder(Some(holder.clone()));
     let server = spawn(listener, build_router(state));
 
     HolderRig {
@@ -763,7 +765,7 @@ async fn crawl_once_pulls_open_and_dcp_gated_catalogs_with_real_per_caller_filte
 
     let participants = vec![clone_entry(&open.entry), clone_entry(&gated.entry)];
     let http = reqwest::Client::new();
-    let cache = InMemoryCatalogCache::new();
+    let cache = OxigraphCatalogCache::in_memory().unwrap();
 
     let summary = crawl_once(
         &http,
@@ -853,7 +855,7 @@ async fn crawl_once_records_a_failure_for_an_expired_dcp_credential_and_preserve
 
     let participants = vec![clone_entry(&gated.entry)];
     let http = reqwest::Client::new();
-    let cache = InMemoryCatalogCache::new();
+    let cache = OxigraphCatalogCache::in_memory().unwrap();
 
     // Seed the cache with prior, good crawl data for this same node -
     // proof that a failed re-crawl must not clobber it.

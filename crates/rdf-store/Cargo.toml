@@ -4,13 +4,12 @@ version.workspace = true
 edition.workspace = true
 license = "GPL-3.0-or-later"
 repository.workspace = true
-description = "The Federated Catalog Semantic Harvester's cache: a storage-agnostic async trait, an in-memory reference implementation, and an Oxigraph-backed (RDF/semantic) implementation."
+description = "The Federated Catalog Semantic Harvester's cache: a storage-agnostic async trait and its Oxigraph-backed (RDF/semantic) implementation."
 
 [dependencies]
 catalog-core = { path = "../catalog-core" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 # default-features = false: contreforts-kg's own `default = ["rocksdb"]`
 # feature (vendor/contreforts-kg/Cargo.toml) re-enables oxigraph's
 # RocksDB backend, which pulls in oxrocksdb-sys (a from-source C++/cmake

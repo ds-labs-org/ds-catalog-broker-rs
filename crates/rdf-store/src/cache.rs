@@ -16,9 +16,8 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// A query over stored catalogs.
 ///
 /// Deliberately minimal - a from-scratch analogue of EDC's `QuerySpec`,
-/// sized to what the in-memory backend here can serve. A real RDF backend
-/// will likely need a richer query shape (e.g. SPARQL passthrough); that
-/// is expected to extend or replace this type, not be forced through it.
+/// sized to what the routes need. Richer queries go through SPARQL
+/// (`OxigraphCatalogCache::sparql_query_json`), not through this type.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogQuery {
     pub origin_node: Option<NodeId>,

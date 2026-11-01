@@ -16,7 +16,7 @@ use edc_connector_client::types::properties::PropertyValue;
 use edc_federated_catalog_client::ListOfferBody;
 use edc_federated_catalog_client::models::FederatedCatalogOffer;
 use http_body_util::BodyExt;
-use rdf_store::memory::InMemoryCatalogCache;
+use rdf_store::oxigraph_backend::OxigraphCatalogCache;
 use rdf_store::{CatalogCache, CatalogQuery};
 use tower::ServiceExt;
 
@@ -28,12 +28,15 @@ use crate::routes::{
     HealthResponse, catalog::CatalogListResponse, policy::CATALOG_VISIBILITY_ACTION,
 };
 use crate::{AppState, SparqlLimitsConfig, config, odrl_filter};
-use crate::{build_router, crawl_limits_from_settings, seed_sample_catalog};
+use crate::{build_router, crawl_limits_from_settings};
+use sample::seed_sample_catalog;
 
 mod bearer_gate;
 mod catalog;
 mod management;
 mod policy;
+mod sample;
+mod serving;
 mod sparql;
 mod sparql_policy;
 
@@ -41,10 +44,10 @@ mod sparql_policy;
 use bearer_gate::{bearer, oauth2_catalog_state, oauth2_config};
 use management::catalog_request;
 use policy::{catalog_with_open_and_gated_datasets, eu_resident_claims};
-use sparql::{participant_catalog, sparql_test_state};
+use sparql::participant_catalog;
 
 fn test_state() -> AppState {
-    AppState::new(Arc::new(InMemoryCatalogCache::new()))
+    AppState::new(Arc::new(OxigraphCatalogCache::in_memory().unwrap()))
 }
 
 #[test]

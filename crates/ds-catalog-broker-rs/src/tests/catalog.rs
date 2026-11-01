@@ -95,47 +95,6 @@ async fn catalog_endpoint_serves_seeded_sample_catalog() {
     assert_eq!(catalog.data_services.len(), 1);
 }
 
-/// Proves `AppState.cache: Arc<dyn CatalogCache>` genuinely works with
-/// the real Oxigraph-backed implementation, not just
-/// `InMemoryCatalogCache` - the backend `main.rs` switches to when
-/// the config lists a `broker:participant` (see that function's comments).
-/// Exercises `GET /catalog` end to end through the router, not just
-/// the cache trait directly. (Previously exercised the now-removed
-/// `POST /dsp/catalog/request` DSP-serving endpoint - see
-/// `docs/gap-analysis-2026-08-27.md` §1 for why that endpoint is
-/// gone; this test keeps the same "real Oxigraph backend through the
-/// router" coverage against the surface that replaced it.)
-#[tokio::test]
-async fn catalog_endpoint_serves_data_from_the_oxigraph_backend() {
-    let cache: Arc<dyn CatalogCache> =
-        Arc::new(rdf_store::oxigraph_backend::OxigraphCatalogCache::in_memory().unwrap());
-    seed_sample_catalog(&*cache).await.unwrap();
-    let state = AppState::new(cache);
-
-    let app = build_router(state);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/catalog?node_id=sample-participant")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let parsed: CatalogListResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(parsed.catalogs.len(), 1);
-    let mut ids: Vec<&str> = parsed.catalogs[0]
-        .datasets
-        .iter()
-        .map(|d| d.id.as_str())
-        .collect();
-    ids.sort_unstable();
-    assert_eq!(ids, vec!["CAT0101", "CAT0102"]);
-}
-
 #[tokio::test]
 async fn catalog_endpoint_filters_by_unknown_node_id() {
     let state = test_state();

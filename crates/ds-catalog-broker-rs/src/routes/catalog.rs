@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
 };
 use catalog_core::{Catalog, NodeId};
-use rdf_store::CatalogQuery;
+use rdf_store::{CatalogCache, CatalogQuery};
 use serde::{Deserialize, Serialize};
 
 use super::ErrorResponse;

@@ -2,15 +2,6 @@ use super::*;
 
 // --- `/sparql` (gap analysis §3.3) --------------------------------------
 
-/// `AppState` wired the way `main.rs` wires it once
-/// the config lists a `broker:participant`: a real Oxigraph-backed cache, with
-/// `AppState::sparql` pointed at that same store so `/sparql` is live.
-pub(super) fn sparql_test_state() -> AppState {
-    let store = Arc::new(rdf_store::oxigraph_backend::OxigraphCatalogCache::in_memory().unwrap());
-    let cache: Arc<dyn CatalogCache> = store.clone();
-    AppState::new(cache).with_sparql(Some(store))
-}
-
 /// A small but real per-participant catalog - same shape as
 /// `seed_sample_catalog`'s fixture (one dataset, one distribution, one
 /// data service), parameterized by origin node so two distinct
@@ -47,7 +38,7 @@ pub(super) fn participant_catalog(node_id: &str, catalog_id: &str, dataset_id: &
 /// serialization all actually work together through the router.
 #[tokio::test]
 async fn sparql_get_select_finds_datasets_from_both_seeded_participants() {
-    let state = sparql_test_state();
+    let state = test_state();
     state
         .cache
         .upsert(participant_catalog("node-a", "cat-a", "DATASET-A"))
@@ -108,7 +99,7 @@ async fn sparql_get_select_finds_datasets_from_both_seeded_participants() {
 /// path and assertions as the GET test above.
 #[tokio::test]
 async fn sparql_post_form_encoded_select_finds_seeded_dataset() {
-    let state = sparql_test_state();
+    let state = test_state();
     state
         .cache
         .upsert(participant_catalog("node-a", "cat-a", "DATASET-A"))
@@ -148,7 +139,7 @@ async fn sparql_post_form_encoded_select_finds_seeded_dataset() {
 /// spec-shaped `{"head":{},"boolean":true}` body.
 #[tokio::test]
 async fn sparql_get_ask_returns_true_over_http() {
-    let state = sparql_test_state();
+    let state = test_state();
     state
         .cache
         .upsert(participant_catalog("node-a", "cat-a", "DATASET-A"))
@@ -169,13 +160,13 @@ async fn sparql_get_ask_returns_true_over_http() {
     assert_eq!(parsed, serde_json::json!({"head": {}, "boolean": true}));
 }
 
-/// The in-memory backend (no `broker:participant`, `AppState::sparql`
-/// is `None`) has no SPARQL capability at all - `/sparql` must say so
-/// plainly (501), not 404 (the route exists) and not pretend to
-/// answer.
+/// There is one serving mode: the store the router is given is the store
+/// `/sparql` reads, with or without a crawler. A fresh store answers an
+/// empty result, not 501.
 #[tokio::test]
-async fn sparql_endpoint_returns_501_when_no_oxigraph_backend_is_configured() {
-    let app = build_router(test_state());
+async fn sparql_is_served_from_the_state_cache_without_a_crawler() {
+    let store = rdf_store::oxigraph_backend::OxigraphCatalogCache::in_memory().unwrap();
+    let app = build_router(AppState::new(Arc::new(store)));
     let response = app
         .oneshot(
             Request::builder()
@@ -185,12 +176,15 @@ async fn sparql_endpoint_returns_501_when_no_oxigraph_backend_is_configured() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed, serde_json::json!({"head": {}, "boolean": false}));
 }
 
 #[tokio::test]
 async fn sparql_endpoint_requires_a_query_parameter() {
-    let app = build_router(sparql_test_state());
+    let app = build_router(test_state());
     let response = app
         .oneshot(
             Request::builder()
@@ -207,7 +201,7 @@ async fn sparql_endpoint_requires_a_query_parameter() {
 /// is 406, not a silent fallback to JSON anyway.
 #[tokio::test]
 async fn sparql_endpoint_rejects_an_unacceptable_accept_header() {
-    let app = build_router(sparql_test_state());
+    let app = build_router(test_state());
     let response = app
         .oneshot(
             Request::builder()
@@ -228,7 +222,7 @@ async fn sparql_endpoint_rejects_an_unacceptable_accept_header() {
 /// use.
 #[tokio::test]
 async fn sparql_endpoint_rejects_an_update_operation_and_leaves_the_store_unchanged() {
-    let state = sparql_test_state();
+    let state = test_state();
     state
         .cache
         .upsert(participant_catalog("node-a", "cat-a", "DATASET-A"))
