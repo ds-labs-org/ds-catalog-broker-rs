@@ -39,7 +39,7 @@ async fn main() {
     // The Turtle config (see `ds_catalog_broker_rs::config`'s module doc).
     // An explicit `CONFIG_STORE_PATH` (path or URL) that cannot be read panics on boot,
     // and so does an invalid participant or holder resource in it.
-    let settings = BrokerSettings::load(&http_client)
+    let settings = BrokerSettings::load()
         .await
         .unwrap_or_else(|err| panic!("failed to load the broker configuration: {err}"));
 

@@ -379,7 +379,7 @@ pub struct BrokerSettings {
 impl BrokerSettings {
     /// Resolve `CONFIG_STORE_PATH` (see the module doc) and read the config it names, if
     /// there is one. `http` is used only for an `http(s)://` location.
-    pub async fn load(http: &reqwest::Client) -> Result<Self, BrokerConfigError> {
+    pub async fn load() -> Result<Self, BrokerConfigError> {
         let raw = std::env::var(CONFIG_STORE_PATH_ENV)
             .ok()
             .filter(|v| !v.is_empty());
@@ -407,7 +407,7 @@ impl BrokerSettings {
             },
         };
 
-        let mut settings = Self::from_location(&location, http).await?;
+        let mut settings = Self::from_location(&location).await?;
         tracing::info!(
             location = %location,
             settings = settings.values.len(),
@@ -422,10 +422,7 @@ impl BrokerSettings {
     /// *not* opened with [`ConfigStore::open`], which creates a missing directory and rewrites a
     /// corrupt `config_graph.ttl` from its `.bak.N` backups. A missing or unparsable file is an
     /// error instead.
-    pub async fn from_location(
-        location: &ConfigLocation,
-        http: &reqwest::Client,
-    ) -> Result<Self, BrokerConfigError> {
+    pub async fn from_location(location: &ConfigLocation) -> Result<Self, BrokerConfigError> {
         match location {
             ConfigLocation::Local(path) => {
                 let file = if path.is_dir() {
@@ -451,6 +448,7 @@ impl BrokerSettings {
                     location: location.to_string(),
                     source,
                 };
+                let http = reqwest::Client::new();
                 let turtle = http
                     .get(url.clone())
                     .header(reqwest::header::ACCEPT, "text/turtle")
@@ -1237,7 +1235,7 @@ mod tests {
         let crawler = crawler_from(
             "<urn:c> a broker:BrokerConfig ; broker:crawlIntervalSecs 5 ;\n\
              broker:participant [ a broker:Participant ; broker:participantId \"p\" ;\n\
-               broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl \"https://h/c\" ;\n\
                broker:credentialProtocol \"dcp\" ; broker:providerDid \"did:web:h\" ] ;\n\
              broker:holder [ a broker:Holder ; broker:ownDidHost \"h\" ;\n\
                broker:credentialJwsFile <file:///run/secrets/holder.jws> ;\n\
@@ -1312,7 +1310,7 @@ mod tests {
         let err = crawler_from(
             "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
              <urn:p> a broker:Participant ; broker:participantId \"p\" ;\n\
-               broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl \"https://h/c\" ;\n\
                broker:credentialProtocol \"dcp\" ; broker:providerDid \"did:web:h\" .\n",
         )
         .unwrap_err();
@@ -1682,6 +1680,8 @@ mod tests {
             "http://10.0.0.5:8080/broker.ttl",
             "http://127.0.0.1.example.org/broker.ttl",
             "HTTP://config.example.org/broker.ttl",
+            // A name is only as local as the resolver makes it.
+            "http://localhost:8000/broker.ttl",
         ] {
             assert!(
                 matches!(
@@ -1694,7 +1694,6 @@ mod tests {
         for raw in [
             "http://127.0.0.1:8000/broker.ttl",
             "http://127.1.2.3/broker.ttl",
-            "http://localhost:8000/broker.ttl",
             "http://[::1]:8000/broker.ttl",
             "https://config.example.org/broker.ttl",
         ] {
@@ -1710,9 +1709,7 @@ mod tests {
         let (dir, _store) = store_with(ONE_SETTING);
         let url = Url::from_directory_path(dir.path()).unwrap();
         let location = ConfigLocation::parse(url.as_str()).unwrap();
-        let settings = BrokerSettings::from_location(&location, &reqwest::Client::new())
-            .await
-            .unwrap();
+        let settings = BrokerSettings::from_location(&location).await.unwrap();
         assert_eq!(settings.get(HTTP_API_ADDR).as_deref(), Some("0.0.0.0:9000"));
     }
 
@@ -1726,9 +1723,7 @@ mod tests {
             Url::from_file_path(&file).unwrap().to_string(),
         ] {
             let location = ConfigLocation::parse(&raw).unwrap();
-            let settings = BrokerSettings::from_location(&location, &reqwest::Client::new())
-                .await
-                .unwrap();
+            let settings = BrokerSettings::from_location(&location).await.unwrap();
             assert_eq!(settings.get(HTTP_API_ADDR).as_deref(), Some("0.0.0.0:9000"));
         }
     }
@@ -1751,13 +1746,88 @@ mod tests {
         format!("http://{addr}")
     }
 
+    #[test]
+    fn the_refusal_does_not_echo_a_password_in_the_url() {
+        let err = ConfigLocation::parse("http://svc:s3cr3t@config.example.org/broker.ttl")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("s3cr3t"), "{err}");
+        let location = ConfigLocation::Remote(
+            Url::parse("https://svc:s3cr3t@config.example.org/broker.ttl").unwrap(),
+        );
+        assert!(!location.to_string().contains("s3cr3t"), "{location}");
+    }
+
+    /// The rule holds however the location was built, not only through
+    /// `ConfigLocation::parse`.
+    #[tokio::test]
+    async fn a_remote_plain_http_location_is_refused_before_any_request() {
+        let location =
+            ConfigLocation::Remote(Url::parse("http://config.invalid/broker.ttl").unwrap());
+        assert!(matches!(
+            BrokerSettings::from_location(&location).await,
+            Err(BrokerConfigError::InsecureRemote(_))
+        ));
+    }
+
+    /// A redirect must not lead the fetch somewhere `CONFIG_STORE_PATH`
+    /// itself could not point.
+    #[tokio::test]
+    async fn a_redirect_to_a_location_that_would_be_refused_is_not_followed() {
+        use axum::{Router, response::Redirect, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/start.ttl",
+                get(move || async move {
+                    Redirect::temporary(&format!("http://localhost:{port}/broker.ttl"))
+                }),
+            )
+            .route("/broker.ttl", get(|| async { ONE_SETTING }));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let location =
+            ConfigLocation::parse(&format!("http://127.0.0.1:{port}/start.ttl")).unwrap();
+        assert!(
+            BrokerSettings::from_location(&location).await.is_err(),
+            "followed a redirect to plain http on a non-loopback-literal host"
+        );
+    }
+
+    /// A gated participant's endpoints carry the crawler's credential, so
+    /// they need https too (or a loopback address); an open one does not.
+    #[test]
+    fn a_gated_participant_needs_https_endpoints() {
+        assert_eq!(
+            participant_error(
+                "broker:participantId \"p\" ; broker:participantName \"P\" ; \
+                 broker:catalogRequestUrl \"http://h/c\" ; \
+                 broker:credentialProtocol \"dcp\" ; broker:providerDid \"did:web:h\""
+            ),
+            CATALOG_REQUEST_URL
+        );
+        assert_eq!(
+            participant_error(&format!(
+                "{ID_NAME_URL} ; broker:credentialProtocol \"oid4vp\" ; \
+                 broker:oid4vpResponseUri \"http://h/response\""
+            )),
+            OID4VP_RESPONSE_URI
+        );
+        let open = "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; broker:participantId \"p\" ; \
+             broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" .\n";
+        assert!(
+            crawler_from(open).is_ok(),
+            "an open participant may use http"
+        );
+    }
+
     #[tokio::test]
     async fn fetches_turtle_over_http() {
         let base = serve_turtle().await;
         let location = ConfigLocation::parse(&format!("{base}/broker.ttl")).unwrap();
-        let settings = BrokerSettings::from_location(&location, &reqwest::Client::new())
-            .await
-            .unwrap();
+        let settings = BrokerSettings::from_location(&location).await.unwrap();
         assert_eq!(settings.get(HTTP_API_ADDR).as_deref(), Some("0.0.0.0:9000"));
     }
 
@@ -1766,7 +1836,7 @@ mod tests {
         let base = serve_turtle().await;
         let location = ConfigLocation::parse(&format!("{base}/missing.ttl")).unwrap();
         assert!(matches!(
-            BrokerSettings::from_location(&location, &reqwest::Client::new()).await,
+            BrokerSettings::from_location(&location).await,
             Err(BrokerConfigError::Fetch { .. })
         ));
     }
@@ -1777,7 +1847,7 @@ mod tests {
         let missing = dir.path().join("nope");
         let location = ConfigLocation::Local(missing.clone());
         assert!(matches!(
-            BrokerSettings::from_location(&location, &reqwest::Client::new()).await,
+            BrokerSettings::from_location(&location).await,
             Err(BrokerConfigError::Read { .. })
         ));
         assert!(!missing.exists());
@@ -1791,7 +1861,7 @@ mod tests {
         std::fs::write(dir.path().join("config_graph.ttl.bak.1"), ONE_SETTING).unwrap();
         let location = ConfigLocation::Local(dir.path().to_path_buf());
         assert!(matches!(
-            BrokerSettings::from_location(&location, &reqwest::Client::new()).await,
+            BrokerSettings::from_location(&location).await,
             Err(BrokerConfigError::Parse { .. })
         ));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "not turtle");
@@ -1889,7 +1959,7 @@ mod tests {
     }
 
     const ID_NAME_URL: &str = "broker:participantId \"p\" ; broker:participantName \"P\" ; \
-         broker:catalogRequestUrl \"http://h/c\"";
+         broker:catalogRequestUrl \"https://h/c\"";
 
     #[test]
     fn participant_values_that_do_not_parse_are_errors() {

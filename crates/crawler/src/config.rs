@@ -360,39 +360,39 @@ mod tests {
         assert!(matches!(err, ConfigError::MissingHolder { id } if id == "gated"));
     }
 
-    /// A compact JWS whose header is `{"alg":"ES256","typ":"JWT"}`.
-    const VALID_JWS: &str = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2YyI6e319.c2lnbmF0dXJl";
+    /// Encode `json` as one base64url JWS segment.
+    fn segment(json: &str) -> String {
+        dcp_core::b64_encode(json)
+    }
+
+    /// A compact JWS: `header` and `payload` are JSON, the signature is
+    /// arbitrary (its check is the verifier's business).
+    fn jws(header: &str, payload: &str) -> String {
+        format!("{}.{}.c2lnbmF0dXJl", segment(header), segment(payload))
+    }
+
+    /// A VC-JWT whose header names ES256.
+    fn valid_jws() -> String {
+        jws(
+            r#"{"alg":"ES256","typ":"JWT"}"#,
+            r#"{"vc":{"type":["VerifiableCredential","FederatedCatalogAccessCredential"]}}"#,
+        )
+    }
 
     /// Write `content` to a fresh credential file and read it back.
     fn read_credential(content: &str) -> Result<String, ConfigError> {
-        let dir = tempfile_dir();
-        let file = dir.join("holder.jws");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("holder.jws");
         std::fs::write(&file, content).unwrap();
         let mut config = holder();
         config.credential_jws_file = file;
-        let read = config.read_credential_jws();
-        std::fs::remove_dir_all(&dir).unwrap();
-        read
-    }
-
-    fn tempfile_dir() -> PathBuf {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "crawler-holder-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        config.read_credential_jws()
     }
 
     #[test]
     fn reads_and_trims_the_credential_file() {
-        assert_eq!(
-            read_credential(&format!("{VALID_JWS}\n")).unwrap(),
-            VALID_JWS
-        );
+        let valid = valid_jws();
+        assert_eq!(read_credential(&format!("{valid}\n")).unwrap(), valid);
         assert!(matches!(
             read_credential("  \n"),
             Err(ConfigError::EmptyCredentialFile { .. })
@@ -404,6 +404,10 @@ mod tests {
     /// JSON credential.
     #[test]
     fn rejects_a_credential_file_that_is_not_a_compact_jws() {
+        // A VC 2.0 JOSE credential (the payload is the credential) passes.
+        let vc2 = jws(r#"{"alg":"ES256"}"#, r#"{"type":["VerifiableCredential"]}"#);
+        assert_eq!(read_credential(&vc2).unwrap(), vc2);
+
         let header = "eyJhbGciOiJFUzI1NiJ9"; // {"alg":"ES256"}
         let cases = [
             ("environment", "PATH=/usr/bin\0HOME=/root\0".to_string()),
@@ -427,6 +431,31 @@ mod tests {
             ), // {"typ":"JWT"}
             ("alg none", "eyJhbGciOiJub25lIn0.e30.c2ln".to_string()), // {"alg":"none"}
             ("inner whitespace", format!("{header}.e30 .c2ln")),
+            (
+                "empty alg",
+                jws(
+                    r#"{"alg":""}"#,
+                    r#"{"vc":{"type":["VerifiableCredential"]}}"#,
+                ),
+            ),
+            (
+                "padded none",
+                jws(
+                    r#"{"alg":" none"}"#,
+                    r#"{"vc":{"type":["VerifiableCredential"]}}"#,
+                ),
+            ),
+            // A bearer token of another kind, such as a service-account JWT.
+            (
+                "not a credential",
+                jws(r#"{"alg":"RS256"}"#, r#"{"sub":"system:serviceaccount"}"#),
+            ),
+            ("payload not JSON", format!("{header}.aGVsbG8.c2ln")),
+            // Non-zero trailing bits: dcp_core's strict decoder refuses them.
+            (
+                "non-canonical base64url",
+                format!("{}.c2lnbmF0dXJm", valid_jws().rsplit_once('.').unwrap().0),
+            ),
         ];
         for (name, content) in cases {
             assert!(
