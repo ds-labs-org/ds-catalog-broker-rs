@@ -82,7 +82,7 @@ Every setting is optional.
 | `broker:oauth2Issuer` | unset | Expected `iss` claim; checked only if set. |
 | `broker:oauth2Audience` | unset | Expected `aud` claim; checked only if set. |
 | `broker:oauth2RequiredScope` | unset | One scope the token's `scope` claim must contain; checked only if set. |
-| `broker:sparqlQueryTimeoutMs` | `10000` | A `/sparql` evaluation running longer is stopped with `503`. Positive integer. |
+| `broker:sparqlQueryTimeoutMs` | `10000` | A `/sparql` request whose work (the policy allow-list, then the evaluation) runs longer gets `503` and its evaluation is cancelled. Positive integer. |
 | `broker:sparqlMaxRows` | `10000` | A `/sparql` `SELECT` result with more rows is rejected with `400`. Positive integer. |
 | `broker:sparqlMaxConcurrent` | `4` | How many `/sparql` evaluations may run at once; another query gets `503` straight away. A query past its timeout keeps its slot until it really stops, since some in-memory work cannot be interrupted. Positive integer. |
 | `broker:policyFilterUnmappableConstraintAction` | `hide_dataset` | `skip`, `drop_policy` or `hide_dataset`: what ODRL filtering does with a constraint it cannot evaluate. |
