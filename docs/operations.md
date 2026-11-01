@@ -78,6 +78,16 @@ waits for an uninterruptible one to end before exiting. At most
 `broker:sparqlMaxConcurrent` of them run at once, and further queries get
 `503` until a slot frees up.
 
+A filtered `/sparql` query needs the caller's policy allow-list, which
+means decoding every catalog. The list is cached per caller (by token
+claims) for up to 5 seconds and discarded when a crawl writes the store,
+so on a large store the first query after each crawl pays the decode and
+the rest do not. The decode checks for cancellation between catalogs and
+datasets, so a query that times out stops building it. Concurrent first
+queries by different callers each decode on their own, up to
+`broker:sparqlMaxConcurrent`. A policy that depends on the clock
+(`odrl:dateTime`) can therefore be applied up to 5 seconds late.
+
 If the crawl scheduler stops on its own (a panic), the broker exits with
 status 1 rather than keep serving catalogs that would no longer be
 refreshed or expired, so the supervisor restarts it.

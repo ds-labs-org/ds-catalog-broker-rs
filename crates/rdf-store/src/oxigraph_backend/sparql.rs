@@ -12,7 +12,94 @@ pub const POLICY_FILTERED_ATTEMPTS: usize = 5;
 /// use up an attempt.
 const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a cached policy allow-list is reused. The allow-list depends
+/// on the clock (a policy's `odrl:dateTime` validity window), so a store
+/// that never changes would otherwise serve it forever.
+pub const ALLOW_LIST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Most allow-lists kept at once, one per distinct caller key.
+const ALLOW_LIST_CACHE_ENTRIES: usize = 64;
+
+/// A policy allow-list and the store state it was built from.
+pub(super) struct CachedAllowList {
+    write_sequence: u64,
+    pub(super) built_at: std::time::Instant,
+    visible: Arc<BTreeSet<String>>,
+}
+
 impl OxigraphCatalogCache {
+    /// The cached allow-list for `key`, if it was built from the store
+    /// state `write_sequence` and is younger than [`ALLOW_LIST_CACHE_TTL`].
+    fn cached_allow_list(&self, key: &str, write_sequence: u64) -> Option<Arc<BTreeSet<String>>> {
+        let cache = self.allow_lists.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .get(key)
+            .filter(|entry| {
+                entry.write_sequence == write_sequence
+                    && entry.built_at.elapsed() < ALLOW_LIST_CACHE_TTL
+            })
+            .map(|entry| Arc::clone(&entry.visible))
+    }
+
+    fn remember_allow_list(&self, key: &str, write_sequence: u64, visible: Arc<BTreeSet<String>>) {
+        let mut cache = self.allow_lists.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= ALLOW_LIST_CACHE_ENTRIES && !cache.contains_key(key) {
+            cache.retain(|_, entry| {
+                entry.write_sequence == write_sequence
+                    && entry.built_at.elapsed() < ALLOW_LIST_CACHE_TTL
+            });
+            if cache.len() >= ALLOW_LIST_CACHE_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            key.to_string(),
+            CachedAllowList {
+                write_sequence,
+                built_at: std::time::Instant::now(),
+                visible,
+            },
+        );
+    }
+
+    /// Decodes the catalogs one at a time and unions what `allow_list`
+    /// returns for each. Checks the cancellation token before each graph
+    /// scan step and each catalog, so a cancelled request stops here
+    /// instead of decoding the rest of the store.
+    fn build_allow_list(
+        &self,
+        allow_list: &mut impl FnMut(&Catalog) -> BTreeSet<String>,
+        limits: &SparqlLimits,
+    ) -> SparqlQueryResult<BTreeSet<String>> {
+        let cancelled = || {
+            limits
+                .cancellation
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+        };
+        let graphs = self
+            .snapshots_until(None, &cancelled)
+            .map_err(|err| SparqlError::Store(err.to_string()))?
+            .ok_or(SparqlError::Cancelled)?;
+        let mut visible = BTreeSet::new();
+        for (graph_iri, graph) in graphs {
+            if cancelled() {
+                return Err(SparqlError::Cancelled);
+            }
+            // Skipped as `catalogs` skips them.
+            let Ok(node) = decode_node_id(&graph_iri) else {
+                continue;
+            };
+            if let Ok(Some(catalog)) = self.load_catalog(&node, &graph) {
+                visible.extend(allow_list(&catalog));
+            }
+        }
+        if cancelled() {
+            return Err(SparqlError::Cancelled);
+        }
+        Ok(visible)
+    }
+
     /// Evaluate an arbitrary, caller-supplied SPARQL query and return
     /// the result serialized as
     /// [`application/sparql-results+json`](https://www.w3.org/TR/sparql11-results-json/)
@@ -151,15 +238,28 @@ impl OxigraphCatalogCache {
     /// from the store's own catalogs, on the same store state the query
     /// reads.
     ///
-    /// `allow_list` receives every catalog ([`Self::catalogs`]) and
-    /// returns the resource IRIs the caller may see. Filtered evaluation
-    /// reads the store once per lookup (see [`VisibleDataset`]), so a
-    /// write landing between the allow-list and the end of evaluation
-    /// would mix two states: a join could see an old graph and a new one,
-    /// and an allow-list built from old policies would admit new data.
-    /// The cache counts writes (`write_sequence`); when a write overlapped
-    /// the attempt, its result is discarded and the whole attempt,
-    /// allow-list included, runs again. After [`POLICY_FILTERED_ATTEMPTS`]
+    /// `allow_list` is called once per catalog and returns the resource
+    /// IRIs the caller may see in it; the union is the allow-list. The
+    /// catalogs are decoded one at a time and the cancellation token is
+    /// checked between them, so a request that timed out or went away
+    /// stops building the list.
+    ///
+    /// `allow_list_key` identifies the caller for caching and must
+    /// determine what `allow_list` returns (the broker passes the
+    /// caller's token claims). An allow-list is reused while the store's
+    /// write sequence is unchanged and it is younger than
+    /// [`ALLOW_LIST_CACHE_TTL`], so repeated queries by one caller skip
+    /// the decode. The TTL bounds how stale a clock-dependent policy
+    /// decision can get. At most 64 keys are kept.
+    ///
+    /// Filtered evaluation reads the store once per lookup (see
+    /// [`VisibleDataset`]), so a write landing between the allow-list and
+    /// the end of evaluation would mix two states: a join could see an
+    /// old graph and a new one, and an allow-list built from old policies
+    /// would admit new data. The cache counts writes (`write_sequence`);
+    /// when a write overlapped the attempt, its result is discarded and
+    /// the whole attempt, allow-list included, runs again. A list built
+    /// across a write is not cached. After [`POLICY_FILTERED_ATTEMPTS`]
     /// attempts the call returns [`SparqlError::StoreBusy`].
     ///
     /// Waiting for a write that is still committing does not use up an
@@ -173,7 +273,7 @@ impl OxigraphCatalogCache {
     /// Writers are never blocked. A crawl that commits rarely sees one
     /// retry; one that commits continuously can starve a long query,
     /// which then ends in `StoreBusy` (or the caller's time limit).
-    /// `allow_list` may therefore run more than once.
+    /// `allow_list` may therefore run more than once per catalog.
     ///
     /// Alternatives considered: a store transaction gives a read view but
     /// takes the in-memory backend's single writer lock for the whole
@@ -182,7 +282,8 @@ impl OxigraphCatalogCache {
     pub fn sparql_query_json_policy_filtered(
         &self,
         query: &str,
-        mut allow_list: impl FnMut(&[Catalog]) -> BTreeSet<String>,
+        allow_list_key: &str,
+        mut allow_list: impl FnMut(&Catalog) -> BTreeSet<String>,
         limits: &SparqlLimits,
     ) -> SparqlQueryResult<Vec<u8>> {
         let cancelled = || {
@@ -215,11 +316,16 @@ impl OxigraphCatalogCache {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             };
-            let catalogs = self
-                .catalogs(CatalogQuery::all())
-                .map_err(|err| SparqlError::Store(err.to_string()))?;
-            let visible = allow_list(&catalogs);
-            drop(catalogs);
+            let visible = match self.cached_allow_list(allow_list_key, before) {
+                Some(visible) => visible,
+                None => {
+                    let visible = Arc::new(self.build_allow_list(&mut allow_list, limits)?);
+                    if self.write_sequence.load(Ordering::SeqCst) == before {
+                        self.remember_allow_list(allow_list_key, before, Arc::clone(&visible));
+                    }
+                    visible
+                }
+            };
             let result = self.sparql_query_json_limited(query, Some(&visible), limits);
             if self.write_sequence.load(Ordering::SeqCst) == before {
                 return result;

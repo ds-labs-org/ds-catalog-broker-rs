@@ -483,7 +483,7 @@ mod write;
 
 use iris::*;
 pub use iris::{dataset_resource_iri, service_resource_iri};
-pub use sparql::POLICY_FILTERED_ATTEMPTS;
+pub use sparql::{ALLOW_LIST_CACHE_TTL, POLICY_FILTERED_ATTEMPTS};
 use vocab::*;
 
 /// A [`CatalogCache`] backed by a real `contreforts_kg::store::GraphStore`
@@ -497,6 +497,10 @@ pub struct OxigraphCatalogCache {
     /// its reads knows no write overlapped them; see
     /// [`WriteSequenceGuard`].
     write_sequence: Arc<AtomicU64>,
+    /// Policy allow-lists built by
+    /// [`OxigraphCatalogCache::sparql_query_json_policy_filtered`], by
+    /// caller key; shared by every clone.
+    allow_lists: Arc<std::sync::Mutex<HashMap<String, sparql::CachedAllowList>>>,
 }
 
 /// Marks a write as in progress for as long as it lives: the sequence
@@ -527,6 +531,7 @@ impl OxigraphCatalogCache {
         Ok(Self {
             store,
             write_sequence: Arc::new(AtomicU64::new(0)),
+            allow_lists: Arc::default(),
         })
     }
 
@@ -547,12 +552,27 @@ impl OxigraphCatalogCache {
         &self,
         graph: Option<&NamedNode>,
     ) -> StoreResult<HashMap<NamedNode, GraphSnapshot>> {
+        self.snapshots_until(graph, &|| false)
+            .map(|graphs| graphs.expect("a scan that is never cancelled completes"))
+    }
+
+    /// [`Self::snapshots`], checking `cancelled` every few thousand quads.
+    /// `None` when it returned true.
+    fn snapshots_until(
+        &self,
+        graph: Option<&NamedNode>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> StoreResult<Option<HashMap<NamedNode, GraphSnapshot>>> {
         let mut graphs: HashMap<NamedNode, GraphSnapshot> = HashMap::new();
-        for quad in self
+        for (count, quad) in self
             .store
             .inner()
             .quads_for_pattern(None, None, None, graph.map(|g| g.into()))
+            .enumerate()
         {
+            if count % 4096 == 0 && cancelled() {
+                return Ok(None);
+            }
             let quad = quad?;
             // This backend only ever writes named-node graphs.
             let GraphName::NamedNode(name) = &quad.graph_name else {
@@ -566,7 +586,7 @@ impl OxigraphCatalogCache {
                 .push(snapshot.quads.len());
             snapshot.quads.push(quad);
         }
-        Ok(graphs)
+        Ok(Some(graphs))
     }
 
     /// Quads of `graph` matching the given pattern, in store order.

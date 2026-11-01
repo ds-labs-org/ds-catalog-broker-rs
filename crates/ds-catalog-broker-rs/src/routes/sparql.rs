@@ -122,9 +122,13 @@ pub(super) fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 ///   gets 503 Service Unavailable straight away; past `timeout` it is
 ///   cancelled and the caller gets 503; a result over `max_rows` rows is
 ///   400 Bad Request. The policy allow-list is computed in the same
-///   blocking task, on the same store state the query reads: a crawl
-///   landing mid-query makes the evaluation start over, up to 5 attempts,
-///   and a store that keeps changing ends in 503 ("kept changing"). This
+///   blocking task, on the same store state the query reads. It is built
+///   one catalog at a time with cancellation checked between them, and
+///   cached per caller (token claims) for the same store write sequence,
+///   for at most a few seconds; a cached list is used only when it was
+///   built from the state the evaluation validates. A crawl landing
+///   mid-query makes the evaluation start over, up to 5 attempts, and a
+///   store that keeps changing ends in 503 ("kept changing"). This
 ///   trades availability for consistency: a filtered query longer than
 ///   the usual interval between crawler commits can get that 503. A read
 ///   transaction was rejected because it would hold the store's single
@@ -213,9 +217,14 @@ pub(super) async fn sparql_route(
             let engine_claims = engine_claims_from_bearer(claims.as_ref());
             // The allow-list and the evaluation run on one store state;
             // see `sparql_query_json_policy_filtered`.
+            // Allow-lists are cached per caller: the token's claims decide
+            // what a caller may see.
+            let allow_list_key = claims.as_ref().map(ToString::to_string).unwrap_or_default();
+            let cancelled = || cancellation_requested(&limits);
             state.cache.sparql_query_json_policy_filtered(
                 &query,
-                |catalogs| visible_resource_iris(catalogs, &engine_claims, &state),
+                &allow_list_key,
+                |catalog| visible_resource_iris(catalog, &engine_claims, &state, &cancelled),
                 &limits,
             )
         } else {

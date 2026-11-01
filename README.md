@@ -40,6 +40,9 @@ Three serving surfaces, all non-DSP:
   doc comment for the full contract. Each query is stopped with `503`
   after `broker:sparqlQueryTimeoutMs` (default 10000), and a result over
   `broker:sparqlMaxRows` rows (default 10000) is rejected with `400`.
+  A caller's policy allow-list is cached for up to 5 seconds and dropped
+  on any crawl write, so repeated queries do not decode the store each
+  time.
 - **`POST /api/management/v4/catalogs/request`** — wire-compatible with
   real EDC Federated Catalog UI tooling
   (`edc-federated-catalog-client`'s `list_offers`/`get_offer_by_dataset_id`):
