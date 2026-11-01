@@ -3051,6 +3051,155 @@ mod tests {
         assert_eq!(response.status(), 200);
     }
 
+    /// The named host `localhost` is not trusted by `remote_allowed`, but a
+    /// redirect that stays on the same origin was never a downgrade: the
+    /// origin passed config validation before the first request.
+    #[tokio::test]
+    async fn outbound_client_follows_a_same_origin_redirect_on_a_named_http_host() {
+        let (listener, addr) = bind_localhost().await;
+        let app = axum::Router::new()
+            .route(
+                "/catalog",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, "/catalog/")],
+                    )
+                        .into_response()
+                }),
+            )
+            .route("/catalog/", axum::routing::post(|| async { "ok" }));
+        spawn_server(listener, app);
+        let url = format!("http://localhost:{}/catalog", addr.port());
+        assert!(!remote_allowed(&reqwest::Url::parse(&url).unwrap()));
+
+        let response = outbound_client().unwrap().post(&url).send().await.unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    async fn assert_redirect_refused(start_url: &str, location: &str) {
+        let (listener, addr) = bind_localhost().await;
+        let location = location.replace("{port}", &addr.port().to_string());
+        let app = axum::Router::new().route(
+            "/start",
+            axum::routing::post(move || {
+                let location = location.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, location)],
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        spawn_server(listener, app);
+        let start = start_url.replace("{port}", &addr.port().to_string());
+
+        let err = outbound_client()
+            .unwrap()
+            .post(&start)
+            .send()
+            .await
+            .expect_err("the redirect was followed");
+
+        assert!(format!("{err:?}").contains("refused a redirect"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn outbound_client_refuses_a_scheme_change_on_the_same_host_and_port() {
+        // https on the same loopback address and port: the bearer token
+        // must not leave an origin it was sent to, in either direction.
+        assert_redirect_refused("http://127.0.0.1:{port}/start", "https://127.0.0.1/x").await;
+        assert_redirect_refused(
+            "http://localhost:{port}/start",
+            "https://localhost:{port}/x",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn outbound_client_refuses_a_redirect_to_another_port() {
+        assert_redirect_refused("http://127.0.0.1:{port}/start", "http://127.0.0.1:1/x").await;
+    }
+
+    #[tokio::test]
+    async fn outbound_client_refuses_a_redirect_from_a_named_host_to_loopback() {
+        assert_redirect_refused("http://localhost:{port}/start", "http://127.0.0.1:{port}/x").await;
+    }
+
+    /// A server answering `/hop/N` with a redirect to `/hop/N+1` until `N`
+    /// reaches `redirects`, which answers `200`.
+    async fn spawn_redirect_chain(redirects: usize) -> String {
+        let (listener, addr) = bind_localhost().await;
+        let app = axum::Router::new().route(
+            "/hop/{n}",
+            axum::routing::get(
+                move |axum::extract::Path(n): axum::extract::Path<usize>| async move {
+                    if n >= redirects {
+                        "ok".into_response()
+                    } else {
+                        (
+                            axum::http::StatusCode::FOUND,
+                            [(axum::http::header::LOCATION, format!("/hop/{}", n + 1))],
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        spawn_server(listener, app);
+        format!("http://{addr}/hop/0")
+    }
+
+    #[tokio::test]
+    async fn outbound_client_follows_ten_redirects_and_refuses_the_eleventh() {
+        let client = outbound_client().unwrap();
+
+        let ten = client.get(spawn_redirect_chain(10).await).send().await;
+        assert_eq!(ten.expect("ten redirects").status(), 200);
+
+        let eleven = client.get(spawn_redirect_chain(11).await).send().await;
+        let err = eleven.expect_err("an eleventh redirect was followed");
+        assert!(format!("{err:?}").contains("too many redirects"), "{err:?}");
+    }
+
+    /// Serve one raw HTTP response, bytes exactly as given.
+    async fn spawn_raw_response(raw: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (listener, addr) = bind_localhost().await;
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let raw = raw.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(&raw).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/x")
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_refuses_a_declared_length_over_the_limit() {
+        // Declared 1 MiB, only a few bytes sent: refused on the header.
+        let raw = b"HTTP/1.1 200 OK\r\ncontent-length: 1048576\r\n\r\nabc".to_vec();
+        let response = reqwest::get(spawn_raw_response(raw).await).await.unwrap();
+
+        let err = read_body_limited(response, 1024).await.unwrap_err();
+
+        assert!(
+            matches!(err, BodyError::TooLarge { limit: 1024 }),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn remote_allowed_accepts_https_and_loopback_http_only() {
         let allowed = |u: &str| remote_allowed(&reqwest::Url::parse(u).unwrap());
