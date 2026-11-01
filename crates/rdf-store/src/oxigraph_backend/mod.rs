@@ -485,22 +485,42 @@ impl OxigraphCatalogCache {
     /// whole catalog is decoded from a single consistent state, even
     /// while another task upserts the same participant.
     fn snapshot(&self, graph: &NamedNode) -> StoreResult<GraphSnapshot> {
-        let mut by_subject: HashMap<NamedOrBlankNode, Vec<Quad>> = HashMap::new();
+        Ok(self
+            .snapshots(Some(graph))?
+            .remove(graph)
+            .unwrap_or_default())
+    }
+
+    /// The quads of `graph`, or of every named graph when `None`, read
+    /// from one store snapshot and grouped by graph - so reading every
+    /// catalog sees all participants in the same store state.
+    fn snapshots(
+        &self,
+        graph: Option<&NamedNode>,
+    ) -> StoreResult<HashMap<NamedNode, GraphSnapshot>> {
+        let mut graphs: HashMap<NamedNode, GraphSnapshot> = HashMap::new();
         for quad in self
             .store
             .inner()
-            .quads_for_pattern(None, None, None, Some(graph.into()))
+            .quads_for_pattern(None, None, None, graph.map(|g| g.into()))
         {
             let quad = quad?;
-            by_subject
+            // This backend only ever writes named-node graphs.
+            let GraphName::NamedNode(name) = &quad.graph_name else {
+                continue;
+            };
+            let snapshot = graphs.entry(name.clone()).or_default();
+            snapshot
+                .by_subject
                 .entry(quad.subject.clone())
                 .or_default()
-                .push(quad);
+                .push(snapshot.quads.len());
+            snapshot.quads.push(quad);
         }
-        Ok(GraphSnapshot { by_subject })
+        Ok(graphs)
     }
 
-    /// Quads of `graph` matching the given pattern.
+    /// Quads of `graph` matching the given pattern, in store order.
     fn quads(
         &self,
         subject: Option<&NamedNode>,
@@ -508,27 +528,24 @@ impl OxigraphCatalogCache {
         object: Option<&Term>,
         graph: &GraphSnapshot,
     ) -> StoreResult<Vec<Quad>> {
-        let matches = |quad: &&Quad| {
-            predicate.is_none_or(|p| &quad.predicate == p)
-                && object.is_none_or(|o| &quad.object == o)
+        let candidates: Box<dyn Iterator<Item = &Quad>> = match subject {
+            Some(subject) => Box::new(
+                graph
+                    .by_subject
+                    .get(&NamedOrBlankNode::from(subject.clone()))
+                    .into_iter()
+                    .flatten()
+                    .map(|&index| &graph.quads[index]),
+            ),
+            None => Box::new(graph.quads.iter()),
         };
-        Ok(match subject {
-            Some(subject) => graph
-                .by_subject
-                .get(&NamedOrBlankNode::from(subject.clone()))
-                .into_iter()
-                .flatten()
-                .filter(matches)
-                .cloned()
-                .collect(),
-            None => graph
-                .by_subject
-                .values()
-                .flatten()
-                .filter(matches)
-                .cloned()
-                .collect(),
-        })
+        Ok(candidates
+            .filter(|quad| {
+                predicate.is_none_or(|p| &quad.predicate == p)
+                    && object.is_none_or(|o| &quad.object == o)
+            })
+            .cloned()
+            .collect())
     }
 
     /// The first object found for `(subject, predicate, ?)` in `graph`,
@@ -585,10 +602,12 @@ impl OxigraphCatalogCache {
     }
 }
 
-/// The quads of one named graph, read from a single store snapshot and
-/// indexed by subject - what `read`'s decoding works from.
+/// The quads of one named graph, read from a single store snapshot in
+/// store order and indexed by subject - what `read`'s decoding works from.
+#[derive(Default)]
 pub(super) struct GraphSnapshot {
-    by_subject: HashMap<NamedOrBlankNode, Vec<Quad>>,
+    quads: Vec<Quad>,
+    by_subject: HashMap<NamedOrBlankNode, Vec<usize>>,
 }
 
 /// The quads of a catalog being written, collected before any of them
@@ -628,18 +647,8 @@ impl CatalogCache for OxigraphCatalogCache {
                 }
             }
             None => {
-                let graph_names: Vec<NamedOrBlankNode> = self
-                    .store
-                    .inner()
-                    .named_graphs()
-                    .collect::<Result<_, _>>()?;
-                for graph in graph_names {
-                    let NamedOrBlankNode::NamedNode(graph_iri) = graph else {
-                        // This backend never writes blank-node graphs.
-                        continue;
-                    };
+                for (graph_iri, graph) in self.snapshots(None)? {
                     let node = decode_node_id(&graph_iri)?;
-                    let graph = self.snapshot(&graph_iri)?;
                     if let Some(catalog) = self.load_catalog(&node, &graph)? {
                         results.push(catalog);
                     }

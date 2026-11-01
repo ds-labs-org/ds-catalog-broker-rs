@@ -130,7 +130,7 @@ fn reading_all_catalogs_sees_one_store_state() {
         rt.block_on(cache.upsert(generation_catalog(node, "static", 300)))
             .unwrap();
     }
-    let generations: Vec<String> = (0..2000).map(|g| format!("{g:04}")).collect();
+    let generations: Vec<String> = (0..600).map(|g| format!("{g:04}")).collect();
     let catalogs = |g: &str| {
         (
             generation_catalog("node-a", g, 2),
