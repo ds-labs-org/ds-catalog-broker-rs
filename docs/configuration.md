@@ -12,7 +12,7 @@ vendored [`contreforts-config`](../vendor/contreforts-config) crate's
 |---|---|
 | `/etc/broker` or `file:///etc/broker` (a directory) | A `contreforts-config` datadir: `<dir>/config_graph.ttl` is read. |
 | `/etc/broker/broker.ttl` or `file:///etc/broker/broker.ttl` (a file) | That Turtle document. |
-| `https://config.example.org/broker.ttl` | A Turtle document fetched once at startup with `Accept: text/turtle`. Relative IRIs in it resolve against the URL. Plain `http://` is accepted only for `localhost` or a loopback address: the config decides where the crawler sends its credential, so it must not be open to tampering in transit. |
+| `https://config.example.org/broker.ttl` | A Turtle document fetched once at startup with `Accept: text/turtle`. Relative IRIs in it resolve against the URL. Plain `http://` is accepted only to a loopback address such as `127.0.0.1` or `[::1]` (not `localhost`, which is only as local as the resolver makes it): the config decides where the crawler sends its credential, so it must not be open to tampering in transit. Redirects are followed only to locations that pass the same rule, and a plain-http fetch ignores proxy settings. |
 
 The broker never writes to its configuration. A datadir is read directly,
 not through `ConfigStore::open`, so a missing directory is not created and a
@@ -153,9 +153,10 @@ resolves against the config's own location, so it works for a local config
 but not for one fetched over HTTP, where it becomes an `https` IRI. Any IRI
 that isn't `file:`, a blank node, or an empty string is rejected. The file is read
 once at startup, with surrounding whitespace trimmed. A missing or empty
-file stops the broker, and so does one that is not a compact JWS (three
-base64url segments, the first a JSON header naming an `alg` other than
-`none`). The error names the file but never shows what it holds. Protect
+file stops the broker, and so does one that is not a Verifiable Credential
+in compact JWS form: three base64url segments, a JSON header naming an
+`alg` other than `none`, and a JSON payload whose `vc` claim (or the
+payload itself) has the type `VerifiableCredential`. The error names the file but never shows what it holds. Protect
 it with file permissions.
 
 Like the settings above, these resources are read strictly. Each of the
@@ -174,6 +175,9 @@ following stops the broker at startup:
 - a `broker:catalogRequestUrl` or `broker:oid4vpResponseUri` that is not an
   absolute `http` or `https` URL (a relative IRI resolves against the
   config's location, so it usually becomes a `file:` IRI and is rejected);
+- on a `dcp` or `oid4vp` participant, a `broker:catalogRequestUrl` or
+  `broker:oid4vpResponseUri` over plain `http` to anything but a loopback
+  address: these endpoints receive the crawler's credential;
 - a `broker:providerDid` that is not a DID (`did:<method>:<id>`);
 - `broker:providerDid` on a participant whose protocol is not `dcp`, or
   `broker:oid4vpResponseUri` on one whose protocol is not `oid4vp`;
