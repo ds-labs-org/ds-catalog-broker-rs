@@ -21,11 +21,10 @@ use super::*;
 // parses.
 
 /// Same idea as `oauth2_sparql_state`, but seeded with a caller-
-/// supplied catalog (via `sparql_test_state()`'s real Oxigraph
+/// supplied catalog (via `test_state()`'s real Oxigraph
 /// backend) rather than the fixed single-dataset `participant_catalog`
 /// fixture - the SPARQL analogue of `oauth2_state_with_catalog`, which
-/// does the same thing for `GET /catalog`/the management API's
-/// in-memory-backed state.
+/// does the same thing for `GET /catalog`/the management API.
 async fn oauth2_sparql_state_with_catalog(
     catalog: Catalog,
     configure: impl FnOnce(&mut OAuth2Config),
@@ -38,7 +37,7 @@ async fn oauth2_sparql_state_with_catalog(
         .await
         .expect("fetch mock JWKS");
 
-    let state = sparql_test_state();
+    let state = test_state();
     state.cache.upsert(catalog).await.unwrap();
     let state = state.with_oauth2(Some(Arc::new(verifier)));
     (state, key)
@@ -162,7 +161,7 @@ async fn sparql_shows_a_policy_gated_datasets_iri_to_a_caller_with_the_required_
 /// (`true`).
 #[tokio::test]
 async fn sparql_filters_by_policy_even_when_oauth2_is_disabled_matching_the_default_config() {
-    let state = sparql_test_state();
+    let state = test_state();
     state
         .cache
         .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))
@@ -266,7 +265,7 @@ async fn unauthenticated_sparql_binding_values_over(
     query: &str,
     policy_filter: odrl_filter::PolicyFilterConfig,
 ) -> Vec<String> {
-    let state = sparql_test_state().with_policy_filter(policy_filter);
+    let state = test_state().with_policy_filter(policy_filter);
     state.cache.upsert(catalog).await.unwrap();
     let app = build_router(state);
 
@@ -458,7 +457,7 @@ async fn sparql_hides_a_gated_dataset_with_an_empty_id() {
 /// Runs `query` unauthenticated against the open + gated catalog with
 /// `limits` applied, returning the status and body.
 async fn sparql_with_limits(query: &str, limits: SparqlLimitsConfig) -> (StatusCode, String) {
-    let state = sparql_test_state().with_sparql_limits(limits);
+    let state = test_state().with_sparql_limits(limits);
     state
         .cache
         .upsert(catalog_with_open_and_gated_datasets("node-a", "cat-a"))

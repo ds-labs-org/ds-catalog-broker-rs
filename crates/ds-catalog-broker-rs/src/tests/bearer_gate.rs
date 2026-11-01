@@ -41,7 +41,7 @@ pub(super) async fn oauth2_catalog_state(
     (state, key)
 }
 
-/// Same idea as `oauth2_catalog_state`, but built on `sparql_test_state()`
+/// Same idea as `oauth2_catalog_state`, but built on `test_state()`
 /// (a real Oxigraph backend, one seeded participant) so `/sparql` has
 /// something real to answer once a valid token clears the gate.
 pub(super) async fn oauth2_sparql_state(
@@ -55,7 +55,7 @@ pub(super) async fn oauth2_sparql_state(
         .await
         .expect("fetch mock JWKS");
 
-    let state = sparql_test_state();
+    let state = test_state();
     state
         .cache
         .upsert(participant_catalog("node-a", "cat-a", "DATASET-A"))

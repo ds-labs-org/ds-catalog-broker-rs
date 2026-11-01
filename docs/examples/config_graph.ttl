@@ -8,9 +8,8 @@
     # Address the HTTP API listens on.
     broker:httpApiAddr "127.0.0.1:8080" ;
 
-    # Participants to crawl, described below. No default: with none, the broker
-    # serves one sample catalog from an in-memory cache, with no crawler and no
-    # /sparql.
+    # Participants to crawl, described below. No default: with none, no crawler
+    # runs and every route, /sparql included, answers from an empty store.
     broker:participant <urn:ds-catalog-broker:participant:a>,
         <urn:ds-catalog-broker:participant:dcp>,
         <urn:ds-catalog-broker:participant:oid4vp> ;

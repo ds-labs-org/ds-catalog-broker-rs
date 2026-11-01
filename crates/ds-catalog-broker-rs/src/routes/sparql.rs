@@ -135,8 +135,6 @@ pub(super) async fn sparql_route(
         Err(response) => return *response,
     };
 
-    let sparql = &state.cache;
-
     if !accepts_sparql_results_json(&headers) {
         return (
             StatusCode::NOT_ACCEPTABLE,
@@ -183,9 +181,9 @@ pub(super) async fn sparql_route(
         cancellation: Some(cancellation.clone()),
         max_rows: Some(state.sparql_limits.max_rows),
     };
-    let sparql = Arc::clone(sparql);
+    let store = Arc::clone(&state.cache);
     let evaluation = tokio::task::spawn_blocking(move || {
-        sparql.sparql_query_json_limited(&query, visible_resources.as_ref(), &limits)
+        store.sparql_query_json_limited(&query, visible_resources.as_ref(), &limits)
     });
     let result = match tokio::time::timeout(state.sparql_limits.timeout, evaluation).await {
         Ok(Ok(result)) => result,

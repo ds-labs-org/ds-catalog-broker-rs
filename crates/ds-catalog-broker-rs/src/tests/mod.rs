@@ -43,7 +43,7 @@ mod sparql_policy;
 use bearer_gate::{bearer, oauth2_catalog_state, oauth2_config};
 use management::catalog_request;
 use policy::{catalog_with_open_and_gated_datasets, eu_resident_claims};
-use sparql::{participant_catalog, sparql_test_state};
+use sparql::participant_catalog;
 
 fn test_state() -> AppState {
     AppState::new(Arc::new(OxigraphCatalogCache::in_memory().unwrap()))

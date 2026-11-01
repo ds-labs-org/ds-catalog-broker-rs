@@ -567,9 +567,8 @@ impl OxigraphCatalogCache {
 impl CatalogCache for OxigraphCatalogCache {
     async fn upsert(&self, catalog: Catalog) -> StoreResult<()> {
         let graph = node_iri(&catalog.origin_node);
-        // Insert-or-replace: clear any prior graph for this node first,
-        // matching the in-memory impl's `HashMap::insert` overwrite
-        // semantics (and EDC's upsert-by-origin-node-url behavior).
+        // Insert-or-replace: clear any prior graph for this node first
+        // (EDC's upsert-by-origin-node-url behavior).
         self.clear_named_graph(&graph)?;
         self.write_catalog(&catalog, &graph)?;
         Ok(())
@@ -604,8 +603,7 @@ impl CatalogCache for OxigraphCatalogCache {
             }
         }
 
-        // Same deterministic ordering + pagination as `memory`'s
-        // implementation, so the two backends are behavior-equivalent.
+        // Deterministic ordering, so pagination is stable.
         results.sort_by(|a, b| a.id.cmp(&b.id));
 
         let skipped = results.into_iter().skip(query.offset);

@@ -293,7 +293,7 @@ async fn catalog_request_route_serves_crawled_dataset_descriptors_from_a_real_ox
     );
     tokio::spawn(async move { axum::serve(listener, participant_app).await });
 
-    let state = sparql_test_state();
+    let state = test_state();
     let participants = [crawler::ParticipantEntry {
         id: "node-a".to_string(),
         name: "Node A".to_string(),
