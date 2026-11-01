@@ -230,6 +230,13 @@ pub enum BrokerConfigError {
     },
     #[error("{resource} has broker:{property}, which this broker does not know")]
     UnknownProperty { resource: String, property: String },
+    #[error(
+        "{resource} uses broker:{term}, but is neither the broker:BrokerConfig resource nor a \
+         participant or holder linked from it"
+    )]
+    Unattached { resource: String, term: String },
+    #[error("{resource} is typed broker:{class}, which this broker does not know")]
+    UnknownClass { resource: String, class: String },
     #[error("{resource} has no broker:{property}, which is required")]
     MissingProperty { resource: String, property: String },
     #[error("broker:{property} on {resource} is {value:?}: {reason}")]
@@ -1553,5 +1560,174 @@ mod tests {
             Err(BrokerConfigError::Parse { .. })
         ));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "not turtle");
+    }
+
+    #[test]
+    fn a_misspelled_config_class_is_an_error() {
+        let err =
+            crawler_from("<urn:c> a broker:BrokerConfg ; broker:oauth2JwksUri \"http://j\" .\n")
+                .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownClass { class, .. } if class == "BrokerConfg"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_participant_class_is_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig .\n<urn:q> a broker:Particpant ; broker:participantId \"q\" .\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownClass { class, .. } if class == "Particpant"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn broker_triples_on_an_unattached_subject_are_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig .\n<urn:x> broker:oauth2JwksUri \"http://j\" .\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::Unattached { resource, term } if resource.contains("urn:x") && term == "oauth2JwksUri"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn broker_triples_without_any_config_resource_are_an_error() {
+        let err = crawler_from(OPEN_PARTICIPANT).unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::Unattached { resource, .. } if resource.contains("urn:p")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn other_vocabularies_are_left_alone() {
+        let settings = BrokerSettings::from_turtle(
+            format!(
+                "{PREFIX}@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+                 <urn:c> a broker:BrokerConfig ; rdfs:label \"broker\" .\n\
+                 <urn:other> rdfs:label \"unrelated\" .\n"
+            )
+            .as_bytes(),
+            None,
+            "test",
+        );
+        assert!(settings.is_ok(), "{:?}", settings.err());
+    }
+
+    #[test]
+    fn a_holder_is_checked_even_without_participants() {
+        let err =
+            crawler_from("<urn:c> a broker:BrokerConfig ; broker:holder \"x\" .\n").unwrap_err();
+        assert!(
+            matches!(err, BrokerConfigError::NotAResource { .. }),
+            "{err}"
+        );
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:holder <urn:h> .\n\
+             <urn:h> a broker:Holder ; broker:ownDidHost \"h\" ; broker:requiredScope \"s\" ;\n\
+               broker:credentialJwsFile \"/h.jws\" ; broker:bogus 1 .\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnknownProperty { property, .. } if property == "bogus"),
+            "{err}"
+        );
+    }
+
+    fn participant_error(properties: &str) -> String {
+        let err = crawler_from(&format!(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; {properties} .\n"
+        ))
+        .unwrap_err();
+        match err {
+            BrokerConfigError::InvalidValue { property, .. } => property,
+            other => panic!("expected InvalidValue for {properties}, got {other}"),
+        }
+    }
+
+    const ID_NAME_URL: &str = "broker:participantId \"p\" ; broker:participantName \"P\" ; \
+         broker:catalogRequestUrl \"http://h/c\"";
+
+    #[test]
+    fn participant_values_that_do_not_parse_are_errors() {
+        let url = "broker:catalogRequestUrl \"http://h/c\"";
+        assert_eq!(
+            participant_error(&format!(
+                "broker:participantId \" \" ; broker:participantName \"P\" ; {url}"
+            )),
+            PARTICIPANT_ID
+        );
+        assert_eq!(
+            participant_error(&format!(
+                "broker:participantId \"p\" ; broker:participantName \"\" ; {url}"
+            )),
+            PARTICIPANT_NAME
+        );
+        for bad in ["\"not a url\"", "\"ftp://h/c\"", "<file:///etc/c>"] {
+            assert_eq!(
+                participant_error(&format!(
+                    "broker:participantId \"p\" ; broker:participantName \"P\" ; \
+                     broker:catalogRequestUrl {bad}"
+                )),
+                CATALOG_REQUEST_URL,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            participant_error(&format!(
+                "{ID_NAME_URL} ; broker:credentialProtocol \"dcp\" ; broker:providerDid \"gated\""
+            )),
+            PROVIDER_DID
+        );
+        assert_eq!(
+            participant_error(&format!(
+                "{ID_NAME_URL} ; broker:credentialProtocol \"oid4vp\" ; \
+                 broker:oid4vpResponseUri \"/response\""
+            )),
+            OID4VP_RESPONSE_URI
+        );
+    }
+
+    #[test]
+    fn credential_properties_for_another_protocol_are_errors() {
+        assert_eq!(
+            participant_error(&format!("{ID_NAME_URL} ; broker:providerDid \"did:web:h\"")),
+            PROVIDER_DID
+        );
+        assert_eq!(
+            participant_error(&format!(
+                "{ID_NAME_URL} ; broker:credentialProtocol \"dcp\" ; \
+                 broker:providerDid \"did:web:h\" ; broker:oid4vpResponseUri \"http://h/r\""
+            )),
+            OID4VP_RESPONSE_URI
+        );
+    }
+
+    #[test]
+    fn a_blank_node_setting_is_an_error() {
+        let err =
+            crawler_from("<urn:c> a broker:BrokerConfig ; broker:oauth2Issuer [] .\n").unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::InvalidValue { property, .. } if property == "oauth2Issuer"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_first_invalid_setting_in_name_order_is_reported() {
+        for _ in 0..32 {
+            assert_eq!(
+                invalid_property(&[("sparqlMaxRows", "-1"), ("crawlConcurrency", "0")]),
+                "crawlConcurrency"
+            );
+        }
     }
 }
