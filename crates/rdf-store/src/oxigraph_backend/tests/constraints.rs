@@ -74,25 +74,142 @@ async fn a_constraint_at_the_depth_bound_round_trips() {
     assert_eq!(round_trip(&cache, &catalog).await, catalog);
 }
 
-/// Children past the bound are dropped the way the crawler drops them -
-/// the group at the bound comes back empty - and nothing half-written is
-/// left to break reads of this or any other participant.
+/// The ODRL engine evaluates a constraint past the bound as not
+/// satisfied, so storing the tree with those children dropped (an empty
+/// `and` at the bound, which always holds) would loosen the policy. The
+/// upsert is refused instead, writes nothing, and leaves the previous
+/// catalog and every other participant readable.
 #[tokio::test]
-async fn children_past_the_depth_bound_are_dropped_cleanly() {
+async fn an_upsert_with_a_constraint_past_the_depth_bound_is_refused() {
     let cache = cache();
     cache
         .upsert(catalog_with_constraint("node-ok", leaf()))
         .await
         .unwrap();
+    let previous = catalog_with_constraint("node-too-deep", leaf());
+    cache.upsert(previous.clone()).await.unwrap();
+
     let too_deep = catalog_with_constraint(
         "node-too-deep",
-        nested_and(MAX_CONSTRAINT_DEPTH + 2, leaf()),
+        nested_and(MAX_CONSTRAINT_DEPTH + 1, leaf()),
     );
-    let read = round_trip(&cache, &too_deep).await;
-    let expected = catalog_with_constraint(
-        "node-too-deep",
-        nested_and(MAX_CONSTRAINT_DEPTH, Constraint::and(Vec::new())),
-    );
-    assert_eq!(read, expected);
+    assert!(cache.upsert(too_deep).await.is_err());
+
+    let read = cache
+        .query(CatalogQuery::for_node(NodeId::new("node-too-deep")))
+        .await
+        .unwrap();
+    assert_eq!(read, vec![previous], "the previous catalog stays as it was");
+    let deepest_written = cache
+        .store
+        .inner()
+        .quads_for_pattern(None, None, None, None)
+        .map(|quad| {
+            quad.unwrap()
+                .subject
+                .to_string()
+                .matches("/constraints/")
+                .count()
+        })
+        .max()
+        .unwrap();
+    assert!(deepest_written <= 1, "the refused tree left quads behind");
     assert_eq!(cache.query(CatalogQuery::all()).await.unwrap().len(), 2);
+}
+
+/// Remove every `fcns:logicalOperator` quad, as in a graph written by
+/// hand or by another producer.
+fn strip_logical_operators(cache: &OxigraphCatalogCache) {
+    let store = cache.store.inner();
+    let marker = logical_operator_pred();
+    let quads: Vec<Quad> = store
+        .quads_for_pattern(None, Some(marker.as_ref()), None, None)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for quad in quads {
+        store.remove(&quad).unwrap();
+    }
+}
+
+/// A group without the marker is read from its link predicates, as plain
+/// ODRL would have it.
+#[tokio::test]
+async fn a_group_without_the_operator_marker_reads_from_its_links() {
+    let cache = cache();
+    let catalog = catalog_with_constraint(
+        "node-plain",
+        Constraint::xone(vec![leaf(), Constraint::and(vec![leaf(), leaf()])]),
+    );
+    cache.upsert(catalog.clone()).await.unwrap();
+    strip_logical_operators(&cache);
+    let read = cache
+        .query(CatalogQuery::for_node(NodeId::new("node-plain")))
+        .await
+        .unwrap();
+    assert_eq!(read, vec![catalog]);
+}
+
+/// A marker naming one operator while the children hang off another is
+/// contradictory: an error, not a silently emptied group.
+#[tokio::test]
+async fn a_marker_that_disagrees_with_the_links_is_an_error() {
+    let cache = cache();
+    let catalog = catalog_with_constraint("node-odd", Constraint::and(vec![leaf()]));
+    cache.upsert(catalog).await.unwrap();
+    let store = cache.store.inner();
+    let marker = logical_operator_pred();
+    let quad = store
+        .quads_for_pattern(None, Some(marker.as_ref()), None, None)
+        .next()
+        .unwrap()
+        .unwrap();
+    store.remove(&quad).unwrap();
+    store
+        .insert(&Quad::new(
+            quad.subject.clone(),
+            marker,
+            odrl_or_pred(),
+            quad.graph_name.clone(),
+        ))
+        .unwrap();
+    assert!(
+        cache
+            .query(CatalogQuery::for_node(NodeId::new("node-odd")))
+            .await
+            .is_err()
+    );
+}
+
+/// One participant's graph that does not decode must not take every
+/// other participant down with it in `query(all)`.
+#[tokio::test]
+async fn an_undecodable_catalog_is_left_out_of_reading_all_catalogs() {
+    let cache = cache();
+    cache
+        .upsert(catalog_with_constraint("node-good", leaf()))
+        .await
+        .unwrap();
+    let broken = catalog_with_constraint("node-broken", Constraint::and(vec![leaf()]));
+    cache.upsert(broken).await.unwrap();
+    strip_logical_operators(&cache);
+    let store = cache.store.inner();
+    // Leave the group with neither a marker nor any child link.
+    let links: Vec<Quad> = store
+        .quads_for_pattern(None, Some(odrl_and_pred().as_ref()), None, None)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for quad in links {
+        store.remove(&quad).unwrap();
+    }
+
+    let all = cache.query(CatalogQuery::all()).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].origin_node, NodeId::new("node-good"));
+    assert!(
+        cache
+            .query(CatalogQuery::for_node(NodeId::new("node-broken")))
+            .await
+            .is_err(),
+        "asking for that participant alone still reports the error"
+    );
 }
