@@ -3,7 +3,11 @@
 
 use std::collections::BTreeSet;
 
+use axum::{Json, http::StatusCode, response::IntoResponse};
 use catalog_core::{Catalog, Dataset};
+use rdf_store::CatalogQuery;
+
+use super::ErrorResponse;
 
 use crate::{AppState, odrl_filter};
 
@@ -178,4 +182,44 @@ pub(super) fn visible_resource_iris(
         );
     }
     visible_resources
+}
+
+/// The response `render` builds from the catalogs matching `query`,
+/// filtered by policy for the caller whose verified `claims` these are.
+/// Decoding, filtering and rendering all run on the blocking pool: each is
+/// synchronous and takes a while on a large store, and an async worker
+/// held that long would stall every other request it serves, `/health`
+/// included.
+pub(super) async fn render_visible_catalogs(
+    state: &AppState,
+    query: CatalogQuery,
+    claims: Option<serde_json::Value>,
+    services: ServiceFiltering,
+    render: impl FnOnce(Vec<Catalog>) -> axum::response::Response + Send + 'static,
+) -> axum::response::Response {
+    let state = state.clone();
+    let rendered = tokio::task::spawn_blocking(move || {
+        let mut catalogs = state.cache.catalogs(query)?;
+        filter_catalogs_by_policy(&mut catalogs, claims.as_ref(), &state, services);
+        Ok::<_, rdf_store::StoreError>(render(catalogs))
+    })
+    .await;
+    match rendered {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: err.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(join_error) => {
+            tracing::error!(error = %join_error, "decoding the catalogs failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "decoding the catalogs failed".to_string(),
+            )
+                .into_response()
+        }
+    }
 }

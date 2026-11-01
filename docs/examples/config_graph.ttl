@@ -37,6 +37,7 @@
     # Bounds on one /sparql evaluation.
     broker:sparqlQueryTimeoutMs 10000 ;
     broker:sparqlMaxRows 10000 ;
+    broker:sparqlMaxConcurrent 4 ;
 
     # ODRL policy-based dataset visibility filtering.
     broker:policyFilterUnmappableConstraintAction "hide_dataset" ; # skip | drop_policy | hide_dataset

@@ -106,7 +106,9 @@ impl SparqlLimitsConfig {
             max_rows: settings
                 .positive_integer(config::SPARQL_MAX_ROWS)
                 .unwrap_or(default.max_rows),
-            ..default
+            max_concurrent: settings
+                .positive_integer(config::SPARQL_MAX_CONCURRENT)
+                .unwrap_or(default.max_concurrent),
         }
     }
 }
