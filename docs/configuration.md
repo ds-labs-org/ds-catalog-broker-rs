@@ -241,6 +241,15 @@ stores at most 256 characters of the raw value. A `rightOperand` array with more
 one element has no single string reading and becomes an unmappable
 constraint.
 
+A rule `action` is stored as `odrl:<name>` whether it was harvested as a bare
+term (`use`), `odrl:use` or the full IRI `http://www.w3.org/ns/odrl/2/use`;
+an action IRI outside the ODRL namespace is kept as written. The visibility
+filter applies the same normalization to rule actions and to the requested
+action (`odrl:use`) when it evaluates, so catalogs stored by an earlier
+version still match. Before this, a bare `use` never matched `odrl:use`: a
+prohibition on it did not apply and an unconstrained permission did not grant
+visibility.
+
 One case is not handled per entry: a catalog response nested deeper than
 serde_json's 128-level recursion limit fails the whole fetch. The previous
 cache entry for that participant stays until it expires.

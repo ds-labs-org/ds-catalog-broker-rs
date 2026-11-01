@@ -549,7 +549,10 @@ pub fn catalog_rule_to_engine_rule(
             constraints.push(engine_constraint);
         }
     }
-    Ok(Some(EngineRule::new(rule.action.clone(), constraints)))
+    Ok(Some(EngineRule::new(
+        catalog_core::normalize_action(&rule.action),
+        constraints,
+    )))
 }
 
 /// [`catalog_core::PolicyKind`]'s wire spelling on [`WirePolicy::kind`] -
@@ -667,8 +670,9 @@ fn build_request(
     claims: &Claims,
     config: &PolicyFilterConfig,
 ) -> EngineRequest {
+    let action = catalog_core::normalize_action(action);
     let mut actions: BTreeSet<String> = BTreeSet::new();
-    actions.insert(action.to_string());
+    actions.insert(action.clone());
     for rule in wire_policy
         .permissions
         .iter()
@@ -701,7 +705,7 @@ fn build_request(
 
     EngineRequest {
         dataset_id: dataset.id.clone(),
-        action: action.to_string(),
+        action,
         config: request_config,
         policies: vec![wire_policy.clone()],
         claims: claims.clone(),

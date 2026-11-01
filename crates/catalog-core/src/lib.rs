@@ -194,6 +194,32 @@ pub const UNMAPPABLE_OPERATOR: &str = "urn:ds42:broker:unmappable";
 /// assignee.
 pub const UNMAPPABLE_ACTION: &str = "urn:ds42:broker:unmappable-action";
 
+/// The ODRL 2.2 vocabulary namespace.
+const ODRL_NS: &str = "http://www.w3.org/ns/odrl/2/";
+
+/// Canonical spelling of an ODRL `action`: `odrl:<name>`.
+///
+/// A harvested action arrives as a bare term (`use`, resolved against the
+/// ODRL JSON-LD context), as `odrl:use`, or as the full IRI
+/// `http://www.w3.org/ns/odrl/2/use`. All three denote one action, so all
+/// three map to `odrl:use`. An IRI outside the ODRL namespace (anything
+/// else containing `:`) is returned unchanged, as is the empty string.
+/// The crawler applies this when it parses a rule and the visibility filter
+/// applies it again at evaluation time, so stored catalogs written before
+/// the crawler normalized still match.
+pub fn normalize_action(action: &str) -> String {
+    if action.is_empty() {
+        return String::new();
+    }
+    if let Some(name) = action.strip_prefix(ODRL_NS) {
+        return format!("odrl:{name}");
+    }
+    if action.contains(':') {
+        return action.to_string();
+    }
+    format!("odrl:{action}")
+}
+
 /// Longest raw excerpt [`Constraint::unmappable`] keeps, in characters.
 pub const UNMAPPABLE_EXCERPT_MAX: usize = 256;
 
@@ -362,6 +388,19 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_action_maps_the_three_odrl_spellings_to_one() {
+        for spelling in ["use", "odrl:use", "http://www.w3.org/ns/odrl/2/use"] {
+            assert_eq!(normalize_action(spelling), "odrl:use");
+        }
+        assert_eq!(
+            normalize_action("https://example.org/a/use"),
+            "https://example.org/a/use"
+        );
+        assert_eq!(normalize_action(UNMAPPABLE_ACTION), UNMAPPABLE_ACTION);
+        assert_eq!(normalize_action(""), "");
+    }
 
     #[test]
     fn catalog_new_has_empty_collections() {

@@ -941,7 +941,7 @@ fn parse_rule(value: &Value) -> Rule {
     }
     let mut constraints = Vec::new();
     let action = match get_field(value, "action") {
-        Field::Value(action) => action,
+        Field::Value(action) => catalog_core::normalize_action(&action),
         Field::Absent | Field::Unreadable => {
             tracing::warn!(
                 entry = %log_excerpt(value),
@@ -1649,7 +1649,7 @@ mod tests {
         assert_eq!(policies.len(), 1);
         assert_eq!(policies[0].kind, PolicyKind::Set);
         assert_eq!(policies[0].permissions.len(), 1);
-        assert_eq!(policies[0].permissions[0].action, "use");
+        assert_eq!(policies[0].permissions[0].action, "odrl:use");
     }
 
     /// (d) A permission carrying one well-formed atomic constraint
@@ -1792,7 +1792,7 @@ mod tests {
                 .iter()
                 .any(Constraint::is_unmappable)
         );
-        assert_eq!(permissions[1].action, "use");
+        assert_eq!(permissions[1].action, "odrl:use");
     }
 
     /// An unrecognized `@type` value degrades leniently to the default
