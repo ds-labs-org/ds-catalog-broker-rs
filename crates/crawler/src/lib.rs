@@ -500,9 +500,18 @@ fn parse_catalog_response(value: &Value, participant: &ParticipantEntry) -> Cata
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    collect_datasets_and_services(value, &mut catalog);
+    collect_datasets_and_services(value, &mut catalog, &mut SeenIds::default());
 
     catalog
+}
+
+/// Ids already collected from one response, across all nesting levels.
+/// Sets keep the dedup linear; scanning the `Catalog` vectors per entry
+/// is quadratic on a large hostile body.
+#[derive(Default)]
+struct SeenIds {
+    datasets: std::collections::HashSet<String>,
+    services: std::collections::HashSet<String>,
 }
 
 /// Extract `value`'s own `service`/`dataset` entries into `catalog`, then
@@ -510,14 +519,14 @@ fn parse_catalog_response(value: &Value, participant: &ParticipantEntry) -> Cata
 /// `parse_catalog_response`'s doc comment for why. `value` is either the
 /// top-level response body or one nested `catalog[]` entry; both share the
 /// same `service`/`dataset`/`catalog` shape.
-fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog) {
+fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog, seen: &mut SeenIds) {
     // `service` entries first, so a dataset's nested `accessService`
     // object (parsed below) can be folded in without duplicating one
     // already listed here.
     if let Some(services) = value.get("service").and_then(Value::as_array) {
         for service_value in services {
             if let Some(service) = parse_data_service(service_value)
-                && !catalog.data_services.iter().any(|s| s.id == service.id)
+                && seen.services.insert(service.id.clone())
             {
                 catalog.data_services.push(service);
             }
@@ -537,7 +546,7 @@ fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog) {
             // The store derives resource IRIs from the dataset id, so two
             // datasets with one id would merge their triples into a mixed
             // policy. Keep the first, as for services.
-            if catalog.datasets.iter().any(|d| d.id == dataset_id) {
+            if !seen.datasets.insert(dataset_id.to_string()) {
                 tracing::warn!(
                     dataset_id,
                     "skipping a crawled dataset whose id was already seen in this response (first one wins)"
@@ -594,7 +603,7 @@ fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog) {
                                 .unwrap_or_default()
                                 .to_string();
                             if let Some(service) = parse_data_service(access_service_value)
-                                && !catalog.data_services.iter().any(|s| s.id == service.id)
+                                && seen.services.insert(service.id.clone())
                             {
                                 catalog.data_services.push(service);
                             }
@@ -616,7 +625,7 @@ fn collect_datasets_and_services(value: &Value, catalog: &mut Catalog) {
 
     if let Some(nested_catalogs) = value.get("catalog").and_then(Value::as_array) {
         for nested_value in nested_catalogs {
-            collect_datasets_and_services(nested_value, catalog);
+            collect_datasets_and_services(nested_value, catalog, seen);
         }
     }
 }
