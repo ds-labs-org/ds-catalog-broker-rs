@@ -595,4 +595,5 @@ async fn upsert_wholesale_replacement_drops_the_prior_catalogs_decomposed_triple
 
 mod concurrency;
 mod constraints;
+mod listing;
 mod sparql;
