@@ -169,13 +169,13 @@ async fn sparql_get_ask_returns_true_over_http() {
     assert_eq!(parsed, serde_json::json!({"head": {}, "boolean": true}));
 }
 
-/// The in-memory backend (no `broker:participant`, `AppState::sparql`
-/// is `None`) has no SPARQL capability at all - `/sparql` must say so
-/// plainly (501), not 404 (the route exists) and not pretend to
-/// answer.
+/// There is one serving mode: the store the router is given is the store
+/// `/sparql` reads, with or without a crawler. A fresh store answers an
+/// empty result, not 501.
 #[tokio::test]
-async fn sparql_endpoint_returns_501_when_no_oxigraph_backend_is_configured() {
-    let app = build_router(test_state());
+async fn sparql_is_served_from_the_state_cache_without_a_crawler() {
+    let store = rdf_store::oxigraph_backend::OxigraphCatalogCache::in_memory().unwrap();
+    let app = build_router(AppState::new(Arc::new(store)));
     let response = app
         .oneshot(
             Request::builder()
@@ -185,7 +185,10 @@ async fn sparql_endpoint_returns_501_when_no_oxigraph_backend_is_configured() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed, serde_json::json!({"head": {}, "boolean": false}));
 }
 
 #[tokio::test]
