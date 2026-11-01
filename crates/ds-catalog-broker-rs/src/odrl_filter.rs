@@ -299,6 +299,12 @@ pub fn jwt_claims_to_engine_claims(claims: &serde_json::Value) -> Claims {
     mapped
 }
 
+/// The cache key for the policy allow-list of a caller with these token
+/// claims (`/sparql`).
+pub fn allow_list_key(claims: Option<&serde_json::Value>) -> String {
+    claims.map(ToString::to_string).unwrap_or_default()
+}
+
 /// Layers host-synthesized context claims on top of JWT-derived ones -
 /// currently just `dateTime`, set to the current wall-clock time
 /// (`chrono::Utc::now()`, already a workspace dependency - no exotic clock
@@ -1274,5 +1280,64 @@ mod tests {
             "only the bare-string 'sub' claim should survive filter_map'ing; got {claims:?}"
         );
         assert!(claims.contains_key("sub"));
+    }
+
+    // --- allow_list_key ---------------------------------------------------
+
+    #[test]
+    fn tokens_differing_only_in_per_token_claims_share_a_key() {
+        let first = serde_json::json!({
+            "sub": "did:example:consumer", "scope": "catalog:read",
+            "jti": "a", "iat": 1, "exp": 100, "nbf": 1,
+        });
+        let second = serde_json::json!({
+            "sub": "did:example:consumer", "scope": "catalog:read",
+            "jti": "b", "iat": 50, "exp": 150, "nbf": 50,
+        });
+        assert_eq!(allow_list_key(Some(&first)), allow_list_key(Some(&second)));
+    }
+
+    #[test]
+    fn a_differing_decision_relevant_claim_changes_the_key() {
+        let base = serde_json::json!({ "sub": "did:example:a", "scope": "x", "tier": "gold" });
+        let key = allow_list_key(Some(&base));
+        for changed in [
+            serde_json::json!({ "sub": "did:example:b", "scope": "x", "tier": "gold" }),
+            serde_json::json!({ "sub": "did:example:a", "scope": "x y", "tier": "gold" }),
+            serde_json::json!({ "sub": "did:example:a", "scope": "x", "tier": "silver" }),
+            serde_json::json!({ "sub": "did:example:a", "scope": "x" }),
+            serde_json::json!({ "sub": "did:example:a", "scope": "x", "tier": ["gold"] }),
+            serde_json::json!({ "sub": "did:example:a", "scope": "x", "tier": "gold", "extra": "1" }),
+        ] {
+            assert_ne!(allow_list_key(Some(&changed)), key, "{changed}");
+        }
+    }
+
+    /// The engine only ever sees the mapped claims, so a claim the mapping
+    /// drops cannot change a decision and need not split the cache.
+    #[test]
+    fn claims_the_engine_mapping_drops_do_not_split_the_key() {
+        let plain = serde_json::json!({ "sub": "did:example:a" });
+        let with_dropped = serde_json::json!({
+            "sub": "did:example:a", "age": 42, "active": true, "obj": {"a": "b"},
+            "nothing": null, "mixed": ["a", 1],
+        });
+        assert_eq!(
+            allow_list_key(Some(&plain)),
+            allow_list_key(Some(&with_dropped))
+        );
+        assert_eq!(
+            allow_list_key(None),
+            allow_list_key(Some(&serde_json::json!({})))
+        );
+    }
+
+    #[test]
+    fn claim_order_in_the_token_does_not_change_the_key() {
+        let one: serde_json::Value =
+            serde_json::from_str(r#"{"sub":"a","tier":"gold","scope":"x"}"#).unwrap();
+        let two: serde_json::Value =
+            serde_json::from_str(r#"{"scope":"x","tier":"gold","sub":"a"}"#).unwrap();
+        assert_eq!(allow_list_key(Some(&one)), allow_list_key(Some(&two)));
     }
 }

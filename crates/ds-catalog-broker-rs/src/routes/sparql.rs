@@ -219,7 +219,7 @@ pub(super) async fn sparql_route(
             // see `sparql_query_json_policy_filtered`.
             // Allow-lists are cached per caller: the token's claims decide
             // what a caller may see.
-            let allow_list_key = claims.as_ref().map(ToString::to_string).unwrap_or_default();
+            let allow_list_key = crate::odrl_filter::allow_list_key(claims.as_ref());
             let cancelled = || cancellation_requested(&limits);
             state.cache.sparql_query_json_policy_filtered(
                 &query,

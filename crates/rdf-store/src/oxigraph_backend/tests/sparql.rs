@@ -1240,3 +1240,63 @@ fn policy_filtered_query_resumes_a_catalog_cancelled_mid_decision() {
         );
     }
 }
+
+/// Runs one filtered query for `key`, so the allow-list is cached under it.
+fn query_as(cache: &OxigraphCatalogCache, key: &str) {
+    cache
+        .sparql_query_json_policy_filtered(TITLES, key, public_only, &SparqlLimits::default())
+        .unwrap();
+}
+
+/// A caller with many distinct keys fills the cache. It must evict one
+/// entry (the oldest), not flush every other caller's.
+#[test]
+fn allow_list_cache_evicts_one_entry_when_full() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    for index in 0..64 {
+        query_as(&cache, &format!("key-{index}"));
+        // Distinct build times, so "oldest" is well defined.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    query_as(&cache, "key-64");
+    let entries = cache.allow_lists.lock().unwrap();
+    assert_eq!(entries.len(), 64);
+    assert!(!entries.contains_key("key-0"));
+    for index in 1..=64 {
+        assert!(entries.contains_key(&format!("key-{index}")), "key-{index}");
+    }
+}
+
+/// The same for the resume cache of cancelled builds.
+#[test]
+fn partial_cache_evicts_one_entry_when_full() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    for index in 0..65 {
+        let token = CancellationToken::new();
+        let limits = SparqlLimits {
+            cancellation: Some(token.clone()),
+            ..SparqlLimits::default()
+        };
+        let result = cache.sparql_query_json_policy_filtered(
+            TITLES,
+            &format!("key-{index}"),
+            |catalog| {
+                token.cancel();
+                public_only(catalog)
+            },
+            &limits,
+        );
+        assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let partials = cache.partial_allow_lists.lock().unwrap();
+    assert_eq!(partials.len(), 64);
+    assert!(!partials.contains_key("key-0"));
+    assert!(partials.contains_key("key-64"));
+}
