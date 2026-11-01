@@ -140,8 +140,19 @@ Each re-crawl replaces a participant's named graph in one Oxigraph
 transaction, and `/catalog` and the management API read every catalog
 from one store snapshot, so a request served during a crawl sees each
 participant's previous catalog or its new one, never a half-written one.
-`/sparql` evaluation still reads the live store pattern by pattern, so one
-query can see two versions of a participant mid-crawl.
+An unfiltered `/sparql` query reads one store snapshot. A policy-filtered
+query (the default; see `broker:policyFilterRunWhenOauth2Disabled`) reads
+the store once per triple-pattern lookup, so the broker brackets it with a
+write counter: it computes the policy allow-list and runs the query, and
+if a write committed meanwhile it discards the result and starts over, up
+to 5 attempts. If writes keep landing the request gets `503` ("the catalog
+store kept changing"). Re-upserting an unchanged catalog counts as a write.
+A returned result therefore never mixes two versions of a participant and
+never applies an old policy to new data. The price is availability: a
+filtered query that runs longer than the typical interval between crawler
+commits can fail with `503` after 5 attempts. A store read transaction
+would avoid the retries, but it would hold the store's single writer lock
+for the whole query and stall every crawl.
 
 ![Internal architecture of the semantic cache: crawler parses a crawled catalog into a domain value plus a generic properties bag, upserts both through the CatalogCache trait, OxigraphCatalogCache stores one named graph per origin node as real DCAT triples plus one triple per property, and the two serving surfaces (catalog cache API, management API) read the triples and the decoded properties back out via SPARQL](docs/diagrams/semantic-cache-architecture.svg)
 

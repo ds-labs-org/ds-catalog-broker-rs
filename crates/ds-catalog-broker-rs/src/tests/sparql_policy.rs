@@ -524,7 +524,14 @@ async fn sparql_answers_a_result_within_the_row_cap() {
 /// the store while evaluating it, so cancellation cannot stop it. Takes a
 /// couple of seconds in a debug build.
 fn uncancellable_query() -> String {
-    let values: String = (0..3000).map(|i| format!("{i} ")).collect();
+    uncancellable_query_of(3000)
+}
+
+/// [`uncancellable_query`] over `n` values per `VALUES` clause: `n * n`
+/// joined rows, about 3.5 s in a debug build at `n = 3000` and growing
+/// with the square of `n`.
+fn uncancellable_query_of(n: usize) -> String {
+    let values: String = (0..n).map(|i| format!("{i} ")).collect();
     format!("SELECT (COUNT(*) AS ?n) WHERE {{ VALUES ?a {{ {values} }} VALUES ?b {{ {values} }} }}")
 }
 
@@ -567,15 +574,21 @@ async fn sparql_answers_503_when_every_evaluation_slot_is_busy() {
 /// or repeated slow queries would pile up blocking threads.
 #[tokio::test]
 async fn a_timed_out_sparql_query_keeps_its_slot_until_evaluation_stops() {
+    // The timeout has to fire while the evaluation is running, not before
+    // its blocking thread has started: a task cancelled before it starts
+    // returns at once and frees its slot (see
+    // `a_query_cancelled_before_its_blocking_task_starts_never_evaluates`).
+    // 500 ms is far above any thread-start delay, and the query takes
+    // about 8 s in a debug build, more than 10 times the timeout.
     let state = test_state().with_sparql_limits(SparqlLimitsConfig {
-        timeout: Duration::from_millis(50),
+        timeout: Duration::from_millis(500),
         max_concurrent: 1,
         ..Default::default()
     });
     let slots = Arc::clone(&state.sparql_slots);
     let app = build_router(state);
 
-    let (status, body) = sparql_status(&app, &uncancellable_query()).await;
+    let (status, body) = sparql_status(&app, &uncancellable_query_of(4500)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
     let (status, body) = sparql_status(&app, "ASK { ?s ?p ?o }").await;
     assert_eq!(
@@ -675,4 +688,91 @@ fn a_huge_sparql_max_concurrent_is_capped_rather_than_panicking() {
     .unwrap();
     let state = test_state().with_sparql_limits(SparqlLimitsConfig::from_settings(&settings));
     assert!(state.sparql_slots.available_permits() > 0);
+}
+
+// --- Status mapping of SPARQL failures ---------------------------------
+
+async fn error_answer(err: rdf_store::oxigraph_backend::SparqlError) -> (StatusCode, String) {
+    let response = crate::routes::sparql::error_response(err, Duration::from_millis(250));
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// A failed store read is the broker's fault: 500, and the body names
+/// nothing of the store.
+#[tokio::test]
+async fn a_store_read_failure_answers_500_with_a_fixed_body() {
+    use rdf_store::oxigraph_backend::SparqlError;
+    let (status, body) = error_answer(SparqlError::Store(
+        "corrupt quad in /var/lib/broker/store".to_string(),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("SPARQL evaluation failed"), "body: {body}");
+    assert!(!body.contains("corrupt"), "body: {body}");
+    assert!(!body.contains("/var/lib"), "body: {body}");
+}
+
+/// A store that kept changing is a temporary condition: 503, not 400.
+#[tokio::test]
+async fn a_store_that_keeps_changing_answers_503() {
+    use rdf_store::oxigraph_backend::SparqlError;
+    let (status, body) = error_answer(SparqlError::StoreBusy).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("kept changing"), "body: {body}");
+    assert!(body.contains("retry"), "body: {body}");
+}
+
+/// An error in the caller's own query stays 400.
+#[tokio::test]
+async fn a_query_evaluation_error_answers_400() {
+    use rdf_store::oxigraph_backend::SparqlError;
+    let (status, _) = error_answer(SparqlError::Evaluation("bad filter".to_string())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A query whose timeout fires while its task still waits for a blocking
+/// thread is cancelled before it starts. The task must then return at
+/// once and free its slot, not run the query. Either the task's own check
+/// of the token or oxigraph's check while it plans the query ends it;
+/// the test does not tell the two apart.
+///
+/// The runtime has one blocking thread, held by the test, so the query's
+/// task cannot start until the test lets go: no timing involved.
+#[test]
+fn a_query_cancelled_before_its_blocking_task_starts_never_evaluates() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let state = test_state().with_sparql_limits(SparqlLimitsConfig {
+            timeout: Duration::from_millis(50),
+            max_concurrent: 1,
+            ..Default::default()
+        });
+        let slots = Arc::clone(&state.sparql_slots);
+        let app = build_router(state);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+
+        // Queued behind the blocker, so the timeout fires first.
+        let (status, body) = sparql_status(&app, &uncancellable_query()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        // Running the query would hold the slot for seconds.
+        let freed = tokio::time::timeout(Duration::from_secs(1), slots.acquire_owned()).await;
+        assert!(freed.is_ok(), "the cancelled task evaluated its query");
+    });
 }

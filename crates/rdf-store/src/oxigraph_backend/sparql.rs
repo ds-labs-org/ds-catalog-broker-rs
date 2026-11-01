@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// How many times [`OxigraphCatalogCache::sparql_query_json_policy_filtered`]
+/// runs a query before giving up because the store keeps changing.
+pub const POLICY_FILTERED_ATTEMPTS: usize = 5;
+
+/// Longest a policy-filtered query waits for one in-progress write to
+/// commit before returning [`SparqlError::StoreBusy`]. Waiting does not
+/// use up an attempt.
+const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl OxigraphCatalogCache {
     /// Evaluate an arbitrary, caller-supplied SPARQL query and return
     /// the result serialized as
@@ -122,8 +131,10 @@ impl OxigraphCatalogCache {
     ///   snapshot per query), and the caller computes
     ///   `visible_resource_iris` before evaluation starts. A crawl
     ///   landing mid-request can therefore show an allow-listed
-    ///   dataset's newer triples. It cannot show anything not on the
-    ///   allow-list.
+    ///   dataset's newer triples, including ones whose policy the
+    ///   crawl tightened. Use [`Self::sparql_query_json_policy_filtered`],
+    ///   which computes the allow-list and evaluates on one store state,
+    ///   when the allow-list comes from the catalogs in the store.
     /// - **No numeric canonicalization.** Terms are compared as written:
     ///   `"01"^^xsd:integer` in a query doesn't match a stored `1`. The
     ///   only typed numbers this store writes are the position numbers
@@ -134,6 +145,90 @@ impl OxigraphCatalogCache {
         visible_resource_iris: &BTreeSet<String>,
     ) -> SparqlQueryResult<Vec<u8>> {
         self.sparql_query_json_limited(query, Some(visible_resource_iris), &SparqlLimits::default())
+    }
+
+    /// [`Self::sparql_query_json_restricted`] with the allow-list computed
+    /// from the store's own catalogs, on the same store state the query
+    /// reads.
+    ///
+    /// `allow_list` receives every catalog ([`Self::catalogs`]) and
+    /// returns the resource IRIs the caller may see. Filtered evaluation
+    /// reads the store once per lookup (see [`VisibleDataset`]), so a
+    /// write landing between the allow-list and the end of evaluation
+    /// would mix two states: a join could see an old graph and a new one,
+    /// and an allow-list built from old policies would admit new data.
+    /// The cache counts writes (`write_sequence`); when a write overlapped
+    /// the attempt, its result is discarded and the whole attempt,
+    /// allow-list included, runs again. After [`POLICY_FILTERED_ATTEMPTS`]
+    /// attempts the call returns [`SparqlError::StoreBusy`].
+    ///
+    /// Waiting for a write that is still committing does not use up an
+    /// attempt; it is bounded by `WRITE_WAIT` and by the caller's
+    /// cancellation token. A cancelled token also ends the call before
+    /// any further attempt, whatever the last attempt returned: oxigraph
+    /// checks the token only when it reads the store, so a query that
+    /// never does would otherwise be re-run in full after its caller gave
+    /// up.
+    ///
+    /// Writers are never blocked. A crawl that commits rarely sees one
+    /// retry; one that commits continuously can starve a long query,
+    /// which then ends in `StoreBusy` (or the caller's time limit).
+    /// `allow_list` may therefore run more than once.
+    ///
+    /// Alternatives considered: a store transaction gives a read view but
+    /// takes the in-memory backend's single writer lock for the whole
+    /// query, and oxigraph exposes no public snapshot to hand to both the
+    /// allow-list and `VisibleDataset`.
+    pub fn sparql_query_json_policy_filtered(
+        &self,
+        query: &str,
+        mut allow_list: impl FnMut(&[Catalog]) -> BTreeSet<String>,
+        limits: &SparqlLimits,
+    ) -> SparqlQueryResult<Vec<u8>> {
+        let cancelled = || {
+            limits
+                .cancellation
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+        };
+        for _ in 0..POLICY_FILTERED_ATTEMPTS {
+            // A caller that gave up gets no further attempt, even when the
+            // last one ended with a result: a query that never reads the
+            // store cannot be interrupted, and each re-run would hold the
+            // caller's evaluation slot for its full duration.
+            if cancelled() {
+                return Err(SparqlError::Cancelled);
+            }
+            // A write is committing: wait it out, bounded by `WRITE_WAIT`,
+            // without using up an attempt.
+            let waiting_since = std::time::Instant::now();
+            let before = loop {
+                let sequence = self.write_sequence.load(Ordering::SeqCst);
+                if sequence.is_multiple_of(2) {
+                    break sequence;
+                }
+                if cancelled() {
+                    return Err(SparqlError::Cancelled);
+                }
+                if waiting_since.elapsed() >= WRITE_WAIT {
+                    return Err(SparqlError::StoreBusy);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            let catalogs = self
+                .catalogs(CatalogQuery::all())
+                .map_err(|err| SparqlError::Store(err.to_string()))?;
+            let visible = allow_list(&catalogs);
+            drop(catalogs);
+            let result = self.sparql_query_json_limited(query, Some(&visible), limits);
+            if self.write_sequence.load(Ordering::SeqCst) == before {
+                return result;
+            }
+            if cancelled() {
+                return Err(SparqlError::Cancelled);
+            }
+        }
+        Err(SparqlError::StoreBusy)
     }
 
     /// [`Self::sparql_query_json`] (`visible_resource_iris: None`) or
@@ -191,6 +286,9 @@ impl OxigraphCatalogCache {
 pub(super) fn evaluation_error(err: QueryEvaluationError) -> SparqlError {
     match err {
         QueryEvaluationError::Cancelled => SparqlError::Cancelled,
+        // The evaluator reads the store through a dataset whose only
+        // error is a storage failure: a server fault, not a bad query.
+        QueryEvaluationError::Dataset(err) => SparqlError::Store(err.to_string()),
         err => SparqlError::Evaluation(err.to_string()),
     }
 }
@@ -309,6 +407,39 @@ pub(super) fn graph_holds_a_catalog(
         .map(|quad| quad.is_some())
 }
 
+// Test seam: runs once per triple-pattern lookup of a `VisibleDataset`
+// on the evaluating thread. A test installs a closure to write to the
+// store in the middle of an evaluation, or to make a lookup fail with a
+// storage error.
+#[cfg(test)]
+type LookupHook = Box<dyn FnMut() -> Option<StorageError>>;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static LOOKUP_HOOK: std::cell::RefCell<Option<LookupHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn lookup_hook() -> Option<StorageError> {
+    // Taken out while it runs, so a hook that itself queries the store
+    // does not re-enter it.
+    let mut hook = LOOKUP_HOOK.with(|hook| hook.borrow_mut().take())?;
+    let injected = hook();
+    LOOKUP_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(hook);
+        }
+    });
+    injected
+}
+
+#[cfg(not(test))]
+fn lookup_hook() -> Option<StorageError> {
+    None
+}
+
 /// The live store, minus every quad [`quad_is_visible`] rejects, as a
 /// dataset oxigraph's SPARQL evaluator can query directly. Terms are
 /// passed through as plain [`Term`]s; `FROM`/`FROM NAMED` and the
@@ -380,6 +511,7 @@ impl<'a> QueryableDataset<'a> for VisibleDataset<'a> {
             NamedOrBlankNodeRef::BlankNode(_) => false,
         });
 
+        let injected = lookup_hook();
         let quads = match (subject, predicate, graph) {
             _ if bound_iri_hidden => None,
             (Some(subject), Some(predicate), Some(graph)) => {
@@ -388,7 +520,11 @@ impl<'a> QueryableDataset<'a> for VisibleDataset<'a> {
             _ => None,
         };
 
-        quads.into_iter().flatten().filter_map(move |quad| {
+        let quads = injected
+            .into_iter()
+            .map(Err)
+            .chain(quads.into_iter().flatten());
+        quads.filter_map(move |quad| {
             let quad = match quad {
                 Ok(quad) => quad,
                 Err(err) => return Some(Err(err)),

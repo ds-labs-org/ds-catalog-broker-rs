@@ -2,6 +2,7 @@
 //! analysis §3.3).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Form,
@@ -12,7 +13,6 @@ use axum::{
 use rdf_store::oxigraph_backend::{
     CancellationToken, OxigraphCatalogCache, SparqlError, SparqlLimits,
 };
-use rdf_store::{CatalogQuery, StoreError};
 use serde::Deserialize;
 
 use super::auth::check_oauth2_bearer;
@@ -105,7 +105,7 @@ pub(super) fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 /// - ODRL policy-based filtering (gap analysis §3.4) runs next, whenever
 ///   [`should_filter_by_policy`] says it should: the query is evaluated
 ///   over only the datasets and data services the caller may see
-///   (`OxigraphCatalogCache::sparql_query_json_restricted`, allow-list
+///   (`OxigraphCatalogCache::sparql_query_json_policy_filtered`, allow-list
 ///   from [`visible_resource_iris`], the same per-dataset decision
 ///   `filter_catalogs_by_policy` makes for `GET /catalog`/the management
 ///   API). Hidden data is absent from what the query reads, so every
@@ -122,7 +122,16 @@ pub(super) fn accepts_sparql_results_json(headers: &HeaderMap) -> bool {
 ///   gets 503 Service Unavailable straight away; past `timeout` it is
 ///   cancelled and the caller gets 503; a result over `max_rows` rows is
 ///   400 Bad Request. The policy allow-list is computed in the same
-///   blocking task, just before evaluation.
+///   blocking task, on the same store state the query reads: a crawl
+///   landing mid-query makes the evaluation start over, up to 5 attempts,
+///   and a store that keeps changing ends in 503 ("kept changing"). This
+///   trades availability for consistency: a filtered query longer than
+///   the usual interval between crawler commits can get that 503. A read
+///   transaction was rejected because it would hold the store's single
+///   writer lock for the whole query.
+/// - A failed store read, including a storage error raised while the
+///   query runs: 500 with the fixed body "SPARQL evaluation failed"; the
+///   detail is logged.
 /// - Otherwise: 200 with an `application/sparql-results+json` body.
 ///
 /// Checked first, ahead of all of the above: the OAuth2 Bearer gate (see
@@ -198,22 +207,20 @@ pub(super) async fn sparql_route(
         let _slot = slot;
         if cancellation_requested(&limits) {
             // Timed out or abandoned while waiting for a blocking thread.
-            return Err(Evaluation::Sparql(SparqlError::Cancelled));
+            return Err(SparqlError::Cancelled);
         }
-        let visible_resources = if should_filter_by_policy(&state) {
+        if should_filter_by_policy(&state) {
             let engine_claims = engine_claims_from_bearer(claims.as_ref());
-            let catalogs = state
-                .cache
-                .catalogs(CatalogQuery::all())
-                .map_err(Evaluation::Store)?;
-            Some(visible_resource_iris(&catalogs, &engine_claims, &state))
+            // The allow-list and the evaluation run on one store state;
+            // see `sparql_query_json_policy_filtered`.
+            state.cache.sparql_query_json_policy_filtered(
+                &query,
+                |catalogs| visible_resource_iris(catalogs, &engine_claims, &state),
+                &limits,
+            )
         } else {
-            None
-        };
-        state
-            .cache
-            .sparql_query_json_limited(&query, visible_resources.as_ref(), &limits)
-            .map_err(Evaluation::Sparql)
+            state.cache.sparql_query_json_limited(&query, None, &limits)
+        }
     });
     let stopping = async move {
         match draining {
@@ -234,8 +241,7 @@ pub(super) async fn sparql_route(
     };
     let result = match finished {
         Ok(Ok(Ok(body))) => Ok(body),
-        Ok(Ok(Err(Evaluation::Sparql(err)))) => Err(err),
-        Ok(Ok(Err(Evaluation::Store(err)))) => return internal_error(err),
+        Ok(Ok(Err(err))) => Err(err),
         Ok(Err(join_error)) => {
             tracing::error!(error = %join_error, "SPARQL evaluation task panicked");
             return internal_error("SPARQL evaluation failed");
@@ -252,12 +258,27 @@ pub(super) async fn sparql_route(
             body,
         )
             .into_response(),
-        Err(
-            err @ (SparqlError::Parse(_)
-            | SparqlError::Evaluation(_)
-            | SparqlError::UnsupportedGraphResult),
-        ) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-        Err(SparqlError::Cancelled) => (
+        Err(err) => error_response(err, timeout),
+    }
+}
+
+/// The HTTP answer for a failed query - see [`sparql_route`] for each
+/// status. `timeout` is only quoted in the answer to a cancelled query.
+pub(crate) fn error_response(err: SparqlError, timeout: Duration) -> axum::response::Response {
+    match err {
+        err @ (SparqlError::Parse(_)
+        | SparqlError::Evaluation(_)
+        | SparqlError::UnsupportedGraphResult) => {
+            (StatusCode::BAD_REQUEST, err.to_string()).into_response()
+        }
+        SparqlError::Store(err) => {
+            tracing::error!(error = %err, "catalog store read failed during SPARQL query");
+            internal_error("SPARQL evaluation failed")
+        }
+        err @ SparqlError::StoreBusy => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
+        SparqlError::Cancelled => (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "SPARQL query ran past the {} ms time limit and was stopped - add a LIMIT or \
@@ -266,22 +287,14 @@ pub(super) async fn sparql_route(
             ),
         )
             .into_response(),
-        Err(err @ SparqlError::TooManyRows(_)) => {
+        err @ SparqlError::TooManyRows(_) => {
             (StatusCode::BAD_REQUEST, err.to_string()).into_response()
         }
-        Err(err @ SparqlError::Serialize(_)) => {
+        err @ SparqlError::Serialize(_) => {
             tracing::error!(error = %err, "failed to serialize SPARQL results");
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
     }
-}
-
-/// Why the blocking half of [`sparql_route`] failed.
-enum Evaluation {
-    /// Decoding the store for the policy allow-list failed: a 500.
-    Store(StoreError),
-    /// The query itself failed - see [`SparqlError`] for each status.
-    Sparql(SparqlError),
 }
 
 /// Cancels the evaluation's token when dropped, so an evaluation whose

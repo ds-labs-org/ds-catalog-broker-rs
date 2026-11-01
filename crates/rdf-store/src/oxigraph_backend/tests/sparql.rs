@@ -574,3 +574,327 @@ async fn sparql_query_json_restricted_supports_graph_from_ask_and_count() {
         true
     );
 }
+
+// --- `sparql_query_json_policy_filtered` (#34) ---------------------------
+
+/// One dataset `ds-1` carrying a `visibility` and a `title` property.
+fn visibility_catalog(visibility: &str, title: &str) -> Catalog {
+    let mut catalog = Catalog::new("cat-v", NodeId::new("node-v"));
+    let mut properties = BTreeMap::new();
+    properties.insert("visibility".to_string(), visibility.to_string());
+    properties.insert("title".to_string(), title.to_string());
+    catalog.datasets.push(Dataset {
+        id: "ds-1".to_string(),
+        properties,
+        distributions: Vec::new(),
+        policies: Vec::new(),
+    });
+    catalog
+}
+
+/// The allow-list a caller who may see only `public` datasets gets.
+fn public_only(catalogs: &[Catalog]) -> BTreeSet<String> {
+    catalogs
+        .iter()
+        .flat_map(|catalog| {
+            catalog
+                .datasets
+                .iter()
+                .filter(|dataset| {
+                    dataset.properties.get("visibility").map(String::as_str) == Some("public")
+                })
+                .map(|dataset| dataset_resource_iri(&catalog.origin_node, &dataset.id))
+        })
+        .collect()
+}
+
+/// A crawl that tightens a dataset's policy lands after the allow-list is
+/// computed. The old allow-list admits the dataset, the store now holds
+/// the new graph. The query must not return the new triples.
+#[test]
+fn policy_filtered_query_does_not_show_new_data_through_an_old_allow_list() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let mut interleaved = false;
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            "SELECT ?o WHERE { ?s ?p ?o }",
+            |catalogs| {
+                let allow = public_only(catalogs);
+                if !interleaved {
+                    interleaved = true;
+                    cache
+                        .store_catalog(visibility_catalog("private", "title-v2"))
+                        .unwrap();
+                }
+                allow
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    assert!(interleaved);
+    let values = binding_values(&body);
+    assert!(!values.iter().any(|v| v == "title-v2"), "{values:?}");
+    assert!(!values.iter().any(|v| v == "title-v1"), "{values:?}");
+}
+
+/// A write that lands before the query starts is an ordinary update, not
+/// a retry.
+#[test]
+fn policy_filtered_query_with_no_overlapping_write_runs_once() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let mut calls = 0;
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            "SELECT ?o WHERE { ?s ?p ?o }",
+            |catalogs| {
+                calls += 1;
+                public_only(catalogs)
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(calls, 1);
+    assert!(binding_values(&body).iter().any(|v| v == "title-v1"));
+}
+
+/// A store written during every attempt gives up instead of answering
+/// from mixed states.
+#[test]
+fn policy_filtered_query_gives_up_when_the_store_keeps_changing() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let mut calls = 0;
+    let result = cache.sparql_query_json_policy_filtered(
+        "SELECT ?o WHERE { ?s ?p ?o }",
+        |catalogs| {
+            calls += 1;
+            let allow = public_only(catalogs);
+            cache
+                .store_catalog(visibility_catalog("public", &format!("title-{calls}")))
+                .unwrap();
+            allow
+        },
+        &SparqlLimits::default(),
+    );
+    assert!(matches!(result, Err(SparqlError::StoreBusy)), "{result:?}");
+    assert_eq!(calls, POLICY_FILTERED_ATTEMPTS);
+}
+
+/// Waiting for one slow write is not a retry: it does not use up an
+/// attempt, however long the write takes (within the wait bound).
+#[test]
+fn policy_filtered_query_waits_out_a_slow_write_without_using_attempts() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    // Odd sequence: a write is in progress. It commits after far longer
+    // than POLICY_FILTERED_ATTEMPTS sleeps of 2 ms.
+    let sequence = cache.write_sequence.clone();
+    sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let mut calls = 0;
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            "SELECT ?o WHERE { ?s ?p ?o }",
+            |catalogs| {
+                calls += 1;
+                public_only(catalogs)
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    writer.join().unwrap();
+    assert_eq!(calls, 1);
+    assert!(binding_values(&body).iter().any(|v| v == "title-v1"));
+}
+
+/// A cancelled query stops waiting for a write.
+#[test]
+fn policy_filtered_query_stops_waiting_when_cancelled() {
+    let cache = cache();
+    cache
+        .write_sequence
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let token = CancellationToken::new();
+    token.cancel();
+    let limits = SparqlLimits {
+        cancellation: Some(token),
+        ..SparqlLimits::default()
+    };
+    let result = cache.sparql_query_json_policy_filtered(
+        "SELECT ?o WHERE { ?s ?p ?o }",
+        public_only,
+        &limits,
+    );
+    assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+}
+
+/// Installs `hook` for the rest of the test's evaluations on this thread.
+fn install_lookup_hook(hook: impl FnMut() -> Option<StorageError> + 'static) {
+    crate::oxigraph_backend::sparql::LOOKUP_HOOK
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// A query that cancellation cannot interrupt is not run again because a
+/// write landed during it: the caller has already given up, and every
+/// extra attempt holds its evaluation slot.
+///
+/// The cancel and the write happen inside the first lookup of the
+/// evaluation. That lookup matches nothing, so oxigraph has no row to
+/// check the token on, and the attempt ends with a result and a changed
+/// write sequence - the shape of a slow `VALUES`-only query cancelled by
+/// the route's timeout.
+#[test]
+fn policy_filtered_query_cancelled_during_an_attempt_is_not_retried() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let token = CancellationToken::new();
+    let limits = SparqlLimits {
+        cancellation: Some(token.clone()),
+        ..SparqlLimits::default()
+    };
+    let writer = cache.clone();
+    let canceller = token.clone();
+    let mut fired = false;
+    install_lookup_hook(move || {
+        if !std::mem::replace(&mut fired, true) {
+            canceller.cancel();
+            writer
+                .store_catalog(visibility_catalog("public", "title-v2"))
+                .unwrap();
+        }
+        None
+    });
+    let mut attempts = 0;
+    let result = cache.sparql_query_json_policy_filtered(
+        "SELECT ?a ?o WHERE { VALUES ?a { 1 } OPTIONAL { ?s <urn:test:absent> ?o } }",
+        |catalogs| {
+            attempts += 1;
+            public_only(catalogs)
+        },
+        &limits,
+    );
+    assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+    assert_eq!(attempts, 1);
+}
+
+/// A storage failure raised while the evaluator reads the store is a
+/// store fault, not an error in the caller's query.
+#[test]
+fn policy_filtered_query_reports_a_storage_failure_during_evaluation_as_a_store_error() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    install_lookup_hook(|| Some(StorageError::Io(std::io::Error::other("disk gone"))));
+    let result = cache.sparql_query_json_policy_filtered(
+        "SELECT ?o WHERE { ?s ?p ?o }",
+        public_only,
+        &SparqlLimits::default(),
+    );
+    assert!(matches!(result, Err(SparqlError::Store(_))), "{result:?}");
+}
+
+/// The same for the unfiltered evaluation path.
+#[test]
+fn evaluation_error_maps_a_dataset_storage_error_to_a_store_error() {
+    let err = QueryEvaluationError::Dataset(Box::new(std::io::Error::other("disk gone")));
+    assert!(matches!(
+        crate::oxigraph_backend::sparql::evaluation_error(err),
+        SparqlError::Store(_)
+    ));
+    let err = QueryEvaluationError::UnboundService;
+    assert!(matches!(
+        crate::oxigraph_backend::sparql::evaluation_error(err),
+        SparqlError::Evaluation(_)
+    ));
+}
+
+/// A write that lands between two lookups of one evaluation must not
+/// show up as a join of an old graph with a new one (issue #34). The
+/// first attempt reads `title-v1` for `?t1` and, after the hook replaces
+/// the catalog, `title-v2` for `?t2`; that attempt is discarded and the
+/// retry reads one state.
+#[test]
+fn policy_filtered_query_does_not_join_old_and_new_graphs_across_a_mid_evaluation_write() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let writer = cache.clone();
+    let mut lookups = 0;
+    install_lookup_hook(move || {
+        lookups += 1;
+        if lookups == 2 {
+            writer
+                .store_catalog(visibility_catalog("public", "title-v2"))
+                .unwrap();
+        }
+        None
+    });
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            "SELECT ?t1 ?t2 WHERE { ?s ?p ?t1 . ?s ?p ?t2 . \
+             FILTER(STRSTARTS(STR(?t1), \"title-\") && STRSTARTS(STR(?t2), \"title-\")) }",
+            public_only,
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let rows = parsed["results"]["bindings"].as_array().unwrap();
+    assert!(!rows.is_empty(), "{parsed}");
+    for row in rows {
+        assert_eq!(row["t1"]["value"], row["t2"]["value"], "{parsed}");
+        assert_eq!(row["t1"]["value"], "title-v2", "{parsed}");
+    }
+}
+
+/// A delete of a node the store does not hold writes nothing, so it must
+/// not look like a write to a query in flight.
+#[test]
+fn deleting_an_absent_node_does_not_advance_the_write_sequence() {
+    let cache = cache();
+    let before = cache
+        .write_sequence
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(!cache.remove_catalog(&NodeId::new("never-stored")).unwrap());
+    assert_eq!(
+        cache
+            .write_sequence
+            .load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+}
+
+/// A delete that removes a graph is a write.
+#[test]
+fn deleting_a_stored_node_advances_the_write_sequence() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let before = cache
+        .write_sequence
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(cache.remove_catalog(&NodeId::new("node-v")).unwrap());
+    assert!(
+        cache
+            .write_sequence
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > before
+    );
+}
