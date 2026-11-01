@@ -75,6 +75,7 @@ async fn main() {
     // `GET /catalog`, the management API and `/sparql`; the crawler fills it
     // when the config lists participants. An unreadable holder credential
     // stops the broker on boot, like any other bad crawler config.
+
     // Registered before anything else starts, so no signal is missed.
     let signals = Signals::install();
     let shutdown = CancellationToken::new();

@@ -73,6 +73,12 @@ impl Signals {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use tokio::sync::Mutex;
+
+    /// Signals go to the whole process, so the tests take turns. Otherwise
+    /// each test's listeners also receive the other test's signals.
+    static ONE_AT_A_TIME: std::sync::LazyLock<Mutex<()>> =
+        std::sync::LazyLock::new(|| Mutex::new(()));
 
     fn send(signal: &str) {
         let status = std::process::Command::new("kill")
@@ -85,6 +91,7 @@ mod tests {
     /// Two signals sent before the first is consumed are both delivered.
     #[tokio::test]
     async fn a_second_signal_sent_before_the_first_is_handled_is_not_lost() {
+        let _turn = ONE_AT_A_TIME.lock().await;
         let mut signals = Signals::install();
         send("TERM");
         send("INT");
@@ -97,6 +104,7 @@ mod tests {
     /// listeners that live across calls, not collapsed or dropped.
     #[tokio::test]
     async fn a_signal_between_two_waits_is_kept_for_the_second_wait() {
+        let _turn = ONE_AT_A_TIME.lock().await;
         let mut signals = Signals::install();
         send("TERM");
         assert_eq!(signals.next().await, "SIGTERM");

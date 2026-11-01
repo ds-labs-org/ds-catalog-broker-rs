@@ -465,9 +465,9 @@ fn normalize_left_operand(left_operand: &str) -> String {
 
 /// [`catalog_constraint_to_engine_constraint`]'s actual recursion, with an
 /// explicit depth counter this crate's own public signature has no room
-/// for. Bounded by the same [`MAX_CONSTRAINT_DEPTH`] the crawler's own
-/// parsing already bounds itself by (shared from `catalog_core`) (gap analysis \u{a7}3.4's own note on
-/// why the two are kept in step) - a harvested `Constraint` reaching this
+/// for. Bounded by [`MAX_CONSTRAINT_DEPTH`], the one definition in
+/// `catalog_core` that the crawler's parsing also uses (gap analysis
+/// section 3.4 explains why the two are kept in step). A harvested `Constraint` reaching this
 /// function has already been through that bound once, so this is a
 /// defense-in-depth guard against a `Constraint` value built some other
 /// way (directly, in a test, or by a future caller), not a bound this
