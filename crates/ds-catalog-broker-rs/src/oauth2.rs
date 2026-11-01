@@ -880,6 +880,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_says_an_unparseable_jwks_uri_is_not_a_valid_url() {
+        let err = OAuth2Verifier::fetch(&reqwest::Client::new(), config("not a url".to_string()))
+            .await
+            .expect_err("an unparseable URI");
+        assert!(err.to_string().contains("not a valid URL"), "{err}");
+    }
+
+    #[tokio::test]
     async fn fetch_refuses_a_jwks_uri_over_plain_http_to_a_named_host() {
         let err = OAuth2Verifier::fetch(
             &reqwest::Client::new(),
