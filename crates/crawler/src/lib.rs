@@ -1605,7 +1605,7 @@ mod tests {
         assert_eq!(policy.assignee.as_deref(), Some("did:example:consumer"));
 
         assert_eq!(policy.permissions.len(), 1);
-        assert_eq!(policy.permissions[0].action, "use");
+        assert_eq!(policy.permissions[0].action, "odrl:use");
         assert_eq!(
             policy.permissions[0].constraints,
             vec![Constraint::atomic(
@@ -1616,7 +1616,7 @@ mod tests {
         );
 
         assert_eq!(policy.prohibitions.len(), 1);
-        assert_eq!(policy.prohibitions[0].action, "distribute");
+        assert_eq!(policy.prohibitions[0].action, "odrl:distribute");
         assert!(policy.prohibitions[0].constraints.is_empty());
 
         assert!(policy.obligations.is_empty());
@@ -2616,6 +2616,25 @@ mod tests {
         }]});
         let catalog = parse_catalog_response(&body, &participant("p40"));
         assert_eq!(catalog.datasets[0].policies.len(), 1);
+    }
+
+    #[test]
+    fn action_spellings_normalize_to_the_odrl_prefixed_form() {
+        for spelling in ["use", "odrl:use", "http://www.w3.org/ns/odrl/2/use"] {
+            let policy = parse_one_policy(json!({
+                "permission": [{"action": spelling}],
+                "prohibition": [{"action": {"@id": spelling}}]
+            }));
+            assert_eq!(policy.permissions[0].action, "odrl:use", "{spelling}");
+            assert_eq!(policy.prohibitions[0].action, "odrl:use", "{spelling}");
+        }
+        let policy = parse_one_policy(json!({
+            "permission": [{"action": "https://example.org/act/share"}]
+        }));
+        assert_eq!(
+            policy.permissions[0].action,
+            "https://example.org/act/share"
+        );
     }
 
     #[test]

@@ -880,6 +880,60 @@ mod tests {
         }
     }
 
+    // --- action spellings (#41) -----------------------------------------
+
+    const USE_SPELLINGS: [&str; 3] = ["use", "odrl:use", "http://www.w3.org/ns/odrl/2/use"];
+
+    #[test]
+    fn a_prohibition_on_any_spelling_of_use_hides_the_dataset() {
+        for spelling in USE_SPELLINGS {
+            let dataset = dataset_with_policies(vec![policy(
+                vec![unconstrained_rule("odrl:use")],
+                vec![unconstrained_rule(spelling)],
+            )]);
+            assert!(
+                !dataset_is_visible(
+                    &dataset,
+                    &Claims::new(),
+                    "odrl:use",
+                    &PolicyFilterConfig::default()
+                ),
+                "prohibition spelled {spelling:?} must apply to odrl:use"
+            );
+        }
+    }
+
+    #[test]
+    fn a_permission_on_any_spelling_of_use_grants_visibility() {
+        for spelling in USE_SPELLINGS {
+            let dataset =
+                dataset_with_policies(vec![policy(vec![unconstrained_rule(spelling)], vec![])]);
+            assert!(
+                dataset_is_visible(
+                    &dataset,
+                    &Claims::new(),
+                    "odrl:use",
+                    &PolicyFilterConfig::default()
+                ),
+                "permission spelled {spelling:?} must cover odrl:use"
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_action_is_normalized_too() {
+        for requested in USE_SPELLINGS {
+            let dataset =
+                dataset_with_policies(vec![policy(vec![unconstrained_rule("use")], vec![])]);
+            assert!(dataset_is_visible(
+                &dataset,
+                &Claims::new(),
+                requested,
+                &PolicyFilterConfig::default()
+            ));
+        }
+    }
+
     // --- dataset_is_visible --------------------------------------------
 
     #[test]
