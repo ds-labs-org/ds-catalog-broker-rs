@@ -170,7 +170,12 @@ fn did_url_allowed(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else {
         return false;
     };
-    let authority = rest.split('/').next().unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Userinfo ("a@b") makes the real host differ from the text before the
+    // port, so an authority carrying it is never loopback-trusted.
+    if authority.contains('@') {
+        return false;
+    }
     let host = if let Some(bracketed) = authority.strip_prefix('[') {
         bracketed.split(']').next().unwrap_or("")
     } else {
@@ -878,6 +883,9 @@ mod tests {
         assert!(!did_url_allowed("http://10.0.0.5:8500/internal/did.json"));
         assert!(!did_url_allowed("http://localhost:8080/did.json"));
         assert!(!did_url_allowed("ftp://127.0.0.1/did.json"));
+        assert!(!did_url_allowed("http://127.0.0.1:80@10.0.0.5/x/did.json"));
+        assert!(!did_url_allowed("http://127.0.0.1@10.0.0.5/did.json"));
+        assert!(!did_url_allowed("http://[::1]:80@10.0.0.5/did.json"));
     }
 
     #[tokio::test]
