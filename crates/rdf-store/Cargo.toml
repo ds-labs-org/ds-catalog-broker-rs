@@ -26,7 +26,7 @@ contreforts-kg = { path = "../../vendor/contreforts-kg", default-features = fals
 oxigraph = { workspace = true }
 spareval = { workspace = true }
 urlencoding = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 serde_json = { workspace = true }
