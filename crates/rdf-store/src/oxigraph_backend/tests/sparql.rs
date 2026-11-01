@@ -823,3 +823,78 @@ fn evaluation_error_maps_a_dataset_storage_error_to_a_store_error() {
         SparqlError::Evaluation(_)
     ));
 }
+
+/// A write that lands between two lookups of one evaluation must not
+/// show up as a join of an old graph with a new one (issue #34). The
+/// first attempt reads `title-v1` for `?t1` and, after the hook replaces
+/// the catalog, `title-v2` for `?t2`; that attempt is discarded and the
+/// retry reads one state.
+#[test]
+fn policy_filtered_query_does_not_join_old_and_new_graphs_across_a_mid_evaluation_write() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let writer = cache.clone();
+    let mut lookups = 0;
+    install_lookup_hook(move || {
+        lookups += 1;
+        if lookups == 2 {
+            writer
+                .store_catalog(visibility_catalog("public", "title-v2"))
+                .unwrap();
+        }
+        None
+    });
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            "SELECT ?t1 ?t2 WHERE { ?s ?p ?t1 . ?s ?p ?t2 . \
+             FILTER(STRSTARTS(STR(?t1), \"title-\") && STRSTARTS(STR(?t2), \"title-\")) }",
+            public_only,
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let rows = parsed["results"]["bindings"].as_array().unwrap();
+    assert!(!rows.is_empty(), "{parsed}");
+    for row in rows {
+        assert_eq!(row["t1"]["value"], row["t2"]["value"], "{parsed}");
+        assert_eq!(row["t1"]["value"], "title-v2", "{parsed}");
+    }
+}
+
+/// A delete of a node the store does not hold writes nothing, so it must
+/// not look like a write to a query in flight.
+#[test]
+fn deleting_an_absent_node_does_not_advance_the_write_sequence() {
+    let cache = cache();
+    let before = cache
+        .write_sequence
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(!cache.remove_catalog(&NodeId::new("never-stored")).unwrap());
+    assert_eq!(
+        cache
+            .write_sequence
+            .load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+}
+
+/// A delete that removes a graph is a write.
+#[test]
+fn deleting_a_stored_node_advances_the_write_sequence() {
+    let cache = cache();
+    cache
+        .store_catalog(visibility_catalog("public", "title-v1"))
+        .unwrap();
+    let before = cache
+        .write_sequence
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(cache.remove_catalog(&NodeId::new("node-v")).unwrap());
+    assert!(
+        cache
+            .write_sequence
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > before
+    );
+}
