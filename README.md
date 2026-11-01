@@ -213,10 +213,13 @@ dependency line for how that got removed.
 
 ## Benchmarks
 
-[`compliance/harvest-benchmark-2026-08-27.md`](compliance/harvest-benchmark-2026-08-27.md)
-benchmarks the harvester against Eclipse EDC's own federated-catalog
-crawler; the `ds-dev-deployment` demo stack reuses its exact
-participant/dataset scale (2 participants, 10 datasets).
+[`compliance/harvest-benchmark-2026-11-01.md`](compliance/harvest-benchmark-2026-11-01.md)
+compares the previous broker build, the current one and Eclipse EDC
+1.0.0-RC5's federated-catalog crawler under the same conditions (two
+participants, ten datasets, 5 s crawl period, 20 VUs for 30 s). The first
+run, against EDC 0.18.0, is
+[`compliance/harvest-benchmark-2026-08-27.md`](compliance/harvest-benchmark-2026-08-27.md);
+the `ds-dev-deployment` demo stack reuses its participant/dataset scale.
 
 ## Layout
 

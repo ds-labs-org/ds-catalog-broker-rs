@@ -1,6 +1,9 @@
 # Harvesting benchmark: EDC's own federated-catalog crawler vs. `crates/crawler`
 
-Full report: [`../harvest-benchmark-2026-08-27.md`](../harvest-benchmark-2026-08-27.md).
+Current report: [`../harvest-benchmark-2026-11-01.md`](../harvest-benchmark-2026-11-01.md)
+(three-way: previous broker, current broker, EDC 1.0.0-RC5; driver `run-three-way.sh`).
+First report: [`../harvest-benchmark-2026-08-27.md`](../harvest-benchmark-2026-08-27.md)
+(driver `run-harvest-bench.sh`, EDC 0.18.0).
 
 Measures both systems with their background harvesting loop actively
 re-crawling two real EDC 0.18.0 participants (3 + 7 datasets) **while**

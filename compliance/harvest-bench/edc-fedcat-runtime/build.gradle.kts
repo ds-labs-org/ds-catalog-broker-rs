@@ -29,9 +29,17 @@ repositories {
     mavenCentral()
 }
 
+// -PedcVersion=<version> selects the EDC release (default: the latest benchmarked,
+// 1.0.0-RC5). 0.18.0 was used by the 2026-08-27 report.
+// dsp-catalog-transform-2025 is listed explicitly: federatedcatalog-base-bom
+// 1.0.0-RC5 no longer brings the transformer for the outgoing
+// CatalogRequestMessage, so every crawl failed without any log line.
+val edcVersion = (findProperty("edcVersion") as String?) ?: "1.0.0-RC5"
+
 dependencies {
-    implementation("org.eclipse.edc:federatedcatalog-base-bom:0.18.0")
-    implementation("org.eclipse.edc:iam-mock:0.18.0")
+    implementation("org.eclipse.edc:federatedcatalog-base-bom:$edcVersion")
+    implementation("org.eclipse.edc:iam-mock:$edcVersion")
+    implementation("org.eclipse.edc:dsp-catalog-transform-2025:$edcVersion")
 }
 
 java {

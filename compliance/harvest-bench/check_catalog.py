@@ -18,6 +18,7 @@ Exits 0 and prints "OK <sorted-ids>" on success, exits 1 and prints
 observed id set so a failure is legible without re-running anything.
 """
 import json
+import os
 import sys
 import urllib.request
 
@@ -65,7 +66,7 @@ def main():
     mode, url = sys.argv[1], sys.argv[2]
 
     if mode == "edc":
-        body = '{"@type":"https://w3id.org/edc/v0.0.1/ns/QuerySpec"}'
+        body = os.environ.get("EDC_QUERYSPEC_BODY", '{"@type":"https://w3id.org/edc/v0.0.1/ns/QuerySpec"}')
         catalogs = post(url, body)
         ids = set()
         for catalog in catalogs:
