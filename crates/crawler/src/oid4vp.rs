@@ -86,11 +86,17 @@ pub enum Oid4VpError {
         uri: String,
         status: reqwest::StatusCode,
     },
+    #[error("reading the response from {uri} failed: {source}")]
+    ReadBody {
+        uri: String,
+        #[source]
+        source: crate::BodyError,
+    },
     #[error("response from {uri} was not valid JSON: {source}")]
     MalformedResponse {
         uri: String,
         #[source]
-        source: reqwest::Error,
+        source: serde_json::Error,
     },
     #[error("response from {uri} had no access_token field")]
     MissingAccessToken { uri: String },
@@ -114,6 +120,7 @@ pub async fn present(
     key_pair: &DcpKeyPair,
     credential_jws: &str,
     response_uri: &str,
+    max_response_bytes: usize,
 ) -> Result<String, Oid4VpError> {
     let vp_token = build_vp_token(key_pair, credential_jws, response_uri);
     let presentation_submission = build_presentation_submission(DEFINITION_ID).to_string();
@@ -138,10 +145,14 @@ pub async fn present(
         });
     }
 
-    let body: Value = response
-        .json()
+    let bytes = crate::read_body_limited(response, max_response_bytes)
         .await
-        .map_err(|source| Oid4VpError::MalformedResponse {
+        .map_err(|source| Oid4VpError::ReadBody {
+            uri: response_uri.to_string(),
+            source,
+        })?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|source| Oid4VpError::MalformedResponse {
             uri: response_uri.to_string(),
             source,
         })?;
@@ -313,7 +324,7 @@ mod tests {
 
         let key_pair = key_pair();
         let http = reqwest::Client::new();
-        let token = present(&http, &key_pair, CREDENTIAL_JWS, &response_uri)
+        let token = present(&http, &key_pair, CREDENTIAL_JWS, &response_uri, 4096)
             .await
             .expect("present should succeed");
 
@@ -336,7 +347,7 @@ mod tests {
 
         let key_pair = key_pair();
         let http = reqwest::Client::new();
-        let err = present(&http, &key_pair, CREDENTIAL_JWS, &response_uri)
+        let err = present(&http, &key_pair, CREDENTIAL_JWS, &response_uri, 4096)
             .await
             .expect_err("should fail on 401");
 
@@ -357,7 +368,7 @@ mod tests {
 
         let key_pair = key_pair();
         let http = reqwest::Client::new();
-        let err = present(&http, &key_pair, CREDENTIAL_JWS, &response_uri)
+        let err = present(&http, &key_pair, CREDENTIAL_JWS, &response_uri, 4096)
             .await
             .expect_err("should fail when access_token is missing");
 
@@ -378,12 +389,37 @@ mod tests {
             &key_pair,
             CREDENTIAL_JWS,
             "http://127.0.0.1:0/oid4vp/response",
+            4096,
         )
         .await
         .expect_err("should fail when the response_uri is unreachable");
 
         assert!(
             matches!(err, Oid4VpError::Transport { .. }),
+            "unexpected error variant: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn present_rejects_a_response_larger_than_the_limit() {
+        let (listener, response_uri) = bind_localhost().await;
+        let app = Router::new().route("/oid4vp/response", post(|| async { "x".repeat(10_000) }));
+        spawn(listener, app);
+
+        let key_pair = key_pair();
+        let http = reqwest::Client::new();
+        let err = present(&http, &key_pair, CREDENTIAL_JWS, &response_uri, 1024)
+            .await
+            .expect_err("should fail on an oversized body");
+
+        assert!(
+            matches!(
+                err,
+                Oid4VpError::ReadBody {
+                    source: crate::BodyError::TooLarge { .. },
+                    ..
+                }
+            ),
             "unexpected error variant: {err:?}"
         );
     }

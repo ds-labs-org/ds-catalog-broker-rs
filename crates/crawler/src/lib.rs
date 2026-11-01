@@ -501,15 +501,20 @@ async fn crawl_one(
                     participant.id
                 )
             })?;
-            let access_token =
-                oid4vp::present(http, &holder.key_pair, &holder.credential_jws, response_uri)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "participant '{}' OID4VP presentation to {response_uri} failed: {e}",
-                            participant.id
-                        )
-                    })?;
+            let access_token = oid4vp::present(
+                http,
+                &holder.key_pair,
+                &holder.credential_jws,
+                response_uri,
+                max_response_bytes,
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "participant '{}' OID4VP presentation to {response_uri} failed: {e}",
+                    participant.id
+                )
+            })?;
             request = request.bearer_auth(access_token);
         }
     }
@@ -607,7 +612,7 @@ fn participant_id_mismatch(participant: &ParticipantEntry, declared: &str) -> bo
 /// marker rule is added to the policy), a rule-level `assignee`, `target` or
 /// `duty`, an action node with keys beyond `@id`/`@type`, and a policy node
 /// with no rule key. An unreadable `assigner` is ignored, as it
-/// scopes nothing. One limit remains: `response.json()` stops at
+/// scopes nothing. One limit remains: `serde_json::from_slice` stops at
 /// serde_json's 128-level recursion limit, so a body nested deeper than
 /// that fails the whole catalog fetch (the previous cache entry is kept
 /// until it expires) rather than being marked per entry.
