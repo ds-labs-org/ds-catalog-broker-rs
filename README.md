@@ -85,7 +85,9 @@ Rust crates rather than Java SPI modules, echoing EDC's `crawler-spi` /
   Oxigraph-backed implementation. See ["The RDF backend"](#the-rdf-backend-semantic-cache).
 - `dcp-core` — DCP JWS sign/verify and `did:web` primitives, used by
   `crawler`'s **holder** role to present this participant's own
-  credential to a gated Catalog Service.
+  credential to a gated Catalog Service. `resolve_did` has a timeout, a
+  body cap, and an https-or-loopback rule; the holder answers a
+  presentation query only for a token it issued.
 - `crawler` — participant registry, scheduled crawl loop
   (`spawn_scheduler`/`crawl_once`), a DSP-response parser tolerant of
   real EDC's JSON-LD shape, and per-participant credential presentation:

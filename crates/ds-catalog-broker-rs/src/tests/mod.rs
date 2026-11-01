@@ -35,6 +35,7 @@ use sample::seed_sample_catalog;
 mod bearer_gate;
 mod blocking;
 mod catalog;
+mod holder;
 mod management;
 mod policy;
 mod ready;

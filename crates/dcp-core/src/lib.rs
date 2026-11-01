@@ -17,7 +17,9 @@
 //! anywhere in this workspace). Nothing in this crate assumes which side
 //! of that exchange the caller is playing.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -151,14 +153,51 @@ pub struct DidService {
     pub service_endpoint: String,
 }
 
+/// How long [`resolve_did`] waits for a DID document, connect and body
+/// together.
+pub const DID_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
+/// The largest DID document [`resolve_did`] reads. A real one is a few
+/// hundred bytes.
+pub const MAX_DID_DOCUMENT_BYTES: usize = 64 * 1024;
+
+/// Whether a DID document may be fetched from `url`: over https, or over
+/// plain http to a loopback IP literal. A host name, even `localhost`, is
+/// not trusted as loopback. Same rule as the broker's config fetch.
+fn did_url_allowed(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Resolves a `did:web` DID. The URL must be https, or plain http to a
+/// loopback IP literal even when `insecure_http` is set. The request has a
+/// [`DID_RESOLUTION_TIMEOUT`] and the body is capped at
+/// [`MAX_DID_DOCUMENT_BYTES`].
 pub async fn resolve_did(
     client: &reqwest::Client,
     did: &str,
     insecure_http: bool,
 ) -> Result<DidDocument, String> {
     let url = did_web_to_url(did, insecure_http)?;
-    let response = client
+    if !did_url_allowed(&url) {
+        return Err(format!(
+            "refusing to resolve {did}: {url} is neither https nor plain http to a loopback address"
+        ));
+    }
+    let mut response = client
         .get(&url)
+        .timeout(DID_RESOLUTION_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("failed to resolve DID {did} at {url}: {e}"))?;
@@ -168,9 +207,26 @@ pub async fn resolve_did(
             response.status()
         ));
     }
-    response
-        .json::<DidDocument>()
+    let too_big =
+        || format!("DID document for {did} is larger than {MAX_DID_DOCUMENT_BYTES} bytes");
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_DID_DOCUMENT_BYTES as u64)
+    {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
+        .map_err(|e| format!("failed to read DID document for {did}: {e}"))?
+    {
+        if body.len() + chunk.len() > MAX_DID_DOCUMENT_BYTES {
+            return Err(too_big());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice::<DidDocument>(&body)
         .map_err(|e| format!("DID document for {did} was not valid: {e}"))
 }
 
@@ -377,7 +433,25 @@ pub struct HolderIdentity {
     /// multi-credential holder would need it to select which
     /// credential(s) satisfy a given request.
     pub required_scope: String,
+    /// Presentation-access tokens (T2) this holder minted, by `jti`. A
+    /// callback is answered only for one of these, and only for the
+    /// provider it was minted for. Shared between clones.
+    issued: Arc<Mutex<HashMap<String, IssuedToken>>>,
+    /// Client for resolving a calling party's DID. It follows no redirect
+    /// and has [`DID_RESOLUTION_TIMEOUT`].
+    resolver: reqwest::Client,
 }
+
+/// A T2 this holder minted: who it was minted for, and until when.
+#[derive(Debug, Clone)]
+struct IssuedToken {
+    provider_did: String,
+    exp: u64,
+}
+
+/// The most outstanding T2 bindings a holder keeps. At the cap the one
+/// closest to expiry is dropped.
+const MAX_ISSUED_TOKENS: usize = 10_000;
 
 impl HolderIdentity {
     /// Builds a fresh holder identity: `own_did` is derived as
@@ -400,7 +474,43 @@ impl HolderIdentity {
             insecure_http,
             credential_jws,
             required_scope,
+            issued: Arc::default(),
+            resolver: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(DID_RESOLUTION_TIMEOUT)
+                .build()
+                .expect("a plain reqwest client builds"),
         }
+    }
+
+    fn remember_issued(&self, jti: String, provider_did: &str, exp: u64) {
+        let mut issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_secs();
+        issued.retain(|_, t| t.exp > now);
+        if issued.len() >= MAX_ISSUED_TOKENS
+            && let Some(oldest) = issued
+                .iter()
+                .min_by_key(|(_, t)| t.exp)
+                .map(|(k, _)| k.clone())
+        {
+            issued.remove(&oldest);
+        }
+        issued.insert(
+            jti,
+            IssuedToken {
+                provider_did: provider_did.to_string(),
+                exp,
+            },
+        );
+    }
+
+    /// The provider a still-valid T2 with this `jti` was minted for.
+    fn issued_to(&self, jti: &str) -> Option<String> {
+        let issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        issued
+            .get(jti)
+            .filter(|t| t.exp > now_secs())
+            .map(|t| t.provider_did.clone())
     }
 
     /// This holder's own `did:web` document, served at `GET
@@ -446,6 +556,8 @@ impl HolderIdentity {
         // but it's still a real JWS signed with this holder's own key
         // rather than a bare unsigned blob, matching the shape a real
         // Secure Token Service would issue.
+        let access_jti = uuid::Uuid::new_v4().to_string();
+        self.remember_issued(access_jti.clone(), target_provider_did, now + 300);
         let access_token_payload = json!({
             "iss": self.key_pair.own_did,
             "sub": self.key_pair.own_did,
@@ -453,7 +565,7 @@ impl HolderIdentity {
             "iat": now,
             "nbf": now,
             "exp": now + 300,
-            "jti": uuid::Uuid::new_v4().to_string(),
+            "jti": access_jti,
         });
         let access_token = sign_jws(
             &access_token_payload,
@@ -496,7 +608,6 @@ impl HolderIdentity {
     pub async fn answer_presentation_query(
         &self,
         incoming_bearer_token: &str,
-        http: &reqwest::Client,
     ) -> Result<PresentationResponseMessage, String> {
         let (_, header, payload) = decode_jws_unverified(incoming_bearer_token)?;
         let caller_did = payload
@@ -509,7 +620,32 @@ impl HolderIdentity {
             .and_then(Value::as_str)
             .ok_or("token has no kid")?;
 
-        let caller_doc = resolve_did(http, &caller_did, self.insecure_http).await?;
+        // Bind the call to a token this holder issued, before any network
+        // access: the nested token (T2) is the one `mint_self_issued_token`
+        // sent, and its `jti` must be one this holder minted for this very
+        // caller. Anything else never reaches the DID resolver.
+        let nested = payload
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or("token has no nested presentation-access-token")?;
+        let (_, _, nested_payload) = decode_jws_unverified(nested)?;
+        let nonce = nested_payload
+            .get("jti")
+            .and_then(Value::as_str)
+            .ok_or("nested token has no jti")?
+            .to_string();
+        let issued_to = self
+            .issued_to(&nonce)
+            .ok_or("nested token was not issued by this holder, or has expired")?;
+        if issued_to != caller_did {
+            return Err(format!(
+                "caller '{caller_did}' is not the provider this holder's token was issued to"
+            ));
+        }
+        let own_key = VerifyingKey::from(&self.key_pair.signing_key());
+        verify_jws_signature(nested, &own_key)?;
+
+        let caller_doc = resolve_did(&self.resolver, &caller_did, self.insecure_http).await?;
         let caller_key = find_verifying_key(&caller_doc, kid)?;
         verify_jws_signature(incoming_bearer_token, &caller_key)?;
 
@@ -530,6 +666,8 @@ impl HolderIdentity {
         let vp_payload = json!({
             "iss": self.key_pair.own_did,
             "sub": self.key_pair.own_did,
+            "aud": caller_did,
+            "nonce": nonce,
             "vp": {
                 "@context": [VERIFIABLE_PRESENTATION_CONTEXT],
                 "type": ["VerifiablePresentation"],
@@ -611,5 +749,179 @@ mod tests {
             json!("http://localhost:19100/dsp/holder"),
             "the published endpoint is the base URL - verify_dcp_bearer_token appends /presentations/query itself"
         );
+    }
+
+    // --- #39: holder presentation endpoint ---------------------------
+
+    fn holder() -> HolderIdentity {
+        HolderIdentity::new(
+            "127.0.0.1:1".to_string(),
+            true,
+            "vc.jws.value".to_string(),
+            "scope".to_string(),
+        )
+    }
+
+    /// A callback token as a verifier would build it from a T1: signed by
+    /// `caller`, addressed to `holder`, nesting `nested`.
+    fn callback_token(caller: &DcpKeyPair, holder_did: &str, nested: &str) -> String {
+        let now = now_secs();
+        sign_jws(
+            &json!({
+                "iss": caller.own_did, "sub": caller.own_did, "aud": holder_did,
+                "token": nested, "iat": now, "nbf": now, "exp": now + 300,
+                "jti": "caller-jti",
+            }),
+            &caller.signing_key(),
+            &caller.own_key_id,
+        )
+    }
+
+    fn nested_of(t1: &str) -> String {
+        let (_, _, payload) = decode_jws_unverified(t1).unwrap();
+        payload["token"].as_str().unwrap().to_string()
+    }
+
+    /// The issue's attack: a stranger's own did:web, correctly signed, `aud`
+    /// right, but no token this holder ever issued. It is refused before
+    /// the DID is resolved (port 1 would fail with a connect error, not
+    /// this message).
+    #[tokio::test]
+    async fn a_caller_with_no_token_issued_by_this_holder_is_refused_before_resolution() {
+        let holder = holder();
+        let attacker = DcpKeyPair::generate("did:web:127.0.0.1%3A1:evil".to_string());
+        let forged_t2 = sign_jws(
+            &json!({"jti": "made-up", "exp": now_secs() + 300}),
+            &attacker.signing_key(),
+            &attacker.own_key_id,
+        );
+        let token = callback_token(&attacker, &holder.key_pair.own_did, &forged_t2);
+        let err = holder.answer_presentation_query(&token).await.unwrap_err();
+        assert!(err.contains("not issued by this holder"), "{err}");
+
+        let no_nested = sign_jws(
+            &json!({"iss": attacker.own_did, "aud": holder.key_pair.own_did, "exp": now_secs() + 60}),
+            &attacker.signing_key(),
+            &attacker.own_key_id,
+        );
+        let err = holder
+            .answer_presentation_query(&no_nested)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no nested"), "{err}");
+    }
+
+    /// A T2 minted for one provider cannot be used by another caller.
+    #[tokio::test]
+    async fn a_token_issued_to_one_provider_is_refused_for_another_caller() {
+        let holder = holder();
+        let t1 = holder.mint_self_issued_token("did:web:127.0.0.1%3A1:provider");
+        let thief = DcpKeyPair::generate("did:web:127.0.0.1%3A1:thief".to_string());
+        let token = callback_token(&thief, &holder.key_pair.own_did, &nested_of(&t1));
+        let err = holder.answer_presentation_query(&token).await.unwrap_err();
+        assert!(err.contains("not the provider"), "{err}");
+    }
+
+    /// Serve `did_doc` on `listener`, whatever path is asked.
+    fn serve_did_on(listener: tokio::net::TcpListener, did_doc: Value) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0u8; 2048];
+                let _ = sock.read(&mut request).await;
+                let body = did_doc.to_string();
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+    }
+
+    /// The VP names the caller as `aud` and echoes the T2 `jti` as `nonce`.
+    #[tokio::test]
+    async fn the_presentation_is_bound_to_the_caller_and_the_issued_token() {
+        let holder = holder();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let provider_did = format!("did:web:127.0.0.1%3A{port}");
+        let provider = DcpKeyPair::generate(provider_did.clone());
+        serve_did_on(listener, provider.did_document(&[]));
+
+        let t1 = holder.mint_self_issued_token(&provider_did);
+        let nested = nested_of(&t1);
+        let (_, _, nested_payload) = decode_jws_unverified(&nested).unwrap();
+        let token = callback_token(&provider, &holder.key_pair.own_did, &nested);
+
+        let response = holder
+            .answer_presentation_query(&token)
+            .await
+            .expect("answered");
+        let (_, _, vp) = decode_jws_unverified(&response.presentation[0]).unwrap();
+        assert_eq!(vp["aud"], json!(provider_did));
+        assert_eq!(vp["nonce"], nested_payload["jti"]);
+    }
+
+    #[test]
+    fn did_urls_must_be_https_or_loopback_http() {
+        assert!(did_url_allowed("https://example.org/.well-known/did.json"));
+        assert!(did_url_allowed("http://127.0.0.1:8080/did.json"));
+        assert!(did_url_allowed("http://[::1]:8080/did.json"));
+        assert!(!did_url_allowed("http://10.0.0.5:8500/internal/did.json"));
+        assert!(!did_url_allowed("http://localhost:8080/did.json"));
+        assert!(!did_url_allowed("ftp://127.0.0.1/did.json"));
+    }
+
+    #[tokio::test]
+    async fn resolve_did_refuses_plain_http_to_a_non_loopback_host() {
+        let client = reqwest::Client::new();
+        let err = resolve_did(&client, "did:web:10.0.0.5%3A8500:internal", true)
+            .await
+            .unwrap_err();
+        assert!(err.contains("refusing to resolve"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_did_caps_the_document_size() {
+        let big = json!({"padding": "x".repeat(MAX_DID_DOCUMENT_BYTES)});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let did = format!(
+            "did:web:127.0.0.1%3A{}",
+            listener.local_addr().unwrap().port()
+        );
+        serve_did_on(listener, big);
+        let err = resolve_did(&reqwest::Client::new(), &did, true)
+            .await
+            .unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_did_gives_up_on_a_server_that_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let did = format!(
+            "did:web:127.0.0.1%3A{}",
+            listener.local_addr().unwrap().port()
+        );
+        let _hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let started = std::time::Instant::now();
+        let err = resolve_did(&reqwest::Client::new(), &did, true)
+            .await
+            .unwrap_err();
+        assert!(err.contains("failed to resolve"), "{err}");
+        assert!(started.elapsed() < DID_RESOLUTION_TIMEOUT + Duration::from_secs(3));
     }
 }

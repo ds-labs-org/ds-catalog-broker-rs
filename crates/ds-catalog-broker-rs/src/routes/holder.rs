@@ -48,7 +48,7 @@ pub(super) async fn holder_presentation_query_route(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    match holder.answer_presentation_query(token, &state.http).await {
+    match holder.answer_presentation_query(token).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(err) => {
             tracing::warn!(error = %err, "holder presentation query failed");
