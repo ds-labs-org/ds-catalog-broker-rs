@@ -47,7 +47,7 @@
 //! `config_graph.ttl` from its `.bak.N` backups - both writes - see
 //! [`BrokerSettings::from_location`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use contreforts_config::{ConfigStore, ConfigStoreConfig, ConfigStoreError};
@@ -108,7 +108,7 @@ impl Setting {
                 .ok_or_else(|| "expected a positive integer".to_string()),
             SettingKind::Boolean => parse_boolean(value)
                 .map(drop)
-                .ok_or_else(|| "expected true, false, 1 or 0".to_string()),
+                .ok_or_else(|| BOOLEAN_REASON.to_string()),
             SettingKind::OneOf(allowed) if allowed.contains(&value) => Ok(()),
             SettingKind::OneOf(allowed) => Err(format!("expected one of {}", allowed.join(", "))),
         }
@@ -176,6 +176,20 @@ pub const ALL_SETTINGS: &[Setting] = &[
     POLICY_FILTER_NO_POLICY_VISIBILITY,
     POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED,
 ];
+
+/// The settings that only matter when there is a participant to crawl.
+const CRAWLER_SETTINGS: &[Setting] = &[
+    CRAWL_INTERVAL_SECS,
+    CRAWL_TIMEOUT_MS,
+    CRAWL_CONCURRENCY,
+    CATALOG_MAX_AGE_SECS,
+];
+
+/// The `broker:` classes this broker reads.
+const KNOWN_CLASSES: &[&str] = &["BrokerConfig", "Participant", "Holder"];
+
+/// Why a value is not a boolean.
+const BOOLEAN_REASON: &str = "expected true, false, 1 or 0";
 
 /// How error messages name the `broker:BrokerConfig` resource.
 const CONFIG_RESOURCE: &str = "the broker:BrokerConfig resource";
@@ -324,7 +338,7 @@ impl std::fmt::Display for ConfigLocation {
 /// The settings read from the Turtle file, keyed by [`Setting::property`].
 #[derive(Debug, Clone, Default)]
 pub struct BrokerSettings {
-    values: HashMap<String, String>,
+    values: BTreeMap<String, String>,
     /// The participant registry and holder; `None` when the config lists no participant.
     crawler: Option<ParticipantsConfig>,
     /// Where the values came from. `None` when no config was read.
@@ -455,11 +469,13 @@ impl BrokerSettings {
     /// from `store`'s [`CONFIG_GRAPH`].
     fn from_graph(store: &Store) -> Result<Self, BrokerConfigError> {
         let graph = ConfigGraph::new(store);
+        graph.reject_unknown_classes()?;
         let mut configs = graph.subjects_of_type("BrokerConfig")?;
         if configs.len() > 1 {
             return Err(BrokerConfigError::MultipleConfigResources(configs.len()));
         }
         let Some(config) = configs.pop() else {
+            graph.reject_unattached(&[])?;
             return Ok(Self::default());
         };
 
@@ -470,9 +486,26 @@ impl BrokerSettings {
         let known: Vec<&str> = ALL_SETTINGS.iter().map(|s| s.property).collect();
         let values = single_values(&resource, properties, &known)?
             .into_iter()
-            .map(|(property, term)| (property, term_value(&term)));
+            .map(|(property, term)| match term {
+                Term::BlankNode(node) => Err(BrokerConfigError::InvalidValue {
+                    resource: resource.clone(),
+                    property,
+                    value: node.to_string(),
+                    reason: "expected a literal or an IRI".to_string(),
+                }),
+                term => Ok((property, term_value(&term))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut settings = Self::from_values(values)?;
-        settings.crawler = settings.read_crawler(&graph, &resource, participants, holders)?;
+        settings.crawler =
+            settings.read_crawler(&graph, &resource, participants.clone(), holders.clone())?;
+
+        // Every `broker:` triple must have been read above; one on any other subject would
+        // otherwise be ignored without a word.
+        let mut attached = vec![Term::from(config)];
+        attached.extend(participants);
+        attached.extend(holders);
+        graph.reject_unattached(&attached)?;
         Ok(settings)
     }
 
@@ -494,16 +527,7 @@ impl BrokerSettings {
                 count: holders.len(),
             });
         }
-        if participants.is_empty() {
-            if !holders.is_empty() || self.get(CRAWL_INTERVAL_SECS).is_some() {
-                tracing::warn!(
-                    "broker:holder or broker:crawlIntervalSecs is set but no broker:participant \
-                     is; the crawler stays off"
-                );
-            }
-            return Ok(None);
-        }
-
+        // Read the holder even when there is no participant, so a bad one is still an error.
         let holder = match holders.into_iter().next() {
             Some(term) => Some(read_holder(
                 graph,
@@ -511,6 +535,23 @@ impl BrokerSettings {
             )?),
             None => None,
         };
+        if participants.is_empty() {
+            let inert: Vec<&str> = CRAWLER_SETTINGS
+                .iter()
+                .filter(|setting| self.get(**setting).is_some())
+                .map(|setting| setting.property)
+                .chain(holder.as_ref().map(|_| HOLDER_LINK))
+                .collect();
+            if !inert.is_empty() {
+                tracing::warn!(
+                    properties = ?inert,
+                    "crawler properties are set but no broker:participant is; the crawler \
+                     stays off and they have no effect"
+                );
+            }
+            return Ok(None);
+        }
+
         let mut entries = participants
             .into_iter()
             .map(|term| {
@@ -536,7 +577,8 @@ impl BrokerSettings {
     pub fn from_values(
         values: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, BrokerConfigError> {
-        let values: HashMap<String, String> = values.into_iter().collect();
+        let values: BTreeMap<String, String> = values.into_iter().collect();
+        // A `BTreeMap`, so that with several bad values the same one is reported every time.
         for (property, value) in &values {
             let resource = || CONFIG_RESOURCE.to_string();
             let setting = ALL_SETTINGS
@@ -641,6 +683,58 @@ impl<'a> ConfigGraph<'a> {
             Some(Err(err)) => Err(BrokerConfigError::Query(err.to_string())),
             found => Ok(found.is_some()),
         }
+    }
+
+    /// Fail on an `rdf:type broker:<class>` this broker does not read.
+    fn reject_unknown_classes(&self) -> Result<(), BrokerConfigError> {
+        for quad in
+            self.store
+                .quads_for_pattern(None, Some(rdf::TYPE), None, Some(self.graph_name()))
+        {
+            let quad = quad.map_err(|err| BrokerConfigError::Query(err.to_string()))?;
+            let Term::NamedNode(class) = &quad.object else {
+                continue;
+            };
+            if let Some(local) = class.as_str().strip_prefix(BROKER_NS)
+                && !KNOWN_CLASSES.contains(&local)
+            {
+                return Err(BrokerConfigError::UnknownClass {
+                    resource: describe(self, &quad.subject),
+                    class: local.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail on a subject outside `attached` that has a `broker:` property or class.
+    fn reject_unattached(&self, attached: &[Term]) -> Result<(), BrokerConfigError> {
+        for quad in self
+            .store
+            .quads_for_pattern(None, None, None, Some(self.graph_name()))
+        {
+            let quad = quad.map_err(|err| BrokerConfigError::Query(err.to_string()))?;
+            let term = match (
+                quad.predicate.as_str().strip_prefix(BROKER_NS),
+                &quad.object,
+            ) {
+                (Some(local), _) => local.to_string(),
+                (None, Term::NamedNode(class)) if quad.predicate == rdf::TYPE => {
+                    match class.as_str().strip_prefix(BROKER_NS) {
+                        Some(local) => local.to_string(),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if !attached.contains(&Term::from(quad.subject.clone())) {
+                return Err(BrokerConfigError::Unattached {
+                    resource: describe(self, &quad.subject),
+                    term,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// `subject`'s `broker:` properties, keyed by local name, with every value of each.
@@ -812,6 +906,74 @@ impl Properties {
         }
     }
 
+    /// `property` as a non-blank string.
+    fn non_empty(&self, property: &str) -> Result<String, BrokerConfigError> {
+        let value = self.required(property)?;
+        if value.trim().is_empty() {
+            return Err(self.invalid(property, value, "empty".to_string()));
+        }
+        Ok(value)
+    }
+
+    /// `property` as an absolute `http(s)` URL, if set.
+    fn optional_http_url(&self, property: &str) -> Result<Option<String>, BrokerConfigError> {
+        let Some(value) = self.optional(property)? else {
+            return Ok(None);
+        };
+        match Url::parse(&value) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(Some(value)),
+            _ => Err(self.invalid(
+                property,
+                value,
+                "expected an absolute http or https URL".to_string(),
+            )),
+        }
+    }
+
+    /// `property` as a DID (`did:<method>:<method-specific id>`), if set.
+    fn optional_did(&self, property: &str) -> Result<Option<String>, BrokerConfigError> {
+        let Some(value) = self.optional(property)? else {
+            return Ok(None);
+        };
+        let is_did = value
+            .strip_prefix("did:")
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(method, id)| {
+                !method.is_empty()
+                    && method
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    && !id.is_empty()
+            });
+        if !is_did {
+            return Err(self.invalid(
+                property,
+                value,
+                "expected a DID (did:<method>:<id>)".to_string(),
+            ));
+        }
+        Ok(Some(value))
+    }
+
+    /// Fail when `property` is set but `protocol` is not the one that reads it.
+    fn only_for(
+        &self,
+        property: &str,
+        value: &Option<String>,
+        protocol: &CredentialProtocol,
+        wanted: CredentialProtocol,
+        wanted_name: &str,
+    ) -> Result<(), BrokerConfigError> {
+        match value {
+            Some(value) if *protocol != wanted => Err(self.invalid(
+                property,
+                value.clone(),
+                format!("only read when broker:{CREDENTIAL_PROTOCOL} is \"{wanted_name}\""),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn required(&self, property: &str) -> Result<String, BrokerConfigError> {
         self.optional(property)?
             .ok_or_else(|| BrokerConfigError::MissingProperty {
@@ -884,13 +1046,37 @@ fn read_participant(
             .map_err(|err| props.invalid(CREDENTIAL_PROTOCOL, raw, err.to_string()))?,
         None => CredentialProtocol::None,
     };
+    let id = props.non_empty(PARTICIPANT_ID)?;
+    let name = props.non_empty(PARTICIPANT_NAME)?;
+    let catalog_request_url = props
+        .optional_http_url(CATALOG_REQUEST_URL)?
+        .ok_or_else(|| BrokerConfigError::MissingProperty {
+            resource: props.resource.clone(),
+            property: CATALOG_REQUEST_URL.to_string(),
+        })?;
+    let provider_did = props.optional_did(PROVIDER_DID)?;
+    props.only_for(
+        PROVIDER_DID,
+        &provider_did,
+        &credential_protocol,
+        CredentialProtocol::Dcp,
+        "dcp",
+    )?;
+    let oid4vp_response_uri = props.optional_http_url(OID4VP_RESPONSE_URI)?;
+    props.only_for(
+        OID4VP_RESPONSE_URI,
+        &oid4vp_response_uri,
+        &credential_protocol,
+        CredentialProtocol::Oid4Vp,
+        "oid4vp",
+    )?;
     Ok(ParticipantEntry {
-        id: props.required(PARTICIPANT_ID)?,
-        name: props.required(PARTICIPANT_NAME)?,
-        catalog_request_url: props.required(CATALOG_REQUEST_URL)?,
+        id,
+        name,
+        catalog_request_url,
         credential_protocol,
-        provider_did: props.optional(PROVIDER_DID)?,
-        oid4vp_response_uri: props.optional(OID4VP_RESPONSE_URI)?,
+        provider_did,
+        oid4vp_response_uri,
     })
 }
 
@@ -901,13 +1087,8 @@ fn read_holder(
     let props = Properties::read(graph, node, "Holder", HOLDER_PROPERTIES)?;
     let insecure_http = match props.optional(INSECURE_HTTP)? {
         None => false,
-        Some(raw) => parse_boolean(&raw).ok_or_else(|| {
-            props.invalid(
-                INSECURE_HTTP,
-                raw,
-                "expected true, false, 1 or 0".to_string(),
-            )
-        })?,
+        Some(raw) => parse_boolean(&raw)
+            .ok_or_else(|| props.invalid(INSECURE_HTTP, raw, BOOLEAN_REASON.to_string()))?,
     };
     let credential_jws_file = props.credential_file()?;
     Ok(HolderConfig {
@@ -1312,16 +1493,6 @@ mod tests {
         let store = ConfigStore::open(dir.path()).unwrap();
         let settings = BrokerSettings::from_store(&store).unwrap();
         assert!(ALL_SETTINGS.iter().all(|s| settings.get(*s).is_none()));
-    }
-
-    #[test]
-    fn triples_on_other_subjects_are_ignored() {
-        let (_dir, store) = store_with(&format!(
-            "@prefix broker: <{BROKER_NS}> .\n\
-             <urn:not-a-config> broker:httpApiAddr \"0.0.0.0:9000\" .\n"
-        ));
-        let settings = BrokerSettings::from_store(&store).unwrap();
-        assert_eq!(settings.get(HTTP_API_ADDR), None);
     }
 
     #[test]
