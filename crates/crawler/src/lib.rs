@@ -1239,6 +1239,24 @@ mod tests {
         })
     }
 
+    /// The declared `participantId` is only compared with a configured
+    /// `providerDid`. Without one, an EDC participant declares its own id,
+    /// which never equals the local `broker:participantId`.
+    #[test]
+    fn participant_id_mismatch_needs_a_configured_provider_did() {
+        let mut configured = participant("p1");
+        configured.provider_did = Some("did:web:p1.example".to_string());
+        assert!(participant_id_mismatch(&configured, "did:web:other"));
+        assert!(!participant_id_mismatch(&configured, "did:web:p1.example"));
+
+        let unconfigured = participant("p1");
+        assert!(!participant_id_mismatch(
+            &unconfigured,
+            "did:web:p1.example"
+        ));
+        assert!(!participant_id_mismatch(&unconfigured, "p1"));
+    }
+
     #[test]
     fn catalog_identity_is_the_configured_provider_did_not_the_declared_participant_id() {
         let mut entry = participant("node-a");
