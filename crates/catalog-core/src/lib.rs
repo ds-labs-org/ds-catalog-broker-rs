@@ -402,6 +402,18 @@ mod tests {
     }
 
     #[test]
+    fn marker_truncation_keeps_multi_byte_characters_whole() {
+        // Three-byte characters straddling the 256-character boundary.
+        let raw = format!("{}{}", "a".repeat(255), "\u{20ac}".repeat(10));
+        let Constraint::Atomic(a) = Constraint::unmappable(&raw) else {
+            panic!("atomic")
+        };
+        assert_eq!(a.right_operand.chars().count(), 256);
+        assert!(a.right_operand.ends_with('\u{20ac}'));
+        assert!(raw.starts_with(&a.right_operand));
+    }
+
+    #[test]
     fn policy_kind_defaults_to_set() {
         assert_eq!(PolicyKind::default(), PolicyKind::Set);
     }

@@ -1012,7 +1012,7 @@ mod tests {
     fn crawler_marker_constraint_follows_the_unmappable_action() {
         for prohibition in [false, true] {
             let dataset = dataset_with_marker(prohibition);
-            let claims = Claims::new();
+            let claims = claims_satisfying_purpose();
             let hide = PolicyFilterConfig::default();
             assert!(!dataset_is_visible(&dataset, &claims, "use", &hide));
             let drop = PolicyFilterConfig {
@@ -1021,6 +1021,64 @@ mod tests {
             };
             assert!(!dataset_is_visible(&dataset, &claims, "use", &drop));
         }
+    }
+
+    fn claims_satisfying_purpose() -> Claims {
+        let mut claims = Claims::new();
+        claims.insert("purpose".to_string(), ClaimValue::from("research"));
+        claims
+    }
+
+    #[test]
+    fn marker_is_not_satisfied_by_claims_that_satisfy_a_mappable_constraint() {
+        let claims = claims_satisfying_purpose();
+        let config = PolicyFilterConfig::default();
+        let mappable = dataset_with_policies(vec![policy(
+            vec![CoreRule {
+                action: "use".to_string(),
+                constraints: vec![CoreConstraint::atomic("purpose", "eq", "research")],
+            }],
+            Vec::new(),
+        )]);
+        assert!(
+            dataset_is_visible(&mappable, &claims, "use", &config),
+            "control: these claims satisfy a mappable purpose constraint"
+        );
+        let marked = dataset_with_marker(false);
+        assert!(
+            !dataset_is_visible(&marked, &claims, "use", &config),
+            "the same claims must not satisfy a marker"
+        );
+    }
+
+    #[test]
+    fn marker_is_dropped_under_skip() {
+        let skip = PolicyFilterConfig {
+            unmappable_constraint_action: UnmappableConstraintAction::SkipConstraint,
+            ..PolicyFilterConfig::default()
+        };
+        let claims = Claims::new();
+        assert!(
+            dataset_is_visible(&dataset_with_marker(false), &claims, "use", &skip),
+            "a permission whose only constraint is a marker is unconstrained under skip"
+        );
+        let unconditional_prohibition = {
+            let mut p = policy(Vec::new(), Vec::new());
+            p.permissions = vec![CoreRule {
+                action: "use".to_string(),
+                constraints: Vec::new(),
+            }];
+            p.prohibitions = vec![CoreRule {
+                action: "use".to_string(),
+                constraints: Vec::new(),
+            }];
+            dataset_with_policies(vec![p])
+        };
+        assert_eq!(
+            dataset_is_visible(&dataset_with_marker(true), &claims, "use", &skip),
+            dataset_is_visible(&unconditional_prohibition, &claims, "use", &skip),
+            "a skipped marker leaves the prohibition as if it had no constraint"
+        );
     }
 
     // --- leftOperand normalization (normalize_left_operand) --------------
