@@ -299,10 +299,29 @@ pub fn jwt_claims_to_engine_claims(claims: &serde_json::Value) -> Claims {
     mapped
 }
 
+/// Claims that identify one token, not one caller. They are left out of
+/// [`allow_list_key`] so a client that rotates tokens keeps its cache entry.
+/// `iat`, `exp` and `nbf` are numbers and [`jwt_claims_to_engine_claims`]
+/// drops them anyway; `jti` is a string and is removed here.
+const PER_TOKEN_CLAIMS: [&str; 4] = ["jti", "iat", "exp", "nbf"];
+
 /// The cache key for the policy allow-list of a caller with these token
 /// claims (`/sparql`).
+///
+/// The key is the claim set the engine is given
+/// ([`jwt_claims_to_engine_claims`]) without [`PER_TOKEN_CLAIMS`], with
+/// claims in name order. The engine looks claims up by name and sees
+/// nothing the mapping drops, so two tokens with the same key get the same
+/// decision for every policy, apart from the clock-dependent `dateTime`
+/// context claim, which the cache TTL bounds. Every other claim stays in
+/// the key, including ones no harvested policy currently names.
 pub fn allow_list_key(claims: Option<&serde_json::Value>) -> String {
-    claims.map(ToString::to_string).unwrap_or_default()
+    let mapped = jwt_claims_to_engine_claims(claims.unwrap_or(&serde_json::Value::Null));
+    let canonical: std::collections::BTreeMap<_, _> = mapped
+        .iter()
+        .filter(|(name, _)| !PER_TOKEN_CLAIMS.contains(&name.as_str()))
+        .collect();
+    serde_json::to_string(&canonical).expect("string-keyed claim values serialize")
 }
 
 /// Layers host-synthesized context claims on top of JWT-derived ones -
@@ -1334,10 +1353,18 @@ mod tests {
 
     #[test]
     fn claim_order_in_the_token_does_not_change_the_key() {
-        let one: serde_json::Value =
-            serde_json::from_str(r#"{"sub":"a","tier":"gold","scope":"x"}"#).unwrap();
-        let two: serde_json::Value =
-            serde_json::from_str(r#"{"scope":"x","tier":"gold","sub":"a"}"#).unwrap();
+        // Engine claims live in a HashMap with per-map random order, so
+        // many claims make an unsorted key differ between two builds.
+        let names: Vec<String> = (0..12).map(|i| format!("claim{i}")).collect();
+        let build = |names: &mut dyn Iterator<Item = &String>| {
+            let mut object = serde_json::Map::new();
+            for name in names {
+                object.insert(name.clone(), serde_json::json!("v"));
+            }
+            serde_json::Value::Object(object)
+        };
+        let one = build(&mut names.iter());
+        let two = build(&mut names.iter().rev());
         assert_eq!(allow_list_key(Some(&one)), allow_list_key(Some(&two)));
     }
 }

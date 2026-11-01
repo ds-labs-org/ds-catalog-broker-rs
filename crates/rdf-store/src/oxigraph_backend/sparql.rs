@@ -63,8 +63,13 @@ impl OxigraphCatalogCache {
                 entry.write_sequence == write_sequence
                     && entry.built_at.elapsed() < ALLOW_LIST_CACHE_TTL
             });
-            if cache.len() >= ALLOW_LIST_CACHE_ENTRIES {
-                cache.clear();
+            if cache.len() >= ALLOW_LIST_CACHE_ENTRIES
+                && let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.built_at)
+                    .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest);
             }
         }
         cache.insert(
@@ -159,8 +164,13 @@ impl OxigraphCatalogCache {
             .unwrap_or_else(|e| e.into_inner());
         if partials.len() >= ALLOW_LIST_CACHE_ENTRIES && !partials.contains_key(key) {
             partials.retain(|_, p| p.started_at.elapsed() < PARTIAL_ALLOW_LIST_TTL);
-            if partials.len() >= ALLOW_LIST_CACHE_ENTRIES {
-                partials.clear();
+            if partials.len() >= ALLOW_LIST_CACHE_ENTRIES
+                && let Some(oldest) = partials
+                    .iter()
+                    .min_by_key(|(_, p)| p.started_at)
+                    .map(|(key, _)| key.clone())
+            {
+                partials.remove(&oldest);
             }
         }
         partials.insert(key.to_string(), progress);
@@ -316,7 +326,7 @@ impl OxigraphCatalogCache {
     /// write sequence is unchanged and it is younger than
     /// [`ALLOW_LIST_CACHE_TTL`], so repeated queries by one caller skip
     /// the decode. The TTL bounds how stale a clock-dependent policy
-    /// decision can get. At most 64 keys are kept.
+    /// decision can get. At most 64 keys are kept; a new key evicts the oldest entry.
     ///
     /// Filtered evaluation reads the store once per lookup (see
     /// [`VisibleDataset`]), so a write landing between the allow-list and
