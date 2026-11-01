@@ -130,9 +130,11 @@ through the management API with the real client type
 (`catalog_request_route_serves_crawled_dataset_descriptors_from_a_real_oxigraph_store`).
 
 Each re-crawl replaces a participant's named graph in one Oxigraph
-transaction, and `/catalog` and the management API decode each catalog
-from one snapshot of its graph, so a request served during a crawl sees
-the previous catalog or the new one, never a half-written one.
+transaction, and `/catalog` and the management API read every catalog
+from one store snapshot, so a request served during a crawl sees each
+participant's previous catalog or its new one, never a half-written one.
+`/sparql` evaluation still reads the live store pattern by pattern, so one
+query can see two versions of a participant mid-crawl.
 
 ![Internal architecture of the semantic cache: crawler parses a crawled catalog into a domain value plus a generic properties bag, upserts both through the CatalogCache trait, OxigraphCatalogCache stores one named graph per origin node as real DCAT triples plus one triple per property, and the two serving surfaces (catalog cache API, management API) read the triples and the decoded properties back out via SPARQL](docs/diagrams/semantic-cache-architecture.svg)
 
