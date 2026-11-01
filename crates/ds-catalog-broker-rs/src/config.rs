@@ -178,6 +178,12 @@ pub enum BrokerConfigError {
         property: String,
         expected: String,
     },
+    #[error("{resource} is a broker:{class}, but no broker:{property} links to it")]
+    UnlinkedResource {
+        resource: String,
+        class: String,
+        property: String,
+    },
     #[error("invalid crawler configuration: {0}")]
     Crawler(#[from] crawler::ConfigError),
     #[error("{CONFIG_STORE_PATH_ENV}={0:?} is not a valid URL: {1}")]
@@ -1001,6 +1007,110 @@ mod tests {
             holder.credential_jws_file,
             PathBuf::from("/etc/broker/holder.jws")
         );
+    }
+
+    fn holder_with_file(file: &str) -> String {
+        format!(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> ; broker:holder <urn:h> .\n\
+             <urn:h> a broker:Holder ; broker:ownDidHost \"h\" ; broker:requiredScope \"s\" ;\n\
+               broker:credentialJwsFile {file} .\n{OPEN_PARTICIPANT}"
+        )
+    }
+
+    #[test]
+    fn an_unlinked_participant_is_an_error() {
+        let err = crawler_from(&format!(
+            "<urn:c> a broker:BrokerConfig ; broker:httpApiAddr \"x\" .\n{OPEN_PARTICIPANT}"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnlinkedResource { class, .. } if class == "Participant"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unlinked_holder_is_an_error() {
+        let err = crawler_from(&format!(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:h> a broker:Holder ; broker:ownDidHost \"h\" .\n{OPEN_PARTICIPANT}"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::UnlinkedResource { class, .. } if class == "Holder"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn errors_on_a_blank_node_participant_name_its_id() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:participant [ a broker:Participant ;\n\
+               broker:participantId \"second\" ; broker:participantName \"P\" ] .\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("\"second\""), "{err}");
+    }
+
+    #[test]
+    fn a_credential_file_that_is_not_a_path_is_an_error() {
+        for file in ["<urn:secret>", "[]", "\"\""] {
+            let ttl = holder_with_file(file);
+            let err = crawler_from(&ttl).unwrap_err();
+            assert!(
+                matches!(&err, BrokerConfigError::InvalidValue { property, .. } if property == CREDENTIAL_JWS_FILE),
+                "{file}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_credential_file_url_literal_is_read_whatever_its_case() {
+        let crawler = crawler_from(&holder_with_file("\"FILE:///etc/h.jws\""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crawler.holder.unwrap().credential_jws_file,
+            PathBuf::from("/etc/h.jws")
+        );
+    }
+
+    #[test]
+    fn a_non_literal_string_property_is_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; broker:participantId [] ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" .\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::InvalidValue { property, .. } if property == PARTICIPANT_ID),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn endpoint_urls_may_be_iris() {
+        let crawler = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; broker:participantId \"p\" ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl <http://h/c> .\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(crawler.participants[0].catalog_request_url, "http://h/c");
+    }
+
+    #[test]
+    fn unknown_properties_are_ignored_even_with_several_values() {
+        let crawler = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:tag \"a\", \"b\" ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; broker:participantId \"p\" ; broker:tag \"a\", \"b\" ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" .\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(crawler.participants[0].id, "p");
     }
 
     #[test]
