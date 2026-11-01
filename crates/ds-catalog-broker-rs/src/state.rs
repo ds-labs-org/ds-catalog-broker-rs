@@ -49,6 +49,10 @@ pub struct AppState {
     /// Time and size bounds on every `/sparql` evaluation - see
     /// [`SparqlLimitsConfig`]. Defaults to `SparqlLimitsConfig::default()`.
     pub sparql_limits: SparqlLimitsConfig,
+    /// What the crawler reports, for `GET /ready`. `None` when no crawler
+    /// runs (no `broker:participant`), in which case the broker is ready
+    /// as soon as it serves.
+    pub crawl_status: Option<crawler::SharedCrawlStatus>,
 }
 
 /// Bounds on one `GET`/`POST /sparql` evaluation, so a caller-supplied
@@ -124,6 +128,7 @@ impl AppState {
             oauth2: None,
             policy_filter: odrl_filter::PolicyFilterConfig::default(),
             sparql_limits: SparqlLimitsConfig::default(),
+            crawl_status: None,
         }
     }
 
@@ -152,6 +157,13 @@ impl AppState {
     /// `sparql_limits` field's doc comment.
     pub fn with_sparql_limits(mut self, sparql_limits: SparqlLimitsConfig) -> Self {
         self.sparql_limits = sparql_limits;
+        self
+    }
+
+    /// Builder-style setter for the crawler's status. See the
+    /// `crawl_status` field's doc comment.
+    pub fn with_crawl_status(mut self, crawl_status: Option<crawler::SharedCrawlStatus>) -> Self {
+        self.crawl_status = crawl_status;
         self
     }
 }

@@ -69,8 +69,12 @@ async fn main() {
     // `GET /catalog`, the management API and `/sparql`; the crawler fills it
     // when the config lists participants. An unreadable holder credential
     // stops the broker on boot, like any other bad crawler config.
-    let serving::Serving { cache, holder, .. } = serving::start(&settings, &http_client)
-        .unwrap_or_else(|err| panic!("failed to start serving: {err}"));
+    let serving::Serving { cache, holder, .. } = serving::start(
+        &settings,
+        &http_client,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .unwrap_or_else(|err| panic!("failed to start serving: {err}"));
 
     let mut state = AppState::new(cache)
         .with_holder(holder)

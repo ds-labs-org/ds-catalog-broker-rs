@@ -18,6 +18,7 @@ pub mod config;
 // module's own tests are compiled and exercised, but nothing in this file
 // wires it into `crawl_one` yet - that lands in the GREEN commit.
 pub mod oid4vp;
+pub mod status;
 
 pub use config::{
     ConfigError, CredentialProtocol, HolderConfig, ParticipantEntry, ParticipantsConfig,
@@ -37,6 +38,9 @@ use futures_util::{FutureExt, StreamExt, stream};
 use rdf_store::CatalogCache;
 use serde_json::Value;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+pub use status::{CrawlStatus, ParticipantStatus, SharedCrawlStatus};
 
 /// `@context` for the `CatalogRequestMessage` this crawler POSTs to each
 /// participant - matches what `ds-catalog-broker-rs`'s own `catalog_request` handler
@@ -183,6 +187,7 @@ pub struct Harvester {
     holder: Option<Arc<HolderIdentity>>,
     limits: CrawlLimits,
     last_success: HashMap<String, Instant>,
+    status: SharedCrawlStatus,
 }
 
 /// The outcome of one [`Harvester::run_cycle`].
@@ -210,7 +215,13 @@ impl Harvester {
             holder,
             limits,
             last_success: HashMap::new(),
+            status: SharedCrawlStatus::default(),
         }
+    }
+
+    /// The status this harvester updates at the end of every cycle.
+    pub fn status(&self) -> SharedCrawlStatus {
+        self.status.clone()
     }
 
     /// Crawl every participant once, then remove the catalog of each
@@ -798,11 +809,14 @@ pub fn spawn_scheduler(
     http: reqwest::Client,
     holder: Option<Arc<HolderIdentity>>,
     limits: CrawlLimits,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    shutdown: CancellationToken,
+) -> Scheduler {
+    let _ = shutdown;
+    let mut harvester = Harvester::new(cache, config.participants, http, holder, limits);
+    let status = harvester.status();
+    let handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(config.interval_secs.max(1)));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut harvester = Harvester::new(cache, config.participants, http, holder, limits);
         loop {
             interval.tick().await;
             let CycleReport { summary, expired } = harvester.run_cycle().await;
@@ -828,7 +842,16 @@ pub fn spawn_scheduler(
                 );
             }
         }
-    })
+    });
+    Scheduler { handle, status }
+}
+
+/// A running crawl scheduler, from [`spawn_scheduler`].
+pub struct Scheduler {
+    /// Ends once the shutdown token is cancelled.
+    pub handle: tokio::task::JoinHandle<()>,
+    /// What the scheduler's harvester reports.
+    pub status: SharedCrawlStatus,
 }
 
 #[cfg(test)]
@@ -1809,6 +1832,106 @@ mod tests {
         assert!(
             report.expired.is_empty(),
             "an expired catalog is removed once"
+        );
+    }
+
+    #[tokio::test]
+    async fn harvester_reports_each_participants_crawl_status() {
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut ok = participant("ok");
+        ok.catalog_request_url = spawn_switchable_catalog_server(up.clone()).await;
+        let mut down = participant("down");
+        down.catalog_request_url = "http://127.0.0.1:1/dsp/catalog/request".to_string();
+        let cache: Arc<dyn CatalogCache> = Arc::new(OxigraphCatalogCache::in_memory().unwrap());
+        let mut harvester = Harvester::new(
+            cache,
+            vec![ok, down],
+            reqwest::Client::new(),
+            None,
+            CrawlLimits::default(),
+        );
+        let status = harvester.status();
+        assert_eq!(status.read().unwrap().cycles_completed, 0);
+
+        harvester.run_cycle().await;
+        let first = status.read().unwrap().clone();
+        assert_eq!(first.cycles_completed, 1);
+        let ok_status = &first.participants["ok"];
+        assert!(ok_status.last_attempt.is_some());
+        assert!(ok_status.last_success.is_some());
+        assert_eq!(ok_status.last_error, None);
+        assert!(ok_status.cached);
+        let down_status = &first.participants["down"];
+        assert!(down_status.last_attempt.is_some());
+        assert_eq!(down_status.last_success, None);
+        assert!(down_status.last_error.is_some());
+        assert!(!down_status.cached);
+
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        harvester.run_cycle().await;
+        let second = status.read().unwrap().clone();
+        assert_eq!(second.cycles_completed, 2);
+        let ok_status = &second.participants["ok"];
+        assert_eq!(
+            ok_status.last_success,
+            first.participants["ok"].last_success
+        );
+        assert!(ok_status.last_error.is_some(), "a failure is recorded");
+        assert!(ok_status.cached, "the previous catalog is still served");
+    }
+
+    #[tokio::test]
+    async fn harvester_status_marks_an_expired_catalog_as_not_cached() {
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut entry = participant("flaky");
+        entry.catalog_request_url = spawn_switchable_catalog_server(up.clone()).await;
+        let cache: Arc<dyn CatalogCache> = Arc::new(OxigraphCatalogCache::in_memory().unwrap());
+        let mut harvester = Harvester::new(
+            cache,
+            vec![entry],
+            reqwest::Client::new(),
+            None,
+            CrawlLimits {
+                max_catalog_age: Duration::from_millis(100),
+                ..CrawlLimits::default()
+            },
+        );
+        harvester.run_cycle().await;
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let report = harvester.run_cycle().await;
+        assert_eq!(report.expired, vec!["flaky"]);
+        assert!(!harvester.status().read().unwrap().participants["flaky"].cached);
+    }
+
+    #[tokio::test]
+    async fn the_scheduler_stops_mid_cycle_when_shutdown_is_cancelled() {
+        let (slow_url, _) = spawn_slow_catalog_server(Duration::from_secs(30)).await;
+        let mut slow = participant("slow");
+        slow.catalog_request_url = slow_url;
+        let shutdown = CancellationToken::new();
+        let scheduler = spawn_scheduler(
+            Arc::new(OxigraphCatalogCache::in_memory().unwrap()),
+            ParticipantsConfig::new(300, vec![slow], None).unwrap(),
+            reqwest::Client::new(),
+            None,
+            CrawlLimits {
+                participant_timeout: Duration::from_secs(60),
+                ..CrawlLimits::default()
+            },
+            shutdown.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown.cancel();
+        let stopped = tokio::time::timeout(Duration::from_secs(2), scheduler.handle).await;
+        assert!(
+            matches!(stopped, Ok(Ok(()))),
+            "the scheduler did not stop: {stopped:?}"
+        );
+        assert_eq!(
+            scheduler.status.read().unwrap().cycles_completed,
+            0,
+            "the interrupted cycle is not counted"
         );
     }
 }

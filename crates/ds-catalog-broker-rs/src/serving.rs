@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use dcp_core::HolderIdentity;
 use rdf_store::oxigraph_backend::OxigraphCatalogCache;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::BrokerSettings;
 use crate::crawl_limits_from_settings;
@@ -18,7 +19,10 @@ pub struct Serving {
     /// and at least one participant.
     pub holder: Option<Arc<HolderIdentity>>,
     /// The crawl scheduler, when the config lists at least one participant.
+    /// It ends once the shutdown token passed to [`start`] is cancelled.
     pub crawler: Option<tokio::task::JoinHandle<()>>,
+    /// What the crawler reports, for `/ready`; `None` with no crawler.
+    pub crawl_status: Option<crawler::SharedCrawlStatus>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -30,8 +34,13 @@ pub enum ServingError {
 }
 
 /// Open the store and, when `settings` lists participants, start the crawl
-/// scheduler on it. Must be called inside a Tokio runtime.
-pub fn start(settings: &BrokerSettings, http: &reqwest::Client) -> Result<Serving, ServingError> {
+/// scheduler on it; cancelling `shutdown` stops the scheduler. Must be
+/// called inside a Tokio runtime.
+pub fn start(
+    settings: &BrokerSettings,
+    http: &reqwest::Client,
+    shutdown: CancellationToken,
+) -> Result<Serving, ServingError> {
     let cache = Arc::new(OxigraphCatalogCache::in_memory()?);
     let Some(config) = settings.crawler().cloned() else {
         tracing::info!("no broker:participant configured; the catalog stays empty");
@@ -39,6 +48,7 @@ pub fn start(settings: &BrokerSettings, http: &reqwest::Client) -> Result<Servin
             cache,
             holder: None,
             crawler: None,
+            crawl_status: None,
         });
     };
 
@@ -53,12 +63,19 @@ pub fn start(settings: &BrokerSettings, http: &reqwest::Client) -> Result<Servin
         max_catalog_age_secs = limits.max_catalog_age.as_secs(),
         "starting scheduled catalog crawler"
     );
-    let crawler =
-        crawler::spawn_scheduler(cache.clone(), config, http.clone(), holder.clone(), limits);
+    let scheduler = crawler::spawn_scheduler(
+        cache.clone(),
+        config,
+        http.clone(),
+        holder.clone(),
+        limits,
+        shutdown,
+    );
     Ok(Serving {
         cache,
         holder,
-        crawler: Some(crawler),
+        crawler: Some(scheduler.handle),
+        crawl_status: None,
     })
 }
 

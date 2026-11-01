@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::serving;
+use tokio_util::sync::CancellationToken;
 
 fn settings(ttl: &str) -> config::BrokerSettings {
     let prefix = "@prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .\n";
@@ -14,9 +15,11 @@ async fn no_participant_serves_an_empty_store_with_sparql() {
     let serving = serving::start(
         &settings("<urn:c> a broker:BrokerConfig .\n"),
         &reqwest::Client::new(),
+        CancellationToken::new(),
     )
     .unwrap();
     assert!(serving.crawler.is_none());
+    assert!(serving.crawl_status.is_none());
     assert!(serving.holder.is_none());
     assert!(
         serving
@@ -51,10 +54,31 @@ async fn a_participant_starts_the_crawler() {
                broker:participantName \"P\" ; broker:catalogRequestUrl \"http://127.0.0.1:1/c\" .\n",
         ),
         &reqwest::Client::new(),
+        CancellationToken::new(),
     )
     .unwrap();
+    assert!(serving.crawl_status.is_some());
     let crawler = serving.crawler.expect("a participant starts the crawler");
     crawler.abort();
+}
+
+/// Cancelling the shutdown token stops the crawler `start` started.
+#[tokio::test]
+async fn cancelling_shutdown_stops_the_crawler() {
+    let shutdown = CancellationToken::new();
+    let serving = serving::start(
+        &settings(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; broker:participantId \"p\" ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl \"http://127.0.0.1:1/c\" .\n",
+        ),
+        &reqwest::Client::new(),
+        shutdown.clone(),
+    )
+    .unwrap();
+    shutdown.cancel();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), serving.crawler.unwrap()).await;
+    assert!(matches!(stopped, Ok(Ok(()))), "{stopped:?}");
 }
 
 /// An unreadable holder credential is an error, not a panic.
@@ -69,6 +93,7 @@ async fn an_unreadable_holder_credential_is_an_error() {
                broker:credentialJwsFile \"/nonexistent/holder.jws\" .\n",
         ),
         &reqwest::Client::new(),
+        CancellationToken::new(),
     );
     assert!(
         matches!(result, Err(serving::ServingError::Holder(_))),
