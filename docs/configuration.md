@@ -135,7 +135,7 @@ may be a `file:` IRI.
 | `broker:participantName` | yes | Display name. |
 | `broker:catalogRequestUrl` | yes | The participant's DSP catalog request endpoint. |
 | `broker:credentialProtocol` | no | `none` (default), `dcp` or `oid4vp`: what the crawler presents to this participant. |
-| `broker:providerDid` | for `dcp` | The participant's DID, the audience of the self-issued token. It is also the `participantId`/`originator` the management API serves for this participant's catalog. Without it the offer carries `broker:participantId`. The `participantId` in the crawled response is ignored. |
+| `broker:providerDid` | for `dcp` | The participant's DID, the audience of the self-issued token. It is also the `participantId`/`originator` the management API serves for this participant's catalog. Without it the offer carries the local `broker:participantId`, so real EDC consumers see that local id for such a participant, not the connector's own DID. The `participantId` in the crawled response is ignored; a mismatch with a configured `providerDid` is logged as a warning, and nothing is logged above debug level when no `providerDid` is set. Catalogs already cached keep their previous identity until the participant's next successful crawl. |
 | `broker:oid4vpResponseUri` | for `oid4vp` | The OID4VP `direct_post` endpoint the presentation is sent to. |
 
 | `broker:Holder` property | Required | Meaning |
@@ -253,3 +253,17 @@ visibility.
 One case is not handled per entry: a catalog response nested deeper than
 serde_json's 128-level recursion limit fails the whole fetch. The previous
 cache entry for that participant stays until it expires.
+
+## Served constraint depth
+
+The management API (`POST /api/management/v4/catalogs/request`) serves
+logical constraint groups (`and`, `or`, `xone`; `andSequence` as `and`) as
+nested JSON. The crawler stores groups nested up to 64 levels, but serde_json
+refuses documents nested past 128 levels and each group costs two JSON
+levels, so a 64-level group would make the whole response unparseable for
+every consumer. The management API therefore serves at most 56 nested groups.
+A group nested deeper is served as the unmappable marker constraint
+(operator `urn:ds42:broker:unmappable`), so the rule stays constrained and
+the consumer's own handling of unknown operators applies. The cap applies to
+the served form only. Stored policies and the broker's own policy filtering
+use the full tree.
