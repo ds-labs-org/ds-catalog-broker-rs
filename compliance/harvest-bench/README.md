@@ -33,7 +33,7 @@ brief.
 - `run-harvest-bench.sh` - the end-to-end driver. Starts the two new
   HARVEST-D/E participants (via `../crawler-edc-fixture/run-instance.sh`,
   unmodified), then runs each system under test in turn (EDC's crawler,
-  then this project's `ds-catalog-broker-rs` with `CRAWLER_CONFIG_PATH` set),
+  then this project's `ds-catalog-broker-rs` with participants configured),
   sampling RSS/CPU and running k6 while each system's harvest loop keeps
   running, checking correctness before and after each load-test window,
   and tearing everything down (trap-based cleanup) even on failure.

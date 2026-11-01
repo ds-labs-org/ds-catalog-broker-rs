@@ -42,8 +42,9 @@ path. `RUST_LOG` still controls log filtering.
 All settings are properties of a single `broker:BrokerConfig` resource, in
 the `https://catalog-broker.ds-labs.org/ontologies/config#` namespace. The
 subject IRI is up to you. Two `broker:BrokerConfig` resources, or two values
-for one property, stop the broker at startup. An unknown `broker:` property
-is logged as a warning and ignored.
+for one setting (anything but `broker:participant`, which repeats), stop the
+broker at startup. An unknown `broker:` property is logged as a warning and
+ignored, however many values it has.
 
 The crawler's participants and its holder identity are separate resources,
 linked from `broker:BrokerConfig`; see [Participants and holder](#participants-and-holder).
@@ -59,7 +60,7 @@ Every setting is optional.
 | Property | Default | Meaning | Replaces env var |
 |---|---|---|---|
 | `broker:httpApiAddr` | `127.0.0.1:8080` | Address the HTTP API listens on. | `HTTP_API_ADDR` |
-| `broker:participant` | none | A `broker:Participant` to crawl; repeat for each. With none, the broker serves one sample catalog from an in-memory cache, with no crawler and `/sparql` answering 501. | `CRAWLER_CONFIG_PATH` |
+| `broker:participant` | none | A `broker:Participant` to crawl; repeat for each. With none, the broker serves one sample catalog from an in-memory cache, with no crawler and `/sparql` answering 501. | `CRAWLER_CONFIG_PATH` (with its TOML file) |
 | `broker:holder` | unset | The crawler's `broker:Holder` identity. Required when a participant uses the `dcp` or `oid4vp` credential protocol. | |
 | `broker:crawlIntervalSecs` | `300` | Seconds between the starts of two crawl cycles. Positive integer. | |
 | `broker:crawlTimeoutMs` | `30000` | How long one participant's crawl may take, credential presentation and response body included, before it counts as failed. Positive integer. | |
@@ -97,7 +98,21 @@ resource typed `broker:Holder`. Either can be an IRI or a blank node:
         broker:providerDid "did:web:gated.example.org:dsp"
     ] ;
     broker:holder <urn:holder> .
+
+<urn:participant:a> a broker:Participant ;
+    broker:participantId "a" ;
+    broker:participantName "Participant A" ;
+    broker:catalogRequestUrl <https://a.example.org/dsp/catalog/request> .
+
+<urn:holder> a broker:Holder ;
+    broker:ownDidHost "broker.example.org" ;
+    broker:credentialJwsFile "/run/secrets/holder.jws" ;
+    broker:requiredScope "org.eclipse.dspace.dcp.vc.type:FederatedCatalogAccessCredential:read" .
 ```
+
+Every value is a string literal, except that `broker:catalogRequestUrl` and
+`broker:oid4vpResponseUri` may also be IRIs and `broker:credentialJwsFile`
+may be a `file:` IRI.
 
 | `broker:Participant` property | Required | Meaning |
 |---|---|---|
@@ -117,18 +132,23 @@ resource typed `broker:Holder`. Either can be an IRI or a blank node:
 
 The credential is a bearer secret, so it is read from a file rather than
 written in the config, which may be fetched over HTTP. The value is a path
-string (relative paths resolve against the broker's working directory) or a
-`file:` IRI; a relative IRI such as `<holder.jws>` resolves against the
-config file's own location. An `http(s)` IRI is rejected. The file is read
+string (relative paths resolve against the broker's working directory), a
+`file:` URL string, or a `file:` IRI. A relative IRI such as `<holder.jws>`
+resolves against the config's own location, so it works for a local config
+but not for one fetched over HTTP, where it becomes an `https` IRI. Any IRI
+that isn't `file:`, a blank node, or an empty string is rejected. The file is read
 once at startup, with surrounding whitespace trimmed; a missing or empty
 file stops the broker. Protect it with file permissions.
 
 Unlike the scalar settings above, these resources are read strictly. Each of
 the following stops the broker at startup:
 
-- a missing required property, or two values for one property;
+- a missing required property, two values for one property, or a value of
+  the wrong kind (see above);
 - a `broker:participant` or `broker:holder` value that is a literal, or a
   resource without the matching `rdf:type`;
+- a `broker:Participant` or `broker:Holder` resource that no
+  `broker:participant` or `broker:holder` links to;
 - more than one `broker:holder`;
 - an unknown `broker:credentialProtocol` or a non-boolean
   `broker:insecureHttp`;
@@ -138,7 +158,8 @@ the following stops the broker at startup:
   `broker:holder`.
 
 An unknown `broker:` property on a participant or the holder is logged as a
-warning and ignored. `broker:holder` or `broker:crawlIntervalSecs` without
+warning and ignored, however many values it has. Errors name a blank-node
+participant by its `broker:participantId`. `broker:holder` or `broker:crawlIntervalSecs` without
 any participant is logged as a warning; the crawler stays off.
 
 These replace the participant registry TOML file that

@@ -3,7 +3,7 @@ use super::*;
 // --- `/sparql` (gap analysis §3.3) --------------------------------------
 
 /// `AppState` wired the way `main.rs` wires it once
-/// `CRAWLER_CONFIG_PATH` is set: a real Oxigraph-backed cache, with
+/// the config lists a `broker:participant`: a real Oxigraph-backed cache, with
 /// `AppState::sparql` pointed at that same store so `/sparql` is live.
 pub(super) fn sparql_test_state() -> AppState {
     let store = Arc::new(rdf_store::oxigraph_backend::OxigraphCatalogCache::in_memory().unwrap());
@@ -169,7 +169,7 @@ async fn sparql_get_ask_returns_true_over_http() {
     assert_eq!(parsed, serde_json::json!({"head": {}, "boolean": true}));
 }
 
-/// The in-memory backend (no `CRAWLER_CONFIG_PATH`, `AppState::sparql`
+/// The in-memory backend (no `broker:participant`, `AppState::sparql`
 /// is `None`) has no SPARQL capability at all - `/sparql` must say so
 /// plainly (501), not 404 (the route exists) and not pretend to
 /// answer.

@@ -98,7 +98,7 @@ async fn catalog_endpoint_serves_seeded_sample_catalog() {
 /// Proves `AppState.cache: Arc<dyn CatalogCache>` genuinely works with
 /// the real Oxigraph-backed implementation, not just
 /// `InMemoryCatalogCache` - the backend `main.rs` switches to when
-/// `CRAWLER_CONFIG_PATH` is set (see that function's doc comment).
+/// the config lists a `broker:participant` (see that function's comments).
 /// Exercises `GET /catalog` end to end through the router, not just
 /// the cache trait directly. (Previously exercised the now-removed
 /// `POST /dsp/catalog/request` DSP-serving endpoint - see
