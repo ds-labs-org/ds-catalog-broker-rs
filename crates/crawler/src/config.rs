@@ -140,7 +140,50 @@ impl HolderConfig {
                 path: self.credential_jws_file.display().to_string(),
             });
         }
+        check_compact_jws(jws).map_err(|reason| ConfigError::InvalidCredentialJws {
+            path: self.credential_jws_file.display().to_string(),
+            reason,
+        })?;
         Ok(jws.to_string())
+    }
+}
+
+/// Whether `jws` has the shape of a compact JWS (RFC 7515 section 7.1):
+/// three non-empty base64url segments, the first a JSON header naming a
+/// signing `alg`. The signature itself is the verifier's business; this
+/// only stops a file that is plainly something else from being sent as
+/// the crawler's credential.
+fn check_compact_jws(jws: &str) -> Result<(), &'static str> {
+    use base64::Engine as _;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    const BASE64URL: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone)
+            .with_decode_allow_trailing_bits(true),
+    );
+
+    let segments: Vec<&str> = jws.split('.').collect();
+    let [header, payload, signature] = segments[..] else {
+        return Err("expected three dot-separated segments");
+    };
+    let mut decoded = Vec::with_capacity(3);
+    for segment in [header, payload, signature] {
+        if segment.is_empty() {
+            return Err("a segment is empty");
+        }
+        decoded.push(
+            BASE64URL
+                .decode(segment)
+                .map_err(|_| "a segment is not base64url")?,
+        );
+    }
+    let header: serde_json::Value =
+        serde_json::from_slice(&decoded[0]).map_err(|_| "the header is not JSON")?;
+    match header.get("alg").and_then(serde_json::Value::as_str) {
+        None => Err("the header names no alg"),
+        Some(alg) if alg.eq_ignore_ascii_case("none") => Err("the header's alg is none"),
+        Some(_) => Ok(()),
     }
 }
 

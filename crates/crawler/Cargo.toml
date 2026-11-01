@@ -11,6 +11,7 @@ catalog-core = { path = "../catalog-core" }
 rdf-store = { path = "../rdf-store" }
 dcp-core = { path = "../dcp-core" }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }

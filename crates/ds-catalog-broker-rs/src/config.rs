@@ -320,7 +320,8 @@ pub enum ConfigLocation {
 
 impl ConfigLocation {
     /// Parse a `CONFIG_STORE_PATH` value. Anything without `://` is a plain path; `file://`
-    /// URLs become paths; `http`/`https` stay URLs; any other scheme is rejected.
+    /// URLs become paths; `https` URLs, and `http` ones to a loopback host, stay URLs; any other
+    /// URL is rejected.
     pub fn parse(raw: &str) -> Result<Self, BrokerConfigError> {
         if !raw.contains("://") {
             return Ok(Self::Local(PathBuf::from(raw)));
@@ -328,13 +329,30 @@ impl ConfigLocation {
         let url = Url::parse(raw)
             .map_err(|err| BrokerConfigError::InvalidUrl(raw.to_string(), err.to_string()))?;
         match url.scheme() {
-            "http" | "https" => Ok(Self::Remote(url)),
+            "https" => Ok(Self::Remote(url)),
+            // Plain http could be rewritten in transit, and the config
+            // decides where the crawler sends its credential: only this
+            // machine is trusted over it.
+            "http" if is_loopback(&url) => Ok(Self::Remote(url)),
+            "http" => Err(BrokerConfigError::InsecureRemote(raw.to_string())),
             "file" => url.to_file_path().map(Self::Local).map_err(|()| {
                 BrokerConfigError::InvalidUrl(raw.to_string(), "not a local file path".to_string())
             }),
             _ => Err(BrokerConfigError::UnsupportedScheme(raw.to_string())),
         }
     }
+}
+
+/// Whether `url`'s host is this machine: `localhost` or a loopback address.
+fn is_loopback(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let ip = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || ip
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 impl std::fmt::Display for ConfigLocation {
