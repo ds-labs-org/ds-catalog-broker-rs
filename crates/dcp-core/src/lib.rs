@@ -336,7 +336,8 @@ impl DcpKeyPair {
 /// `key_pair` is produced by [`DcpKeyPair::generate`] - a fresh random
 /// P-256 key every time a `HolderIdentity` is constructed - and is never
 /// persisted to or read from config. Only `own_did_host` and
-/// `credential_jws` are config-driven (see `crawler::config::HolderConfig`).
+/// `credential_jws` are config-driven (see `crawler::config::HolderConfig`;
+/// the credential is read from the file its `credential_jws_file` names).
 ///
 /// This is safe, not an oversight to "fix" later: a `did:web` identity is
 /// entirely self-hosted (the DID document is served *by this same
@@ -351,7 +352,7 @@ impl DcpKeyPair {
 /// pre-agreed (and therefore *does* need to persist in config, not be
 /// regenerated) is `credential_jws` - a credential some external issuer
 /// signed for this holder's `own_did` ahead of time, which is exactly why
-/// it lives in `HolderConfig` while the key pair does not.
+/// it is configured (via `HolderConfig`) while the key pair is not.
 #[derive(Debug, Clone)]
 pub struct HolderIdentity {
     pub key_pair: DcpKeyPair,

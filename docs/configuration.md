@@ -45,6 +45,9 @@ subject IRI is up to you. Two `broker:BrokerConfig` resources, or two values
 for one property, stop the broker at startup. An unknown `broker:` property
 is logged as a warning and ignored.
 
+The crawler's participants and its holder identity are separate resources,
+linked from `broker:BrokerConfig`; see [Participants and holder](#participants-and-holder).
+
 [`examples/config_graph.ttl`](examples/config_graph.ttl) sets every
 property; a test (`config::tests::reads_every_setting_from_the_example_ttl`)
 keeps it in step with the code.
@@ -56,7 +59,9 @@ Every setting is optional.
 | Property | Default | Meaning | Replaces env var |
 |---|---|---|---|
 | `broker:httpApiAddr` | `127.0.0.1:8080` | Address the HTTP API listens on. | `HTTP_API_ADDR` |
-| `broker:crawlerConfigPath` | unset | Path to the participant registry TOML. Unset serves one sample catalog from an in-memory cache, with no crawler and `/sparql` answering 501. | `CRAWLER_CONFIG_PATH` |
+| `broker:participant` | none | A `broker:Participant` to crawl; repeat for each. With none, the broker serves one sample catalog from an in-memory cache, with no crawler and `/sparql` answering 501. | `CRAWLER_CONFIG_PATH` |
+| `broker:holder` | unset | The crawler's `broker:Holder` identity. Required when a participant uses the `dcp` or `oid4vp` credential protocol. | |
+| `broker:crawlIntervalSecs` | `300` | Seconds between the starts of two crawl cycles. Positive integer. | |
 | `broker:crawlTimeoutMs` | `30000` | How long one participant's crawl may take, credential presentation and response body included, before it counts as failed. Positive integer. | |
 | `broker:crawlConcurrency` | `8` | How many participants are crawled at the same time. Positive integer. | |
 | `broker:catalogMaxAgeSecs` | `86400` | A participant's cached catalog is removed once its last successful crawl is older than this, so a participant that stays down stops being served. A failed crawl keeps the previous catalog until then. Positive integer. | |
@@ -75,3 +80,66 @@ is logged as a warning and the default is used. Integers and booleans can
 be written as plain Turtle literals (`10000`, `true`) or as strings.
 
 The old environment variables in the last column are no longer read.
+
+## Participants and holder
+
+Each participant is a resource typed `broker:Participant`, and the holder a
+resource typed `broker:Holder`. Either can be an IRI or a blank node:
+
+```turtle
+<urn:ds-catalog-broker:config> a broker:BrokerConfig ;
+    broker:participant <urn:participant:a>, [
+        a broker:Participant ;
+        broker:participantId "gated" ;
+        broker:participantName "DCP-gated participant" ;
+        broker:catalogRequestUrl "https://gated.example.org/dsp/catalog/request" ;
+        broker:credentialProtocol "dcp" ;
+        broker:providerDid "did:web:gated.example.org:dsp"
+    ] ;
+    broker:holder <urn:holder> .
+```
+
+| `broker:Participant` property | Required | Meaning |
+|---|---|---|
+| `broker:participantId` | yes | Unique id; it identifies the participant on its harvested catalog and in logs. |
+| `broker:participantName` | yes | Display name. |
+| `broker:catalogRequestUrl` | yes | The participant's DSP catalog request endpoint. |
+| `broker:credentialProtocol` | no | `none` (default), `dcp` or `oid4vp`: what the crawler presents to this participant. |
+| `broker:providerDid` | for `dcp` | The participant's DID, the audience of the self-issued token. |
+| `broker:oid4vpResponseUri` | for `oid4vp` | The OID4VP `direct_post` endpoint the presentation is sent to. |
+
+| `broker:Holder` property | Required | Meaning |
+|---|---|---|
+| `broker:ownDidHost` | yes | The crawler's own `did:web` host[:port]; its DID is `did:web:<host>:dsp:holder`. |
+| `broker:insecureHttp` | no | `true` resolves `did:web` DIDs over `http://`, for local tests. Default `false`. |
+| `broker:credentialJwsFile` | yes | A local file holding the crawler's Verifiable Credential (a JWS compact string). See below. |
+| `broker:requiredScope` | yes | The DCP scope the credential is expected to satisfy. |
+
+The credential is a bearer secret, so it is read from a file rather than
+written in the config, which may be fetched over HTTP. The value is a path
+string (relative paths resolve against the broker's working directory) or a
+`file:` IRI; a relative IRI such as `<holder.jws>` resolves against the
+config file's own location. An `http(s)` IRI is rejected. The file is read
+once at startup, with surrounding whitespace trimmed; a missing or empty
+file stops the broker. Protect it with file permissions.
+
+Unlike the scalar settings above, these resources are read strictly. Each of
+the following stops the broker at startup:
+
+- a missing required property, or two values for one property;
+- a `broker:participant` or `broker:holder` value that is a literal, or a
+  resource without the matching `rdf:type`;
+- more than one `broker:holder`;
+- an unknown `broker:credentialProtocol` or a non-boolean
+  `broker:insecureHttp`;
+- two participants with the same `broker:participantId`;
+- a `dcp` participant without `broker:providerDid`, an `oid4vp` participant
+  without `broker:oid4vpResponseUri`, or either one without a
+  `broker:holder`.
+
+An unknown `broker:` property on a participant or the holder is logged as a
+warning and ignored. `broker:holder` or `broker:crawlIntervalSecs` without
+any participant is logged as a warning; the crawler stays off.
+
+These replace the participant registry TOML file that
+`broker:crawlerConfigPath` used to name. That property is no longer read.
