@@ -479,7 +479,7 @@ async fn crawl_one(
 /// `permission`/`prohibition`/`obligation` under a policy follows the same
 /// convention. See `parse_policies` for the field-by-field mapping.
 ///
-/// Every ODRL key is read through one helper, [`get_aliased`], in its bare,
+/// Every ODRL key is read through one helper, [`aliased_all`], in its bare,
 /// `odrl:`-prefixed or full-IRI spelling. Scalar values go through one
 /// helper, [`json_ld_scalar`], which accepts plain strings, numbers,
 /// booleans, `{"@value": ...}` value objects and `{"@id": ...}` references.
@@ -694,17 +694,27 @@ fn parse_data_service(value: &Value) -> Option<DataService> {
 /// The ODRL namespace. `<ODRL_NS>hasPolicy` is the expanded-IRI form real
 /// EDC/DSP JSON-LD uses in place of the compact `hasPolicy` key (see
 /// `edc_federated_catalog_client::models::Dataset::has_policy`'s own
-/// `#[serde(rename = ...)]`); [`get_aliased`] accepts every key in that form.
+/// `#[serde(rename = ...)]`); [`aliased_all`] accepts every key in that form.
 const ODRL_NS: &str = "http://www.w3.org/ns/odrl/2/";
 
 /// ODRL/JSON-LD's "one-or-many" convention: a value that is normally an
 /// array may legally appear as a single bare object instead when there is
 /// exactly one entry. Returns an empty `Vec` for a missing key, the single
 /// value wrapped for a bare object, or the array's own entries otherwise.
+///
+/// A JSON-LD list or set object (`{"@list": [...]}`, `{"@set": [...]}`, as
+/// its only key) is unwrapped to its entries, so wrapping a rule or policy
+/// in one does not hide it from the parser.
 fn one_or_many(value: Option<&Value>) -> Vec<&Value> {
     match value {
         None => Vec::new(),
         Some(Value::Array(items)) => items.iter().collect(),
+        Some(Value::Object(map)) if map.len() == 1 => {
+            match map.get("@list").or_else(|| map.get("@set")) {
+                Some(inner) => one_or_many(Some(inner)),
+                None => vec![value.unwrap()],
+            }
+        }
         Some(other) => vec![other],
     }
 }
@@ -743,17 +753,33 @@ fn one_or_many_aliased<'a>(value: &'a Value, name: &str) -> Vec<&'a Value> {
 fn json_ld_scalar(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
+        Value::Number(n) => Some(render_number(n)),
         Value::Bool(b) => Some(b.to_string()),
         Value::Object(map) => match map.get("@value") {
             Some(inner @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) => {
                 json_ld_scalar(inner)
             }
             Some(_) => None,
-            None => map.get("@id").and_then(Value::as_str).map(str::to_string),
+            // A node reference is its @id only when nothing else qualifies
+            // it: an action with a `refinement`, for example, is narrower
+            // than its bare @id.
+            None if map.keys().all(|k| k == "@id" || k == "@type") => {
+                map.get("@id").and_then(Value::as_str).map(str::to_string)
+            }
+            None => None,
         },
         Value::Array(items) if items.len() == 1 => json_ld_scalar(&items[0]),
         _ => None,
+    }
+}
+
+/// Render a JSON number as the claim strings the broker compares against: an
+/// integral float (`10.0`, `1e3`) renders as an integer (`10`, `1000`), so an
+/// `eq` against a claim written `10` still matches.
+fn render_number(n: &serde_json::Number) -> String {
+    match n.as_f64() {
+        Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() < 1e15 => format!("{}", f as i64),
+        _ => n.to_string(),
     }
 }
 
@@ -787,7 +813,11 @@ fn get_field(value: &Value, name: &str) -> Field {
 
 /// The raw value as logged next to a marker.
 fn log_excerpt(value: &Value) -> String {
-    value.to_string()
+    value
+        .to_string()
+        .chars()
+        .take(catalog_core::UNMAPPABLE_EXCERPT_MAX)
+        .collect()
 }
 
 /// A rule that carries only an unmappable marker, standing in for policy
@@ -849,6 +879,16 @@ fn parse_policy(value: &Value) -> Policy {
         .unwrap_or_default();
     let assigner = get_field(value, "assigner").value();
     let mut obligations = parse_rules(value, "obligation");
+    // A policy node with none of the rule keys has nothing the broker can
+    // evaluate (a bare reference, an unknown shape). An empty policy would
+    // read as permissive, so it carries a marker. An explicitly empty rule
+    // list is a real, empty policy and is not marked.
+    if ["permission", "prohibition", "obligation"]
+        .iter()
+        .all(|k| aliased_all(value, k).is_empty())
+    {
+        obligations.push(unmappable_rule(value));
+    }
     // An assignee scopes the policy to one party. Reading it as absent would
     // widen the policy to everyone, so an unreadable one adds a marker rule.
     let assignee = match get_field(value, "assignee") {
@@ -910,6 +950,27 @@ fn parse_rule(value: &Value) -> Rule {
         }
     };
     constraints.extend(parse_constraints(one_or_many_aliased(value, "constraint")));
+    // The model has no rule-level assignee, target or duty. Dropping one
+    // would widen the rule (an assignee-scoped permission would apply to
+    // everyone), so each present key adds a marker.
+    for key in ["assignee", "target", "duty"] {
+        let raws = aliased_all(value, key);
+        if !raws.is_empty() {
+            tracing::warn!(
+                key,
+                entry = %log_excerpt(raws[0]),
+                "crawled ODRL rule carries a rule-level key the broker cannot honour; \
+                 keeping it as an unmappable marker"
+            );
+            constraints.push(Constraint::unmappable(format!(
+                "{key}: {}",
+                raws.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
     Rule {
         action,
         constraints,
@@ -937,7 +998,7 @@ const MAX_CONSTRAINT_DEPTH: usize = 64;
 /// clippy `type_complexity` warning).
 type LogicalConstraintBuilder = fn(Vec<Constraint>) -> Constraint;
 
-/// The JSON-LD keys (read under any alias, see [`get_aliased`]) a logical
+/// The JSON-LD keys (read under any alias, see [`aliased_all`]) a logical
 /// constraint group may use,
 /// each paired with the `catalog_core::Constraint` constructor for that
 /// combinator, in the same fixed precedence order
