@@ -141,9 +141,18 @@ may be a `file:` IRI.
 | `broker:Holder` property | Required | Meaning |
 |---|---|---|
 | `broker:ownDidHost` | yes | The crawler's own `did:web` host[:port]; its DID is `did:web:<host>:dsp:holder`. |
-| `broker:insecureHttp` | no | `true` resolves `did:web` DIDs over `http://`, for local tests. Default `false`. |
+| `broker:insecureHttp` | no | `true` resolves `did:web` DIDs over `http://`, for local tests. Only a loopback IP literal (`127.0.0.1`, `[::1]`) is then fetched over `http://`; any other host is refused. Default `false`. |
 | `broker:credentialJwsFile` | yes | A local file holding the crawler's Verifiable Credential (a JWS compact string). See below. |
 | `broker:requiredScope` | yes | The DCP scope the credential is expected to satisfy. |
+
+`POST /dsp/holder/presentations/query` answers only a participant this
+broker sent a `dcp` token to: the call must carry the presentation-access
+token (its `jti`) the broker minted for that participant, and the caller's
+DID must be that participant's `broker:providerDid`. The presentation it
+returns has the caller's DID as `aud` and that `jti` as `nonce`. The
+caller's DID document is fetched with a 5 second timeout, a 64 KiB cap and
+no redirects, and only after the token check. The binding is held in
+memory, so a restart ends any call in flight.
 
 The credential is a bearer secret, so it is read from a file rather than
 written in the config, which may be fetched over HTTP. The value is a path
