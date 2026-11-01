@@ -287,12 +287,12 @@ pub enum BrokerConfigError {
     #[error("{CONFIG_STORE_PATH_ENV}={0:?} is not a valid URL: {1}")]
     InvalidUrl(String, String),
     #[error(
-        "{CONFIG_STORE_PATH_ENV}={0:?} uses an unsupported URL scheme (expected file, http or https)"
+        "{CONFIG_STORE_PATH_ENV}={0:?} uses an unsupported URL scheme (expected file or https)"
     )]
     UnsupportedScheme(String),
     #[error(
-        "{CONFIG_STORE_PATH_ENV}={0:?} is plain http to a non-loopback host; the config decides \
-         where the crawler sends its credential, so fetch it over https"
+        "{CONFIG_STORE_PATH_ENV}={0:?} is plain http to something other than a loopback address; \
+         the config decides where the crawler sends its credential, so fetch it over https"
     )]
     InsecureRemote(String),
     #[error("failed to read {location}: {source}")]
@@ -331,12 +331,11 @@ impl ConfigLocation {
         let url = Url::parse(raw)
             .map_err(|err| BrokerConfigError::InvalidUrl(raw.to_string(), err.to_string()))?;
         match url.scheme() {
-            "https" => Ok(Self::Remote(url)),
             // Plain http could be rewritten in transit, and the config
             // decides where the crawler sends its credential: only this
             // machine is trusted over it.
-            "http" if is_loopback(&url) => Ok(Self::Remote(url)),
-            "http" => Err(BrokerConfigError::InsecureRemote(raw.to_string())),
+            "http" | "https" if remote_allowed(&url) => Ok(Self::Remote(url)),
+            "http" => Err(BrokerConfigError::InsecureRemote(redacted(&url))),
             "file" => url.to_file_path().map(Self::Local).map_err(|()| {
                 BrokerConfigError::InvalidUrl(raw.to_string(), "not a local file path".to_string())
             }),
@@ -345,23 +344,61 @@ impl ConfigLocation {
     }
 }
 
-/// Whether `url`'s host is this machine: `localhost` or a loopback address.
-fn is_loopback(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let ip = host.trim_start_matches('[').trim_end_matches(']');
-    host.eq_ignore_ascii_case("localhost")
-        || ip
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+/// Whether a config may be fetched from, or a credential sent to, `url`:
+/// over https, or over plain http to a loopback address. A host name, even
+/// `localhost`, is not trusted as loopback: where it goes is up to the
+/// resolver.
+fn remote_allowed(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host_str().is_some_and(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
+/// The client that fetches a remote config: it follows a redirect only to a
+/// location `CONFIG_STORE_PATH` could name itself, and reaches a loopback
+/// address directly rather than through a proxy from the environment.
+fn config_client(url: &Url) -> reqwest::Result<reqwest::Client> {
+    let redirects = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            attempt.error("too many redirects")
+        } else if remote_allowed(attempt.url()) {
+            attempt.follow()
+        } else {
+            let target = redacted(attempt.url());
+            attempt.error(format!(
+                "refused a redirect to {target}: a config is fetched over https, or plain http \
+                 to a loopback address"
+            ))
+        }
+    });
+    let builder = reqwest::Client::builder().redirect(redirects);
+    if url.scheme() == "http" {
+        builder.no_proxy().build()
+    } else {
+        builder.build()
+    }
+}
+
+/// `url` without any user name or password, for messages and logs.
+fn redacted(url: &Url) -> String {
+    let mut url = url.clone();
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    url.to_string()
 }
 
 impl std::fmt::Display for ConfigLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Local(path) => write!(f, "{}", path.display()),
-            Self::Remote(url) => write!(f, "{url}"),
+            Self::Remote(url) => write!(f, "{}", redacted(url)),
         }
     }
 }
@@ -448,8 +485,11 @@ impl BrokerSettings {
                     location: location.to_string(),
                     source,
                 };
-                let http = reqwest::Client::new();
-                let turtle = http
+                if !remote_allowed(url) {
+                    return Err(BrokerConfigError::InsecureRemote(redacted(url)));
+                }
+                let turtle = config_client(url)
+                    .map_err(fetch)?
                     .get(url.clone())
                     .header(reqwest::header::ACCEPT, "text/turtle")
                     .send()
@@ -944,12 +984,26 @@ impl Properties {
         Ok(value)
     }
 
-    /// `property` as an absolute `http(s)` URL, if set.
-    fn optional_http_url(&self, property: &str) -> Result<Option<String>, BrokerConfigError> {
+    /// `property` as an absolute `http(s)` URL, if set. When the endpoint
+    /// carries the crawler's credential (`gated`), plain http is accepted
+    /// only to a loopback address, as for a remote config.
+    fn optional_endpoint_url(
+        &self,
+        property: &str,
+        gated: bool,
+    ) -> Result<Option<String>, BrokerConfigError> {
         let Some(value) = self.optional(property)? else {
             return Ok(None);
         };
         match Url::parse(&value) {
+            Ok(url) if gated && !remote_allowed(&url) && url.scheme() == "http" => Err(self
+                .invalid(
+                    property,
+                    value,
+                    "this endpoint receives the crawler's credential: expected https, or plain \
+                     http to a loopback address"
+                        .to_string(),
+                )),
             Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(Some(value)),
             _ => Err(self.invalid(
                 property,
@@ -1077,8 +1131,9 @@ fn read_participant(
     };
     let id = props.non_empty(PARTICIPANT_ID)?;
     let name = props.non_empty(PARTICIPANT_NAME)?;
+    let gated = credential_protocol != CredentialProtocol::None;
     let catalog_request_url = props
-        .optional_http_url(CATALOG_REQUEST_URL)?
+        .optional_endpoint_url(CATALOG_REQUEST_URL, gated)?
         .ok_or_else(|| BrokerConfigError::MissingProperty {
             resource: props.resource.clone(),
             property: CATALOG_REQUEST_URL.to_string(),
@@ -1091,7 +1146,7 @@ fn read_participant(
         CredentialProtocol::Dcp,
         "dcp",
     )?;
-    let oid4vp_response_uri = props.optional_http_url(OID4VP_RESPONSE_URI)?;
+    let oid4vp_response_uri = props.optional_endpoint_url(OID4VP_RESPONSE_URI, true)?;
     props.only_for(
         OID4VP_RESPONSE_URI,
         &oid4vp_response_uri,

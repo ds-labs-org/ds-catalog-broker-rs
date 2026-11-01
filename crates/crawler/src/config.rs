@@ -115,7 +115,10 @@ pub struct HolderConfig {
     ///
     /// A VC is a *bearer credential* - whoever holds the JWS can present
     /// it - so it is kept out of the config document itself, which may be
-    /// fetched over HTTP. The file is still plain, unencrypted text: this
+    /// fetched from another machine. The flip side is that the config picks
+    /// which local file is sent as the credential, so
+    /// [`Self::read_credential_jws`] only accepts a file that is a VC in
+    /// compact JWS form. The file is still plain, unencrypted text: this
     /// project has no secret-management story yet (see the `dataspace`
     /// study repo's `authority/` placeholder), so protecting it is left to
     /// the file's permissions.
@@ -148,43 +151,43 @@ impl HolderConfig {
     }
 }
 
-/// Whether `jws` has the shape of a compact JWS (RFC 7515 section 7.1):
-/// three non-empty base64url segments, the first a JSON header naming a
-/// signing `alg`. The signature itself is the verifier's business; this
-/// only stops a file that is plainly something else from being sent as
-/// the crawler's credential.
+/// Whether `jws` looks like a Verifiable Credential in compact JWS form
+/// (RFC 7515 section 7.1): three non-empty, canonical base64url segments,
+/// a JSON header naming a signing `alg`, and a JSON payload that is a
+/// `VerifiableCredential` - VC-JWT's `vc` claim, or a VC 2.0 JOSE payload
+/// that is the credential itself. The signature is the verifier's business;
+/// this only stops a file that is plainly something else (an environment
+/// dump, a key, another kind of bearer token) from being sent as the
+/// crawler's credential.
 fn check_compact_jws(jws: &str) -> Result<(), &'static str> {
-    use base64::Engine as _;
-    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-    const BASE64URL: GeneralPurpose = GeneralPurpose::new(
-        &base64::alphabet::URL_SAFE,
-        GeneralPurposeConfig::new()
-            .with_decode_padding_mode(DecodePaddingMode::RequireNone)
-            .with_decode_allow_trailing_bits(true),
-    );
-
+    use serde_json::Value;
     let segments: Vec<&str> = jws.split('.').collect();
-    let [header, payload, signature] = segments[..] else {
+    let [_, _, signature] = segments[..] else {
         return Err("expected three dot-separated segments");
     };
-    let mut decoded = Vec::with_capacity(3);
-    for segment in [header, payload, signature] {
-        if segment.is_empty() {
-            return Err("a segment is empty");
-        }
-        decoded.push(
-            BASE64URL
-                .decode(segment)
-                .map_err(|_| "a segment is not base64url")?,
-        );
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err("a segment is empty");
     }
-    let header: serde_json::Value =
-        serde_json::from_slice(&decoded[0]).map_err(|_| "the header is not JSON")?;
-    match header.get("alg").and_then(serde_json::Value::as_str) {
-        None => Err("the header names no alg"),
-        Some(alg) if alg.eq_ignore_ascii_case("none") => Err("the header's alg is none"),
-        Some(_) => Ok(()),
+    dcp_core::b64_decode(signature).map_err(|_| "the signature is not base64url")?;
+    let (_, header, payload) = dcp_core::decode_jws_unverified(jws)
+        .map_err(|_| "the header or payload is not base64url-encoded JSON")?;
+    let alg = header
+        .get("alg")
+        .and_then(Value::as_str)
+        .ok_or("the header names no alg")?;
+    if alg.is_empty() || alg.trim() != alg || alg.eq_ignore_ascii_case("none") {
+        return Err("the header's alg is empty or none");
     }
+    let credential = payload.get("vc").unwrap_or(&payload);
+    let is_credential = match credential.get("type") {
+        Some(Value::String(kind)) => kind == "VerifiableCredential",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "VerifiableCredential"),
+        _ => false,
+    };
+    if !is_credential {
+        return Err("the payload is not a VerifiableCredential");
+    }
+    Ok(())
 }
 
 /// A crawler configuration that violates one of the invariants
@@ -451,10 +454,11 @@ mod tests {
                 jws(r#"{"alg":"RS256"}"#, r#"{"sub":"system:serviceaccount"}"#),
             ),
             ("payload not JSON", format!("{header}.aGVsbG8.c2ln")),
-            // Non-zero trailing bits: dcp_core's strict decoder refuses them.
+            // `l` leaves non-zero trailing bits: dcp_core's strict decoder
+            // refuses them (`c2k` would be canonical).
             (
                 "non-canonical base64url",
-                format!("{}.c2lnbmF0dXJm", valid_jws().rsplit_once('.').unwrap().0),
+                format!("{}.c2l", valid_jws().rsplit_once('.').unwrap().0),
             ),
         ];
         for (name, content) in cases {
