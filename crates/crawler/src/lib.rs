@@ -2740,7 +2740,7 @@ mod tests {
                 } else {
                     &policy.prohibitions
                 };
-                assert_eq!(rules[0].action, "use", "{extra}");
+                assert_eq!(rules[0].action, "odrl:use", "{extra}");
                 assert!(
                     rules[0].constraints.iter().any(is_marker),
                     "{extra}: {rules:?}"
