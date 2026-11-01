@@ -192,17 +192,26 @@ fn instance_is_reusable_and_buffers_can_be_freed_repeatedly() {
     }
 }
 
+/// A negative length is 2 GiB or more read as u32. Returning a non-null
+/// pointer to a zero-byte buffer would let a host write past it without any
+/// signal, so the guest reports the failure with 0, as for any other
+/// allocation it cannot serve.
 #[test]
-fn negative_alloc_length_is_clamped_not_a_huge_allocation() {
+fn negative_alloc_length_returns_null() {
     let mut guest = Guest::new();
-    let ptr = guest
-        .alloc
-        .call(&mut guest.store, -1)
-        .expect("alloc(-1) does not trap");
+    for len in [-1, i32::MIN] {
+        let ptr = guest
+            .alloc
+            .call(&mut guest.store, len)
+            .expect("alloc with a negative length does not trap");
+        assert_eq!(ptr, 0, "alloc({len}) returns 0");
+    }
     guest
         .dealloc
-        .call(&mut guest.store, (ptr, -1))
-        .expect("dealloc(ptr, -1) does not trap");
+        .call(&mut guest.store, (0, -1))
+        .expect("dealloc(0, -1) does not trap");
+    let request = json!({"dataset_id": "d", "policies": [], "claims": {}}).to_string();
+    assert_eq!(guest.call(request.as_bytes())["decision"], "Allow");
 }
 
 /// The host caps the guest's memory at 8 MiB, so a 64 MiB allocation cannot
