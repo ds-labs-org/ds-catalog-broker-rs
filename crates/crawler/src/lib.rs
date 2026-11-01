@@ -941,7 +941,7 @@ fn parse_rule(value: &Value) -> Rule {
     }
     let mut constraints = Vec::new();
     let action = match get_field(value, "action") {
-        Field::Value(action) => action,
+        Field::Value(action) => catalog_core::normalize_action(&action),
         Field::Absent | Field::Unreadable => {
             tracing::warn!(
                 entry = %log_excerpt(value),
@@ -1605,7 +1605,7 @@ mod tests {
         assert_eq!(policy.assignee.as_deref(), Some("did:example:consumer"));
 
         assert_eq!(policy.permissions.len(), 1);
-        assert_eq!(policy.permissions[0].action, "use");
+        assert_eq!(policy.permissions[0].action, "odrl:use");
         assert_eq!(
             policy.permissions[0].constraints,
             vec![Constraint::atomic(
@@ -1616,7 +1616,7 @@ mod tests {
         );
 
         assert_eq!(policy.prohibitions.len(), 1);
-        assert_eq!(policy.prohibitions[0].action, "distribute");
+        assert_eq!(policy.prohibitions[0].action, "odrl:distribute");
         assert!(policy.prohibitions[0].constraints.is_empty());
 
         assert!(policy.obligations.is_empty());
@@ -1649,7 +1649,7 @@ mod tests {
         assert_eq!(policies.len(), 1);
         assert_eq!(policies[0].kind, PolicyKind::Set);
         assert_eq!(policies[0].permissions.len(), 1);
-        assert_eq!(policies[0].permissions[0].action, "use");
+        assert_eq!(policies[0].permissions[0].action, "odrl:use");
     }
 
     /// (d) A permission carrying one well-formed atomic constraint
@@ -1792,7 +1792,7 @@ mod tests {
                 .iter()
                 .any(Constraint::is_unmappable)
         );
-        assert_eq!(permissions[1].action, "use");
+        assert_eq!(permissions[1].action, "odrl:use");
     }
 
     /// An unrecognized `@type` value degrades leniently to the default
@@ -2619,6 +2619,25 @@ mod tests {
     }
 
     #[test]
+    fn action_spellings_normalize_to_the_odrl_prefixed_form() {
+        for spelling in ["use", "odrl:use", "http://www.w3.org/ns/odrl/2/use"] {
+            let policy = parse_one_policy(json!({
+                "permission": [{"action": spelling}],
+                "prohibition": [{"action": {"@id": spelling}}]
+            }));
+            assert_eq!(policy.permissions[0].action, "odrl:use", "{spelling}");
+            assert_eq!(policy.prohibitions[0].action, "odrl:use", "{spelling}");
+        }
+        let policy = parse_one_policy(json!({
+            "permission": [{"action": "https://example.org/act/share"}]
+        }));
+        assert_eq!(
+            policy.permissions[0].action,
+            "https://example.org/act/share"
+        );
+    }
+
+    #[test]
     fn json_ld_value_objects_are_normalized() {
         let policy = parse_one_policy(json!({
             "assignee": {"@id": "did:web:a"},
@@ -2721,7 +2740,7 @@ mod tests {
                 } else {
                     &policy.prohibitions
                 };
-                assert_eq!(rules[0].action, "use", "{extra}");
+                assert_eq!(rules[0].action, "odrl:use", "{extra}");
                 assert!(
                     rules[0].constraints.iter().any(is_marker),
                     "{extra}: {rules:?}"

@@ -549,7 +549,10 @@ pub fn catalog_rule_to_engine_rule(
             constraints.push(engine_constraint);
         }
     }
-    Ok(Some(EngineRule::new(rule.action.clone(), constraints)))
+    Ok(Some(EngineRule::new(
+        catalog_core::normalize_action(&rule.action),
+        constraints,
+    )))
 }
 
 /// [`catalog_core::PolicyKind`]'s wire spelling on [`WirePolicy::kind`] -
@@ -667,8 +670,9 @@ fn build_request(
     claims: &Claims,
     config: &PolicyFilterConfig,
 ) -> EngineRequest {
+    let action = catalog_core::normalize_action(action);
     let mut actions: BTreeSet<String> = BTreeSet::new();
-    actions.insert(action.to_string());
+    actions.insert(action.clone());
     for rule in wire_policy
         .permissions
         .iter()
@@ -701,7 +705,7 @@ fn build_request(
 
     EngineRequest {
         dataset_id: dataset.id.clone(),
-        action: action.to_string(),
+        action,
         config: request_config,
         policies: vec![wire_policy.clone()],
         claims: claims.clone(),
@@ -877,6 +881,60 @@ mod tests {
         CoreRule {
             action: action.to_string(),
             constraints: Vec::new(),
+        }
+    }
+
+    // --- action spellings (#41) -----------------------------------------
+
+    const USE_SPELLINGS: [&str; 3] = ["use", "odrl:use", "http://www.w3.org/ns/odrl/2/use"];
+
+    #[test]
+    fn a_prohibition_on_any_spelling_of_use_hides_the_dataset() {
+        for spelling in USE_SPELLINGS {
+            let dataset = dataset_with_policies(vec![policy(
+                vec![unconstrained_rule("odrl:use")],
+                vec![unconstrained_rule(spelling)],
+            )]);
+            assert!(
+                !dataset_is_visible(
+                    &dataset,
+                    &Claims::new(),
+                    "odrl:use",
+                    &PolicyFilterConfig::default()
+                ),
+                "prohibition spelled {spelling:?} must apply to odrl:use"
+            );
+        }
+    }
+
+    #[test]
+    fn a_permission_on_any_spelling_of_use_grants_visibility() {
+        for spelling in USE_SPELLINGS {
+            let dataset =
+                dataset_with_policies(vec![policy(vec![unconstrained_rule(spelling)], vec![])]);
+            assert!(
+                dataset_is_visible(
+                    &dataset,
+                    &Claims::new(),
+                    "odrl:use",
+                    &PolicyFilterConfig::default()
+                ),
+                "permission spelled {spelling:?} must cover odrl:use"
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_action_is_normalized_too() {
+        for requested in USE_SPELLINGS {
+            let dataset =
+                dataset_with_policies(vec![policy(vec![unconstrained_rule("use")], vec![])]);
+            assert!(dataset_is_visible(
+                &dataset,
+                &Claims::new(),
+                requested,
+                &PolicyFilterConfig::default()
+            ));
         }
     }
 
