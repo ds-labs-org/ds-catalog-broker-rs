@@ -30,7 +30,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use catalog_core::{
-    Catalog, Constraint, DataService, Dataset, Distribution, NodeId, Policy, PolicyKind, Rule,
+    Catalog, Constraint, DataService, Dataset, Distribution, LOGICAL_CONSTRAINT_BUILDERS,
+    LogicalConstraintBuilder, MAX_CONSTRAINT_DEPTH, NodeId, Policy, PolicyKind, Rule,
     UNMAPPABLE_ACTION,
 };
 use dcp_core::HolderIdentity;
@@ -1112,46 +1113,6 @@ fn parse_rule(value: &Value) -> Rule {
     }
 }
 
-/// Bounds how many nested `odrl:and`/`odrl:or`/`odrl:xone`/`odrl:andSequence`
-/// levels [`parse_constraint`] will recurse into when parsing one crawled
-/// constraint tree, so a pathologically deep (or adversarial) crawled
-/// payload cannot grow this parser's call stack unboundedly. Deliberately
-/// set to the exact same value as `ds-odrl-engine-rs`'s own
-/// `engine::constraint::MAX_CONSTRAINT_DEPTH` (see that constant's doc
-/// comment for the full rationale, including why 64 specifically) rather
-/// than picking an independent number here: this crawler and that engine
-/// parse/evaluate the same wire shape into structurally the same tree, and
-/// a policy this crawler harvests but the engine would then refuse to
-/// evaluate (or vice versa) would be a confusing, hard-to-diagnose mismatch
-/// between "harvested" and "enforceable" for the exact same input.
-const MAX_CONSTRAINT_DEPTH: usize = 64;
-
-/// Constructor signature shared by [`Constraint::and`], [`Constraint::or`],
-/// [`Constraint::xone`], and [`Constraint::and_sequence`] - factored into a
-/// named alias purely so [`LOGICAL_CONSTRAINT_KEYS`]'s own type stays
-/// readable (a bare `[(&str, fn(Vec<Constraint>) -> Constraint); 4]` is a
-/// clippy `type_complexity` warning).
-type LogicalConstraintBuilder = fn(Vec<Constraint>) -> Constraint;
-
-/// The JSON-LD keys (read under any alias, see [`aliased_all`]) a logical
-/// constraint group may use,
-/// each paired with the `catalog_core::Constraint` constructor for that
-/// combinator, in the same fixed precedence order
-/// `ds-odrl-engine-rs::engine::Constraint::evaluate` applies when more than
-/// one such key is present on a single node: `xone`, then `or`, then `and`,
-/// then `andSequence`. A crawled constraint node is expected to carry at
-/// most one of these, but keeping the same precedence as the engine (rather
-/// than an arbitrary one) means a hand-authored node setting more than one
-/// key - malformed, but not rejected outright, matching this parser's
-/// generally lenient stance - is at least interpreted identically by both
-/// this crawler and the engine that will later evaluate it.
-const LOGICAL_CONSTRAINT_KEYS: [(&str, LogicalConstraintBuilder); 4] = [
-    ("xone", Constraint::xone),
-    ("or", Constraint::or),
-    ("and", Constraint::and),
-    ("andSequence", Constraint::and_sequence),
-];
-
 /// Parse a rule's `constraint` entries (one-or-many) into `Constraint`s -
 /// see [`parse_constraint`] for the per-entry (recursive) parse.
 fn parse_constraints(entries: Vec<&Value>) -> Vec<Constraint> {
@@ -1163,7 +1124,7 @@ fn parse_constraints(entries: Vec<&Value>) -> Vec<Constraint> {
 
 /// Parse one `constraint` entry into a `Constraint`, recursively: either the
 /// atomic `leftOperand`/`operator`/`rightOperand` shape, or a logical group
-/// under one of [`LOGICAL_CONSTRAINT_KEYS`], whose child entries
+/// under one of [`LOGICAL_CONSTRAINT_BUILDERS`], whose child entries
 /// (one-or-many) are parsed by recursing at `depth + 1`.
 ///
 /// This never drops an entry. Content that cannot be read becomes a
@@ -1185,7 +1146,7 @@ fn parse_constraint(value: &Value, depth: usize) -> Constraint {
     let has_atomic_key = ["leftOperand", "operator", "rightOperand"]
         .iter()
         .any(|k| !aliased_all(value, k).is_empty());
-    let logical_present: Vec<&(&str, LogicalConstraintBuilder)> = LOGICAL_CONSTRAINT_KEYS
+    let logical_present: Vec<&(&str, LogicalConstraintBuilder)> = LOGICAL_CONSTRAINT_BUILDERS
         .iter()
         .filter(|(key, _)| !aliased_all(value, key).is_empty())
         .collect();

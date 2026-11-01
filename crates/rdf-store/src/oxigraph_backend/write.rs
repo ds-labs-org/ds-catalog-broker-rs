@@ -18,7 +18,7 @@ impl OxigraphCatalogCache {
             &rdf_type(),
             &Term::from(dcat_catalog_class()),
             graph,
-        )?;
+        );
 
         if let Some(participant_id) = &catalog.participant_id {
             self.insert(
@@ -26,7 +26,7 @@ impl OxigraphCatalogCache {
                 &participant_id_pred(),
                 &Term::from(Literal::from(participant_id.clone())),
                 graph,
-            )?;
+            );
         }
 
         for (key, value) in &catalog.properties {
@@ -35,7 +35,7 @@ impl OxigraphCatalogCache {
                 &property_predicate(key),
                 &Term::from(Literal::from(value.clone())),
                 graph,
-            )?;
+            );
         }
 
         for (index, dataset) in catalog.datasets.iter().enumerate() {
@@ -45,19 +45,19 @@ impl OxigraphCatalogCache {
                 &dcat_dataset_pred(),
                 &Term::from(dataset_node.clone()),
                 graph,
-            )?;
+            );
             self.insert(
                 &dataset_node,
                 &rdf_type(),
                 &Term::from(dcat_dataset_class()),
                 graph,
-            )?;
+            );
             self.insert(
                 &dataset_node,
                 &sequence_index_pred(),
                 &Term::from(Literal::from(index as i64)),
                 graph,
-            )?;
+            );
 
             for (key, value) in &dataset.properties {
                 self.insert(
@@ -65,7 +65,7 @@ impl OxigraphCatalogCache {
                     &property_predicate(key),
                     &Term::from(Literal::from(value.clone())),
                     graph,
-                )?;
+                );
             }
 
             for (dist_index, distribution) in dataset.distributions.iter().enumerate() {
@@ -75,32 +75,32 @@ impl OxigraphCatalogCache {
                     &dcat_distribution_pred(),
                     &Term::from(distribution_node.clone()),
                     graph,
-                )?;
+                );
                 self.insert(
                     &distribution_node,
                     &rdf_type(),
                     &Term::from(dcat_distribution_class()),
                     graph,
-                )?;
+                );
                 self.insert(
                     &distribution_node,
                     &sequence_index_pred(),
                     &Term::from(Literal::from(dist_index as i64)),
                     graph,
-                )?;
+                );
                 self.insert(
                     &distribution_node,
                     &dct_format_pred(),
                     &Term::from(Literal::from(distribution.format.clone())),
                     graph,
-                )?;
+                );
                 let access_service_node = service_iri(&base, &distribution.access_service);
                 self.insert(
                     &distribution_node,
                     &dcat_access_service_pred(),
                     &Term::from(access_service_node),
                     graph,
-                )?;
+                );
             }
 
             for (policy_index, policy) in dataset.policies.iter().enumerate() {
@@ -110,7 +110,7 @@ impl OxigraphCatalogCache {
                     &odrl_has_policy_pred(),
                     &Term::from(policy_node.clone()),
                     graph,
-                )?;
+                );
                 self.write_policy(policy, &policy_node, policy_index, graph)?;
             }
         }
@@ -122,32 +122,32 @@ impl OxigraphCatalogCache {
                 &dcat_service_pred(),
                 &Term::from(service_node.clone()),
                 graph,
-            )?;
+            );
             self.insert(
                 &service_node,
                 &rdf_type(),
                 &Term::from(dcat_data_service_class()),
                 graph,
-            )?;
+            );
             self.insert(
                 &service_node,
                 &sequence_index_pred(),
                 &Term::from(Literal::from(index as i64)),
                 graph,
-            )?;
+            );
             self.insert(
                 &service_node,
                 &dcat_endpoint_url_pred(),
                 &iri_or_literal_term(&service.endpoint_url),
                 graph,
-            )?;
+            );
             if let Some(description) = &service.endpoint_description {
                 self.insert(
                     &service_node,
                     &dcat_endpoint_description_pred(),
                     &Term::from(Literal::from(description.clone())),
                     graph,
-                )?;
+                );
             }
         }
 
@@ -169,20 +169,20 @@ impl OxigraphCatalogCache {
             &rdf_type(),
             &Term::from(odrl_policy_class(policy.kind)),
             graph,
-        )?;
+        );
         self.insert(
             policy_node,
             &sequence_index_pred(),
             &Term::from(Literal::from(index as i64)),
             graph,
-        )?;
+        );
         if let Some(id) = &policy.id {
             self.insert(
                 policy_node,
                 &policy_id_pred(),
                 &Term::from(Literal::from(id.clone())),
                 graph,
-            )?;
+            );
         }
         if let Some(assigner) = &policy.assigner {
             self.insert(
@@ -190,7 +190,7 @@ impl OxigraphCatalogCache {
                 &odrl_assigner_pred(),
                 &iri_or_literal_term(assigner),
                 graph,
-            )?;
+            );
         }
         if let Some(assignee) = &policy.assignee {
             self.insert(
@@ -198,7 +198,7 @@ impl OxigraphCatalogCache {
                 &odrl_assignee_pred(),
                 &iri_or_literal_term(assignee),
                 graph,
-            )?;
+            );
         }
 
         self.write_rules(
@@ -243,7 +243,7 @@ impl OxigraphCatalogCache {
                 predicate,
                 &Term::from(rule_node.clone()),
                 graph,
-            )?;
+            );
             self.write_rule(rule, &rule_node, index, graph)?;
         }
         Ok(())
@@ -261,13 +261,13 @@ impl OxigraphCatalogCache {
             &sequence_index_pred(),
             &Term::from(Literal::from(index as i64)),
             graph,
-        )?;
+        );
         self.insert(
             rule_node,
             &odrl_action_pred(),
             &iri_or_literal_term(&rule.action),
             graph,
-        )?;
+        );
         for (index, constraint) in rule.constraints.iter().enumerate() {
             let constraint_node = constraint_iri(rule_node.as_str(), index);
             self.insert(
@@ -275,7 +275,7 @@ impl OxigraphCatalogCache {
                 &odrl_constraint_pred(),
                 &Term::from(constraint_node.clone()),
                 graph,
-            )?;
+            );
             // 0: a rule's own top-level constraints are depth 0, the
             // same numbering `crawler::parse_constraint` uses for a
             // rule's top-level `constraint` entries.
@@ -322,7 +322,7 @@ impl OxigraphCatalogCache {
             &sequence_index_pred(),
             &Term::from(Literal::from(index as i64)),
             graph,
-        )?;
+        );
         match constraint {
             Constraint::Atomic(atomic) => {
                 self.insert(
@@ -330,19 +330,19 @@ impl OxigraphCatalogCache {
                     &odrl_left_operand_pred(),
                     &iri_or_literal_term(&atomic.left_operand),
                     graph,
-                )?;
+                );
                 self.insert(
                     constraint_node,
                     &odrl_operator_pred(),
                     &iri_or_literal_term(&atomic.operator),
                     graph,
-                )?;
+                );
                 self.insert(
                     constraint_node,
                     &odrl_right_operand_pred(),
                     &Term::from(Literal::from(atomic.right_operand.clone())),
                     graph,
-                )?;
+                );
             }
             Constraint::Logical(logical) => {
                 let (predicate, children): (NamedNode, &[Constraint]) = match logical {
@@ -359,7 +359,7 @@ impl OxigraphCatalogCache {
                     &logical_operator_pred(),
                     &Term::from(predicate.clone()),
                     graph,
-                )?;
+                );
                 for (child_index, child) in children.iter().enumerate() {
                     let child_node = constraint_iri(constraint_node.as_str(), child_index);
                     self.insert(
@@ -367,7 +367,7 @@ impl OxigraphCatalogCache {
                         &predicate,
                         &Term::from(child_node.clone()),
                         graph,
-                    )?;
+                    );
                     self.write_constraint(child, &child_node, child_index, depth + 1, graph)?;
                 }
             }

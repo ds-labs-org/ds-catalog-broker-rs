@@ -57,8 +57,7 @@
 //! an error.
 //!
 //! Recursion depth - both writing and reading - is bounded by
-//! `MAX_CONSTRAINT_DEPTH` (64), the exact same bound and rationale as
-//! `crawler::MAX_CONSTRAINT_DEPTH` and
+//! `catalog_core::MAX_CONSTRAINT_DEPTH` (64), the same bound as
 //! `ds-odrl-engine-rs::engine::constraint::MAX_CONSTRAINT_DEPTH`: a
 //! catalog holding a constraint nested past the bound is refused on
 //! upsert, and nothing of it is written: dropping the over-deep child
@@ -230,8 +229,8 @@
 //!
 //!   Each `<child>` is itself a full constraint resource (see "Resource
 //!   IRIs" above), recursively either shape again - up to
-//!   `MAX_CONSTRAINT_DEPTH` (64) levels deep, matching
-//!   `crawler::MAX_CONSTRAINT_DEPTH`; an upsert holding a child nested
+//!   `MAX_CONSTRAINT_DEPTH` (64) levels deep, the
+//!   shared `catalog_core::MAX_CONSTRAINT_DEPTH`; an upsert holding a child nested
 //!   past that bound fails and writes nothing.
 //!
 //! For each distribution resource `<distribution>` (from
@@ -341,7 +340,8 @@
 use async_trait::async_trait;
 use catalog_core::{Catalog, NodeId};
 use catalog_core::{
-    Constraint, DataService, Dataset, Distribution, LogicalConstraint, Policy, PolicyKind, Rule,
+    Constraint, DataService, Dataset, Distribution, LOGICAL_CONSTRAINT_BUILDERS, LogicalConstraint,
+    LogicalConstraintBuilder, MAX_CONSTRAINT_DEPTH, Policy, PolicyKind, Rule,
 };
 use contreforts_kg::GraphError;
 use contreforts_kg::store::GraphStore;
@@ -367,22 +367,6 @@ const DCAT_NS: &str = "http://www.w3.org/ns/dcat#";
 const DCT_NS: &str = "http://purl.org/dc/terms/";
 const ODRL_NS: &str = "http://www.w3.org/ns/odrl/2/";
 const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-
-/// Bounds how many nested `odrl:and`/`odrl:or`/`odrl:xone`/
-/// `odrl:andSequence` levels [`OxigraphCatalogCache::write_constraint`]
-/// and [`OxigraphCatalogCache::load_constraint`] will recurse into for
-/// one constraint tree - the exact same value and rationale as
-/// `crawler::MAX_CONSTRAINT_DEPTH` (deliberately kept in sync with it,
-/// and in turn with `ds-odrl-engine-rs::engine::constraint::MAX_CONSTRAINT_DEPTH`):
-/// a policy this store persists but the engine would then refuse to
-/// evaluate (or vice versa) would be a confusing, hard-to-diagnose
-/// mismatch between "stored" and "enforceable" for the exact same
-/// input. Applied independently of `crawler`'s own bound - a
-/// `Constraint` tree can reach this store from any caller, not only
-/// `crawler::parse_catalog_response`, so this store defends its own
-/// write/read recursion rather than trusting an upstream producer to
-/// have already bounded it.
-const MAX_CONSTRAINT_DEPTH: usize = 64;
 
 impl From<GraphError> for StoreError {
     fn from(err: GraphError) -> Self {
@@ -599,7 +583,20 @@ impl OxigraphCatalogCache {
         object: Option<&Term>,
         graph: &GraphSnapshot,
     ) -> StoreResult<Vec<Quad>> {
-        let candidates: Box<dyn Iterator<Item = &Quad>> = match subject {
+        Ok(Self::matching_quads(subject, predicate, object, graph)
+            .cloned()
+            .collect())
+    }
+
+    /// The quads of `graph` matching the given subject, predicate and
+    /// object, without copying them.
+    fn matching_quads<'a>(
+        subject: Option<&NamedNode>,
+        predicate: Option<&'a NamedNode>,
+        object: Option<&'a Term>,
+        graph: &'a GraphSnapshot,
+    ) -> impl Iterator<Item = &'a Quad> {
+        let candidates: Box<dyn Iterator<Item = &'a Quad> + 'a> = match subject {
             Some(subject) => Box::new(
                 graph
                     .by_subject
@@ -610,13 +607,10 @@ impl OxigraphCatalogCache {
             ),
             None => Box::new(graph.quads.iter()),
         };
-        Ok(candidates
-            .filter(|quad| {
-                predicate.is_none_or(|p| &quad.predicate == p)
-                    && object.is_none_or(|o| &quad.object == o)
-            })
-            .cloned()
-            .collect())
+        candidates.filter(move |quad| {
+            predicate.is_none_or(|p| &quad.predicate == p)
+                && object.is_none_or(|o| &quad.object == o)
+        })
     }
 
     /// The first object found for `(subject, predicate, ?)` in `graph`,
@@ -627,11 +621,11 @@ impl OxigraphCatalogCache {
         predicate: &NamedNode,
         graph: &GraphSnapshot,
     ) -> StoreResult<Option<Term>> {
-        Ok(self
-            .quads(Some(subject), Some(predicate), None, graph)?
-            .into_iter()
-            .next()
-            .map(|quad| quad.object))
+        Ok(
+            Self::matching_quads(Some(subject), Some(predicate), None, graph)
+                .next()
+                .map(|quad| quad.object.clone()),
+        )
     }
 
     fn sequence_index(&self, subject: &NamedNode, graph: &GraphSnapshot) -> StoreResult<usize> {
@@ -662,14 +656,13 @@ impl OxigraphCatalogCache {
         predicate: &NamedNode,
         object: &Term,
         graph: &mut GraphWrite,
-    ) -> StoreResult<()> {
+    ) {
         graph.quads.push(Quad::new(
             subject.clone(),
             predicate.clone(),
             object.clone(),
             graph.name.clone(),
         ));
-        Ok(())
     }
 }
 

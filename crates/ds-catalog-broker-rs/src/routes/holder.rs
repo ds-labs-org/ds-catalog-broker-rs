@@ -3,10 +3,11 @@
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 
+use super::auth::bearer_token;
 use crate::AppState;
 
 /// `GET /dsp/holder/did.json` - this connector's own holder `did:web`
@@ -38,13 +39,7 @@ pub(super) async fn holder_presentation_query_route(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let token = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|token| !token.is_empty());
-    let Some(token) = token else {
+    let Some(token) = bearer_token(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 

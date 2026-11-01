@@ -145,11 +145,30 @@ async fn ready_before_the_first_cycle_when_a_holder_must_answer_callbacks() {
     ));
     let state = test_state()
         .with_holder(Some(holder))
+        .with_crawl_needs_holder_callbacks(true)
         .with_crawl_status(Some(SharedCrawlStatus::default()));
     let (status, body) = get_ready(state).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ready");
     assert_eq!(body["crawler"]["cycles_completed"], 0);
+}
+
+/// A holder with every participant on `credentialProtocol none` receives no
+/// callback, so readiness still waits for the first cycle.
+#[tokio::test]
+async fn not_ready_before_the_first_cycle_when_a_holder_is_configured_but_unused() {
+    let holder = Arc::new(crate::HolderIdentity::new(
+        "broker.example".to_string(),
+        false,
+        "header.payload.signature".to_string(),
+        "scope".to_string(),
+    ));
+    let state = test_state()
+        .with_holder(Some(holder))
+        .with_crawl_status(Some(SharedCrawlStatus::default()));
+    let (status, body) = get_ready(state).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["status"], "starting");
 }
 
 /// Once shutdown has started, `/ready` fails so traffic drains away.

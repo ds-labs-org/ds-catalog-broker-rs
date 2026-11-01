@@ -61,6 +61,12 @@ pub struct AppState {
     /// runs (no `broker:participant`), in which case the broker is ready
     /// as soon as it serves.
     pub crawl_status: Option<crawler::SharedCrawlStatus>,
+    /// True when a participant's `credentialProtocol` is `dcp` or `oid4vp`,
+    /// so its crawl needs the remote side to call back into
+    /// `/dsp/holder/*` on this broker. `GET /ready` then does not wait for
+    /// the first crawl cycle. A holder alone does not set it: with every
+    /// participant on `none` no callback happens.
+    pub crawl_needs_holder_callbacks: bool,
     /// Cancelled when the broker starts shutting down; from then on
     /// `GET /ready` answers 503 `stopping`. `None` in tests that never stop.
     pub shutdown: Option<tokio_util::sync::CancellationToken>,
@@ -175,6 +181,7 @@ impl AppState {
                 std::thread::available_parallelism().map_or(2, |n| n.get().max(2)),
             )),
             crawl_status: None,
+            crawl_needs_holder_callbacks: false,
             shutdown: None,
             draining: None,
         }
@@ -217,6 +224,12 @@ impl AppState {
     /// `crawl_status` field's doc comment.
     pub fn with_crawl_status(mut self, crawl_status: Option<crawler::SharedCrawlStatus>) -> Self {
         self.crawl_status = crawl_status;
+        self
+    }
+
+    /// Builder-style setter for [`AppState::crawl_needs_holder_callbacks`].
+    pub fn with_crawl_needs_holder_callbacks(mut self, needs: bool) -> Self {
+        self.crawl_needs_holder_callbacks = needs;
         self
     }
 

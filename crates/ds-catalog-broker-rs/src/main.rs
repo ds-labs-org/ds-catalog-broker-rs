@@ -3,6 +3,7 @@ use std::sync::Arc;
 use ds_catalog_broker_rs::config::{self, BrokerSettings};
 use ds_catalog_broker_rs::oauth2::{OAuth2Config, OAuth2Verifier};
 use ds_catalog_broker_rs::odrl_filter::PolicyFilterConfig;
+use ds_catalog_broker_rs::signals::Signals;
 use std::future::IntoFuture;
 
 use ds_catalog_broker_rs::{
@@ -74,12 +75,16 @@ async fn main() {
     // `GET /catalog`, the management API and `/sparql`; the crawler fills it
     // when the config lists participants. An unreadable holder credential
     // stops the broker on boot, like any other bad crawler config.
+
+    // Registered before anything else starts, so no signal is missed.
+    let signals = Signals::install();
     let shutdown = CancellationToken::new();
     let draining = CancellationToken::new();
     let serving::Serving {
         cache,
         holder,
         crawler,
+        crawl_needs_holder_callbacks,
     } = serving::start(&settings, &http_client, shutdown.clone())
         .unwrap_or_else(|err| panic!("failed to start serving: {err}"));
 
@@ -89,6 +94,7 @@ async fn main() {
         .with_policy_filter(PolicyFilterConfig::from_settings(&settings))
         .with_sparql_limits(SparqlLimitsConfig::from_settings(&settings))
         .with_crawl_status(crawler.as_ref().map(|c| c.status.clone()))
+        .with_crawl_needs_holder_callbacks(crawl_needs_holder_callbacks)
         .with_shutdown(shutdown.clone())
         .with_draining(draining.clone());
     state.http = http_client;
@@ -99,7 +105,7 @@ async fn main() {
         .unwrap_or_else(|err| panic!("failed to bind {addr}: {err}"));
     tracing::info!("ds-catalog-broker-rs listening on {addr}");
 
-    tokio::spawn(handle_signals(shutdown.clone()));
+    tokio::spawn(handle_signals(signals, shutdown.clone()));
     // On SIGTERM or SIGINT: /ready starts failing and the crawler stops
     // (interrupting a cycle in flight); after broker:shutdownDelaySecs the
     // listener closes and in-flight requests are drained, with running
@@ -145,39 +151,11 @@ async fn main() {
 
 /// Cancel `shutdown` on the first SIGTERM or SIGINT (Ctrl-C), and exit at
 /// once on a second one, for when draining takes too long.
-async fn handle_signals(shutdown: CancellationToken) {
-    let first = next_signal().await;
+async fn handle_signals(mut signals: Signals, shutdown: CancellationToken) {
+    let first = signals.next().await;
     tracing::info!("{first} received; shutting down (send it again to exit at once)");
     shutdown.cancel();
-    let second = next_signal().await;
+    let second = signals.next().await;
     tracing::warn!("{second} received again; exiting without draining");
     std::process::exit(130);
-}
-
-/// Wait for the next SIGINT or SIGTERM and name it.
-async fn next_signal() -> &'static str {
-    let interrupt = async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::error!(error = %err, "cannot listen for SIGINT");
-            std::future::pending::<()>().await;
-        }
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "cannot listen for SIGTERM");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = interrupt => "SIGINT",
-        () = terminate => "SIGTERM",
-    }
 }

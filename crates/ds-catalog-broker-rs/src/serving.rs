@@ -23,6 +23,9 @@ pub struct Serving {
     /// one participant. It ends once the shutdown token passed to [`start`]
     /// is cancelled.
     pub crawler: Option<crawler::Scheduler>,
+    /// True when a participant uses `dcp` or `oid4vp`, so crawling it needs
+    /// the holder routes on this broker to be reachable.
+    pub crawl_needs_holder_callbacks: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,10 +51,15 @@ pub fn start(
             cache,
             holder: None,
             crawler: None,
+            crawl_needs_holder_callbacks: false,
         });
     };
 
     let holder = config.holder.as_ref().map(build_holder).transpose()?;
+    let crawl_needs_holder_callbacks = config
+        .participants
+        .iter()
+        .any(|p| p.credential_protocol != crawler::CredentialProtocol::None);
     let limits = crawl_limits_from_settings(settings);
     tracing::info!(
         participants = config.participants.len(),
@@ -74,6 +82,7 @@ pub fn start(
         cache,
         holder,
         crawler: Some(scheduler),
+        crawl_needs_holder_callbacks,
     })
 }
 
