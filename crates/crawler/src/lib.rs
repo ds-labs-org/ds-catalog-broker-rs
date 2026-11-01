@@ -449,6 +449,17 @@ async fn crawl_one(
     Ok(parse_catalog_response(&body, participant))
 }
 
+/// Whether a response's declared `participantId` contradicts the
+/// configured identity. Only a configured `provider_did` is a real
+/// expectation. Without one the local `broker:participantId` is not what
+/// the participant declares about itself, so there is nothing to compare.
+fn participant_id_mismatch(participant: &ParticipantEntry, declared: &str) -> bool {
+    participant
+        .provider_did
+        .as_deref()
+        .is_some_and(|did| did != declared)
+}
+
 /// Parse a DSP catalog-request response body into a `catalog_core::Catalog`,
 /// leniently enough to accept either this workspace's own compact DSP
 /// shape or real Eclipse EDC's fuller one. Notably: EDC's `accessService`
@@ -525,6 +536,10 @@ async fn crawl_one(
 /// nested response (empty top-level `dataset`/`service`, matching what
 /// `catalog_request` now does for 2+ cached origin nodes) would parse as
 /// an apparently-empty catalog.
+///
+/// `Catalog::participant_id` is the participant's configured
+/// `provider_did` (`None` when not configured, so consumers fall back to the
+/// origin node id). The response's own `participantId` is not adopted.
 fn parse_catalog_response(value: &Value, participant: &ParticipantEntry) -> Catalog {
     let id = value
         .get("@id")
@@ -533,10 +548,26 @@ fn parse_catalog_response(value: &Value, participant: &ParticipantEntry) -> Cata
         .unwrap_or_else(|| format!("urn:uuid:{}", uuid::Uuid::new_v4()));
 
     let mut catalog = Catalog::new(id, NodeId::new(participant.id.clone()));
-    catalog.participant_id = value
-        .get("participantId")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    // The identity is the configured one. A participant's own response may
+    // claim any `participantId`, so it is never adopted; a mismatch is only
+    // logged.
+    catalog.participant_id = participant.provider_did.clone();
+    if let Some(declared) = value.get("participantId").and_then(Value::as_str) {
+        if participant_id_mismatch(participant, declared) {
+            tracing::warn!(
+                participant = %participant.id,
+                declared,
+                "crawled response declares a participantId that differs from the configured \
+                 providerDid; the declared value is ignored"
+            );
+        } else if participant.provider_did.is_none() {
+            tracing::debug!(
+                participant = %participant.id,
+                declared,
+                "no providerDid configured; the declared participantId is ignored"
+            );
+        }
+    }
 
     collect_datasets_and_services(value, &mut catalog, &mut SeenIds::default());
 
@@ -1225,6 +1256,52 @@ mod tests {
         })
     }
 
+    /// The declared `participantId` is only compared with a configured
+    /// `providerDid`. Without one, an EDC participant declares its own id,
+    /// which never equals the local `broker:participantId`.
+    #[test]
+    fn participant_id_mismatch_needs_a_configured_provider_did() {
+        let mut configured = participant("p1");
+        configured.provider_did = Some("did:web:p1.example".to_string());
+        assert!(participant_id_mismatch(&configured, "did:web:other"));
+        assert!(!participant_id_mismatch(&configured, "did:web:p1.example"));
+
+        let unconfigured = participant("p1");
+        assert!(!participant_id_mismatch(
+            &unconfigured,
+            "did:web:p1.example"
+        ));
+        assert!(!participant_id_mismatch(&unconfigured, "p1"));
+    }
+
+    #[test]
+    fn catalog_identity_is_the_configured_provider_did_not_the_declared_participant_id() {
+        let mut entry = participant("node-a");
+        entry.provider_did = Some("did:web:node-a.example".to_string());
+        let body = serde_json::json!({
+            "@id": "cat",
+            "participantId": "did:web:trusted-b",
+            "dataset": [], "service": []
+        });
+        let catalog = parse_catalog_response(&body, &entry);
+        assert_eq!(
+            catalog.participant_id.as_deref(),
+            Some("did:web:node-a.example")
+        );
+    }
+
+    #[test]
+    fn declared_participant_id_is_ignored_without_a_configured_did() {
+        let body = serde_json::json!({
+            "@id": "cat",
+            "participantId": "did:web:trusted-b",
+            "dataset": [], "service": []
+        });
+        let catalog = parse_catalog_response(&body, &participant("node-a"));
+        assert_eq!(catalog.participant_id, None);
+        assert_eq!(catalog.origin_node, NodeId::new("node-a"));
+    }
+
     #[test]
     fn parses_real_edc_shaped_response_with_nested_access_service_object() {
         let participant = participant("edc-participant");
@@ -1232,10 +1309,9 @@ mod tests {
 
         assert_eq!(catalog.id, "6d3d7a0c-bf06-4160-839f-853350446179");
         assert_eq!(catalog.origin_node, NodeId::new("edc-participant"));
-        assert_eq!(
-            catalog.participant_id.as_deref(),
-            Some("CONNECTOR_UNDER_TEST")
-        );
+        // No configured identity for this participant: the response's own
+        // `participantId` is not adopted.
+        assert_eq!(catalog.participant_id, None);
 
         assert_eq!(catalog.datasets.len(), 1);
         let dataset = &catalog.datasets[0];
@@ -1429,16 +1505,13 @@ mod tests {
 
         // One Catalog per configured target participant is this crate's
         // own model - nested sub-participant identity isn't preserved,
-        // only that the data isn't dropped. The outer wrapper's own
-        // participantId is what's kept.
+        // only that the data isn't dropped. The wrapper's declared
+        // participantId is not adopted (no configured identity).
         assert_eq!(
             catalog.origin_node,
             NodeId::new("upstream-aggregator-participant")
         );
-        assert_eq!(
-            catalog.participant_id.as_deref(),
-            Some("urn:connector:upstream-aggregator")
-        );
+        assert_eq!(catalog.participant_id, None);
 
         let mut dataset_ids: Vec<&str> = catalog.datasets.iter().map(|d| d.id.as_str()).collect();
         dataset_ids.sort();

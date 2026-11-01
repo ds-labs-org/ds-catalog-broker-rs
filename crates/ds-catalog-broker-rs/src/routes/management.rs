@@ -156,9 +156,10 @@ pub(super) struct CatalogRequestParticipantId {
 /// Field mapping notes (everything not explicitly called out is a direct
 /// copy):
 /// - `participantId`/`originator`: `catalog.participant_id` when the crawl
-///   recorded one (a DID, typically), else `catalog.origin_node`'s id - the
-///   best identifier this product actually has for who this catalog came
-///   from.
+///   recorded one, else `catalog.origin_node`'s id. The crawler records the
+///   configured participant's `provider_did` there and never the identity
+///   the crawled response declares for itself, so a participant cannot
+///   have its datasets offered under another participant's id.
 /// - dataset `name`/`contenttype`: `catalog_core::Dataset` has no separate
 ///   "name" or "content type" field, so `name` is `dataset.id` (the best
 ///   available stand-in) and `contenttype` is the first distribution's
@@ -225,12 +226,9 @@ pub(super) fn catalog_to_offer(catalog: &Catalog) -> Option<CatalogRequestOffer>
 /// - each atomic `Constraint` -> `{"leftOperand": ..., "operator": ...,
 ///   "rightOperand": ...}`, all three always present - the real
 ///   `AtomicConstraint` requires all three with no defaults. A `Logical`
-///   `catalog_core::Constraint` (gap analysis §3.4 - `Constraint` now
-///   models both shapes, see its own doc comment) is skipped here rather
-///   than mis-emitted as if it were atomic: mapping a logical group to the
-///   real client's own `MultiplicityConstraint` wire shape is separate,
-///   not-yet-done work this route does not perform yet, and no current
-///   producer constructs a `Logical` constraint in the first place.
+///   `catalog_core::Constraint` is served as the real client's
+///   `MultiplicityConstraint` shape (`{"and"|"or"|"xone": [...]}`), nested
+///   groups included; see `constraint_to_json`.
 pub(super) fn policy_to_json(policy: &Policy) -> serde_json::Value {
     let kind = match policy.kind {
         PolicyKind::Set => "Set",
@@ -286,18 +284,70 @@ pub(super) fn rule_to_json(rule: &Rule) -> serde_json::Value {
         value["constraint"] = serde_json::Value::Array(
             rule.constraints
                 .iter()
-                .filter_map(|constraint| match constraint {
-                    catalog_core::Constraint::Atomic(atomic) => Some(serde_json::json!({
-                        "leftOperand": atomic.left_operand,
-                        "operator": atomic.operator,
-                        "rightOperand": atomic.right_operand,
-                    })),
-                    catalog_core::Constraint::Logical(_) => None,
-                })
+                .map(|constraint| constraint_to_json(constraint, 0))
                 .collect(),
         );
     }
     value
+}
+
+/// Deepest chain of logical groups served. The crawler accepts 64 levels,
+/// but serde_json refuses documents nested past 128 levels and every group
+/// costs two JSON levels (object plus array). The route adds 9 levels
+/// around the first constraint array (response array, offer, dataset array,
+/// dataset, hasPolicy array, policy, permission array, permission,
+/// constraint array) and the innermost atomic constraint adds 1. With 56
+/// served groups the deepest document is 9 + 112 + 1 = 122 levels, which
+/// leaves room for a consumer that embeds this response in one more
+/// wrapper level (123) and 5 spare. Groups nested further are served as
+/// the unmappable marker. This limits the served form only; stored
+/// policies and filtering still see the full tree.
+pub(super) const MAX_SERVED_GROUP_DEPTH: usize = 56;
+
+/// One constraint as the real client's wire shape: an atomic constraint as
+/// `{leftOperand, operator, rightOperand}`, a logical group as
+/// `{"and"|"or"|"xone": [children...]}` with the children serialized
+/// recursively. The real client has no `andSequence`; it is served as
+/// `and`, which keeps every child instead of dropping the group (it loses
+/// only the ordering requirement).
+///
+/// `group_depth` is the number of enclosing groups. A group at
+/// `MAX_SERVED_GROUP_DEPTH` is served as the unmappable marker constraint
+/// instead, so the rule stays constrained (the configured unmappable
+/// action applies) and the response stays parseable.
+fn constraint_to_json(
+    constraint: &catalog_core::Constraint,
+    group_depth: usize,
+) -> serde_json::Value {
+    match constraint {
+        catalog_core::Constraint::Logical(_) if group_depth >= MAX_SERVED_GROUP_DEPTH => {
+            constraint_to_json(
+                &catalog_core::Constraint::unmappable(
+                    "logical group nested beyond the served depth limit",
+                ),
+                group_depth,
+            )
+        }
+        catalog_core::Constraint::Atomic(atomic) => serde_json::json!({
+            "leftOperand": atomic.left_operand,
+            "operator": atomic.operator,
+            "rightOperand": atomic.right_operand,
+        }),
+        catalog_core::Constraint::Logical(logical) => {
+            let (key, children) = match logical {
+                catalog_core::LogicalConstraint::And(children)
+                | catalog_core::LogicalConstraint::AndSequence(children) => ("and", children),
+                catalog_core::LogicalConstraint::Or(children) => ("or", children),
+                catalog_core::LogicalConstraint::Xone(children) => ("xone", children),
+            };
+            serde_json::json!({
+                key: children
+                    .iter()
+                    .map(|child| constraint_to_json(child, group_depth + 1))
+                    .collect::<Vec<_>>()
+            })
+        }
+    }
 }
 
 /// Reads the optional descriptive properties `crawler::collect_datasets_and_services`
