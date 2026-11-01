@@ -391,7 +391,8 @@ impl BrokerSettings {
         let mut properties = graph.properties(&config)?;
         let participants = properties.remove(PARTICIPANT_LINK).unwrap_or_default();
         let holders = properties.remove(HOLDER_LINK).unwrap_or_default();
-        let values = single_values(&resource, properties)?
+        let known: Vec<&str> = ALL_SETTINGS.iter().map(|s| s.property).collect();
+        let values = single_values(&resource, properties, &known)?
             .into_iter()
             .map(|(property, term)| (property, term_value(&term)));
         let mut settings = Self::from_values(values);
@@ -408,6 +409,8 @@ impl BrokerSettings {
         participants: Vec<Term>,
         holders: Vec<Term>,
     ) -> Result<Option<ParticipantsConfig>, BrokerConfigError> {
+        reject_unlinked(graph, &participants, "Participant", PARTICIPANT_LINK)?;
+        reject_unlinked(graph, &holders, "Holder", HOLDER_LINK)?;
         if holders.len() > 1 {
             return Err(BrokerConfigError::MultipleValues {
                 resource: resource.to_string(),
@@ -595,21 +598,66 @@ fn term_value(term: &Term) -> String {
     }
 }
 
-/// How a resource is named in an error message.
-fn describe(node: &NamedOrBlankNode) -> String {
+/// How a resource is named in an error message: its IRI, or for a blank node its
+/// `broker:participantId` when it has one.
+fn describe(graph: &ConfigGraph<'_>, node: &NamedOrBlankNode) -> String {
     match node {
         NamedOrBlankNode::NamedNode(node) => format!("<{}>", node.as_str()),
-        NamedOrBlankNode::BlankNode(_) => "a blank node".to_string(),
+        NamedOrBlankNode::BlankNode(_) => {
+            let id = graph.properties(node).ok().and_then(|mut properties| {
+                match properties.remove(PARTICIPANT_ID)?.as_slice() {
+                    [Term::Literal(literal)] => Some(literal.value().to_string()),
+                    _ => None,
+                }
+            });
+            match id {
+                Some(id) => format!("(blank node with broker:{PARTICIPANT_ID} {id:?})"),
+                None => "(blank node)".to_string(),
+            }
+        }
     }
 }
 
-/// Reject any property with more than one value.
+/// Fail on a `broker:<class>` resource that no `broker:<property>` link in `linked` points to:
+/// it was meant to be configured, but would be silently ignored.
+fn reject_unlinked(
+    graph: &ConfigGraph<'_>,
+    linked: &[Term],
+    class: &str,
+    property: &str,
+) -> Result<(), BrokerConfigError> {
+    for subject in graph.subjects_of_type(class)? {
+        if !linked.contains(&Term::from(subject.clone())) {
+            return Err(BrokerConfigError::UnlinkedResource {
+                resource: describe(graph, &subject),
+                class: class.to_string(),
+                property: property.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Drop, with a warning, every property not in `known`, whatever its values; reject a known
+/// one with more than one value.
 fn single_values(
     resource: &str,
     properties: BTreeMap<String, Vec<Term>>,
+    known: &[&str],
 ) -> Result<BTreeMap<String, Term>, BrokerConfigError> {
     properties
         .into_iter()
+        .filter(|(property, _)| {
+            let is_known = known.contains(&property.as_str());
+            if !is_known {
+                tracing::warn!(
+                    property,
+                    resource,
+                    "unknown broker:{property} on {resource}; ignored"
+                );
+            }
+            is_known
+        })
         .map(|(property, mut terms)| {
             if terms.len() > 1 {
                 return Err(BrokerConfigError::MultipleValues {
@@ -642,7 +690,7 @@ fn linked(
     };
     if !graph.has_type(&node, class)? {
         return Err(BrokerConfigError::WrongType {
-            resource: describe(&node),
+            resource: describe(graph, &node),
             property: property.to_string(),
             expected: class.to_string(),
         });
@@ -650,11 +698,14 @@ fn linked(
     Ok(node)
 }
 
-/// A resource's single-valued `broker:` properties as strings, warning about unknown ones.
+/// A resource's known, single-valued `broker:` properties.
 struct Properties {
     resource: String,
-    values: BTreeMap<String, String>,
+    values: BTreeMap<String, Term>,
 }
+
+/// Properties whose value may be an IRI as well as a string literal.
+const IRI_VALUED: &[&str] = &[CATALOG_REQUEST_URL, OID4VP_RESPONSE_URI];
 
 impl Properties {
     fn read(
@@ -663,29 +714,30 @@ impl Properties {
         class: &str,
         known: &[&str],
     ) -> Result<Self, BrokerConfigError> {
-        let resource = format!("broker:{class} {}", describe(node));
-        let values: BTreeMap<String, String> = single_values(&resource, graph.properties(node)?)?
-            .into_iter()
-            .map(|(property, term)| (property, term_value(&term)))
-            .collect();
-        for property in values.keys() {
-            if !known.contains(&property.as_str()) {
-                tracing::warn!(
-                    property,
-                    resource,
-                    "unknown broker:{property} on {resource}; ignored"
-                );
-            }
-        }
+        let resource = format!("broker:{class} {}", describe(graph, node));
+        let values = single_values(&resource, graph.properties(node)?, known)?;
         Ok(Self { resource, values })
     }
 
-    fn optional(&self, property: &str) -> Option<String> {
-        self.values.get(property).cloned()
+    /// `property` as a string: a literal's lexical form, or an IRI for [`IRI_VALUED`]
+    /// properties. Anything else (a blank node, an IRI elsewhere) is an error.
+    fn optional(&self, property: &str) -> Result<Option<String>, BrokerConfigError> {
+        match self.values.get(property) {
+            None => Ok(None),
+            Some(Term::Literal(literal)) => Ok(Some(literal.value().to_string())),
+            Some(Term::NamedNode(node)) if IRI_VALUED.contains(&property) => {
+                Ok(Some(node.as_str().to_string()))
+            }
+            Some(other) => Err(self.invalid(
+                property,
+                other.to_string(),
+                "expected a string literal".to_string(),
+            )),
+        }
     }
 
     fn required(&self, property: &str) -> Result<String, BrokerConfigError> {
-        self.optional(property)
+        self.optional(property)?
             .ok_or_else(|| BrokerConfigError::MissingProperty {
                 resource: self.resource.clone(),
                 property: property.to_string(),
@@ -700,6 +752,49 @@ impl Properties {
             reason,
         }
     }
+
+    /// `broker:credentialJwsFile` as a local path: a path string, or a `file:` URL written as
+    /// a string or an IRI (a relative `<holder.jws>` resolves against the config's own
+    /// location).
+    fn credential_file(&self) -> Result<PathBuf, BrokerConfigError> {
+        let property = CREDENTIAL_JWS_FILE;
+        let invalid =
+            |value: String, reason: &str| self.invalid(property, value, reason.to_string());
+        let from_url = |raw: &str| match Url::parse(raw) {
+            Ok(url) if url.scheme() == "file" => url
+                .to_file_path()
+                .map(Some)
+                .map_err(|()| invalid(raw.to_string(), "not a local file path")),
+            Ok(_) => Err(invalid(
+                raw.to_string(),
+                "the credential must be a local file",
+            )),
+            Err(_) => Ok(None),
+        };
+        match self.values.get(property) {
+            None => Err(BrokerConfigError::MissingProperty {
+                resource: self.resource.clone(),
+                property: property.to_string(),
+            }),
+            Some(Term::Literal(literal)) => {
+                let raw = literal.value();
+                if raw.trim().is_empty() {
+                    return Err(invalid(raw.to_string(), "empty path"));
+                }
+                // Only a value that says `file:` or has an authority is a URL; a plain path
+                // such as `C:\holder.jws` would otherwise parse as one with scheme `c`.
+                let looks_like_url = raw
+                    .get(..5)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("file:"))
+                    || raw.contains("://");
+                let url_path = if looks_like_url { from_url(raw)? } else { None };
+                Ok(url_path.unwrap_or_else(|| PathBuf::from(raw)))
+            }
+            Some(Term::NamedNode(node)) => from_url(node.as_str())?
+                .ok_or_else(|| invalid(node.as_str().to_string(), "not a local file path")),
+            Some(other) => Err(invalid(other.to_string(), "expected a path or a file: IRI")),
+        }
+    }
 }
 
 fn read_participant(
@@ -707,7 +802,7 @@ fn read_participant(
     node: &NamedOrBlankNode,
 ) -> Result<ParticipantEntry, BrokerConfigError> {
     let props = Properties::read(graph, node, "Participant", PARTICIPANT_PROPERTIES)?;
-    let credential_protocol = match props.optional(CREDENTIAL_PROTOCOL) {
+    let credential_protocol = match props.optional(CREDENTIAL_PROTOCOL)? {
         Some(raw) => raw
             .parse::<CredentialProtocol>()
             .map_err(|err| props.invalid(CREDENTIAL_PROTOCOL, raw, err.to_string()))?,
@@ -718,8 +813,8 @@ fn read_participant(
         name: props.required(PARTICIPANT_NAME)?,
         catalog_request_url: props.required(CATALOG_REQUEST_URL)?,
         credential_protocol,
-        provider_did: props.optional(PROVIDER_DID),
-        oid4vp_response_uri: props.optional(OID4VP_RESPONSE_URI),
+        provider_did: props.optional(PROVIDER_DID)?,
+        oid4vp_response_uri: props.optional(OID4VP_RESPONSE_URI)?,
     })
 }
 
@@ -728,7 +823,7 @@ fn read_holder(
     node: &NamedOrBlankNode,
 ) -> Result<HolderConfig, BrokerConfigError> {
     let props = Properties::read(graph, node, "Holder", HOLDER_PROPERTIES)?;
-    let insecure_http = match props.optional(INSECURE_HTTP) {
+    let insecure_http = match props.optional(INSECURE_HTTP)? {
         None => false,
         Some(raw) => match raw.trim() {
             "true" | "1" => true,
@@ -736,29 +831,7 @@ fn read_holder(
             _ => return Err(props.invalid(INSECURE_HTTP, raw, "expected a boolean".to_string())),
         },
     };
-    // A `<file:...>` IRI (which a relative `<holder.jws>` resolves to, against the config
-    // file's own location) or a plain path string.
-    let raw_file = props.required(CREDENTIAL_JWS_FILE)?;
-    let credential_jws_file = if raw_file.starts_with("file:") {
-        Url::parse(&raw_file)
-            .ok()
-            .and_then(|url| url.to_file_path().ok())
-            .ok_or_else(|| {
-                props.invalid(
-                    CREDENTIAL_JWS_FILE,
-                    raw_file.clone(),
-                    "not a local file path".to_string(),
-                )
-            })?
-    } else if raw_file.contains("://") {
-        return Err(props.invalid(
-            CREDENTIAL_JWS_FILE,
-            raw_file,
-            "the credential must be a local file".to_string(),
-        ));
-    } else {
-        PathBuf::from(raw_file)
-    };
+    let credential_jws_file = props.credential_file()?;
     Ok(HolderConfig {
         own_did_host: props.required(OWN_DID_HOST)?,
         insecure_http,
