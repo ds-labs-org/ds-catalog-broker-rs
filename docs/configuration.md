@@ -12,7 +12,7 @@ vendored [`contreforts-config`](../vendor/contreforts-config) crate's
 |---|---|
 | `/etc/broker` or `file:///etc/broker` (a directory) | A `contreforts-config` datadir: `<dir>/config_graph.ttl` is read. |
 | `/etc/broker/broker.ttl` or `file:///etc/broker/broker.ttl` (a file) | That Turtle document. |
-| `https://config.example.org/broker.ttl` (or `http://`) | A Turtle document fetched once at startup with `Accept: text/turtle`. Relative IRIs in it resolve against the URL. |
+| `https://config.example.org/broker.ttl` | A Turtle document fetched once at startup with `Accept: text/turtle`. Relative IRIs in it resolve against the URL. Plain `http://` is accepted only for `localhost` or a loopback address: the config decides where the crawler sends its credential, so it must not be open to tampering in transit. |
 
 The broker never writes to its configuration. A datadir is read directly,
 not through `ConfigStore::open`, so a missing directory is not created and a
@@ -152,8 +152,11 @@ string (relative paths resolve against the broker's working directory), a
 resolves against the config's own location, so it works for a local config
 but not for one fetched over HTTP, where it becomes an `https` IRI. Any IRI
 that isn't `file:`, a blank node, or an empty string is rejected. The file is read
-once at startup, with surrounding whitespace trimmed; a missing or empty
-file stops the broker. Protect it with file permissions.
+once at startup, with surrounding whitespace trimmed. A missing or empty
+file stops the broker, and so does one that is not a compact JWS (three
+base64url segments, the first a JSON header naming an `alg` other than
+`none`). The error names the file but never shows what it holds. Protect
+it with file permissions.
 
 Like the settings above, these resources are read strictly. Each of the
 following stops the broker at startup:
