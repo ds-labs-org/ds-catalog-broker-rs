@@ -36,6 +36,7 @@ mod catalog;
 mod management;
 mod policy;
 mod sample;
+mod serving;
 mod sparql;
 mod sparql_policy;
 
