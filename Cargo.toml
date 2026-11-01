@@ -43,7 +43,10 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+# CancellationToken: one shutdown signal shared by the HTTP server and the
+# crawl scheduler. Already in the graph through hyper/h2.
+tokio-util = "0.7"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 # Used by crawler's crawl_once to crawl participants concurrently with a

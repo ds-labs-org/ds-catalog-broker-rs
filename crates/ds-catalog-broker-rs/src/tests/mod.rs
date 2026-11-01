@@ -35,6 +35,7 @@ mod bearer_gate;
 mod catalog;
 mod management;
 mod policy;
+mod ready;
 mod sample;
 mod serving;
 mod sparql;

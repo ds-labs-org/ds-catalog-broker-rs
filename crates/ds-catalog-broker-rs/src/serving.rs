@@ -2,9 +2,11 @@
 //! fills it when the config lists participants.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use dcp_core::HolderIdentity;
 use rdf_store::oxigraph_backend::OxigraphCatalogCache;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::BrokerSettings;
 use crate::crawl_limits_from_settings;
@@ -17,8 +19,10 @@ pub struct Serving {
     /// The crawler's holder identity, when the config has a `broker:holder`
     /// and at least one participant.
     pub holder: Option<Arc<HolderIdentity>>,
-    /// The crawl scheduler, when the config lists at least one participant.
-    pub crawler: Option<tokio::task::JoinHandle<()>>,
+    /// The crawl scheduler and its status, when the config lists at least
+    /// one participant. It ends once the shutdown token passed to [`start`]
+    /// is cancelled.
+    pub crawler: Option<crawler::Scheduler>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -30,8 +34,13 @@ pub enum ServingError {
 }
 
 /// Open the store and, when `settings` lists participants, start the crawl
-/// scheduler on it. Must be called inside a Tokio runtime.
-pub fn start(settings: &BrokerSettings, http: &reqwest::Client) -> Result<Serving, ServingError> {
+/// scheduler on it; cancelling `shutdown` stops the scheduler. Must be
+/// called inside a Tokio runtime.
+pub fn start(
+    settings: &BrokerSettings,
+    http: &reqwest::Client,
+    shutdown: CancellationToken,
+) -> Result<Serving, ServingError> {
     let cache = Arc::new(OxigraphCatalogCache::in_memory()?);
     let Some(config) = settings.crawler().cloned() else {
         tracing::info!("no broker:participant configured; the catalog stays empty");
@@ -53,12 +62,18 @@ pub fn start(settings: &BrokerSettings, http: &reqwest::Client) -> Result<Servin
         max_catalog_age_secs = limits.max_catalog_age.as_secs(),
         "starting scheduled catalog crawler"
     );
-    let crawler =
-        crawler::spawn_scheduler(cache.clone(), config, http.clone(), holder.clone(), limits);
+    let scheduler = crawler::spawn_scheduler(
+        cache.clone(),
+        config,
+        http.clone(),
+        holder.clone(),
+        limits,
+        shutdown,
+    );
     Ok(Serving {
         cache,
         holder,
-        crawler: Some(crawler),
+        crawler: Some(scheduler),
     })
 }
 
@@ -71,4 +86,19 @@ fn build_holder(holder: &crawler::HolderConfig) -> Result<Arc<HolderIdentity>, S
         holder.read_credential_jws()?,
         holder.required_scope.clone(),
     )))
+}
+
+/// The future `main` hands to axum's graceful shutdown: it completes
+/// `delay` after `shutdown` is cancelled. In between, `/ready` already
+/// answers 503, so a load balancer stops routing new requests before the
+/// listener closes.
+pub async fn stop_after(shutdown: CancellationToken, delay: Duration) {
+    shutdown.cancelled().await;
+    if !delay.is_zero() {
+        tracing::info!(
+            delay_secs = delay.as_secs(),
+            "shutting down; /ready now fails, closing the listener after the delay"
+        );
+        tokio::time::sleep(delay).await;
+    }
 }

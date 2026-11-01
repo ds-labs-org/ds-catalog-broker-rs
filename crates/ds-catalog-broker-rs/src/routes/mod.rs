@@ -13,6 +13,7 @@ pub(crate) mod catalog;
 mod holder;
 mod management;
 pub(crate) mod policy;
+mod ready;
 mod sparql;
 
 use catalog::get_catalog;
@@ -25,6 +26,7 @@ use sparql::{sparql_route_get, sparql_route_post};
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready::ready))
         .route("/catalog", get(get_catalog))
         // The SPARQL 1.1 Protocol query surface (gap analysis §3.3) - see
         // `sparql_route`'s own doc comment for the exact request/response

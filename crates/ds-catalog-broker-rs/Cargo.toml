@@ -19,6 +19,7 @@ axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
@@ -52,6 +53,8 @@ contreforts-core = { workspace = true }
 oxigraph = { workspace = true }
 
 [dev-dependencies]
+# start_paused tests for the shutdown delay.
+tokio = { workspace = true, features = ["test-util"] }
 # A throwaway config store datadir per test in src/config.rs.
 tempfile = "3"
 tower = { workspace = true }

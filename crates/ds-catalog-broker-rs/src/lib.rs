@@ -21,4 +21,6 @@ mod tests;
 pub use dcp_core::HolderIdentity;
 pub use oauth2::{OAuth2Config, OAuth2Verifier, VerifyError};
 pub use routes::build_router;
-pub use state::{AppState, SparqlLimitsConfig, crawl_limits_from_settings};
+pub use state::{
+    AppState, SparqlLimitsConfig, crawl_limits_from_settings, shutdown_delay_from_settings,
+};

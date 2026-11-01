@@ -1,0 +1,9 @@
+target
+.git
+**/target
+**/.gradle
+**/build
+**/node_modules
+# Only tests read these.
+compliance
+docs
