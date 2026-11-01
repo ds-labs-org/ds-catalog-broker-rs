@@ -1156,3 +1156,76 @@ fn policy_filtered_query_drops_partial_progress_after_a_write() {
         .unwrap();
     assert_eq!(calls, 3);
 }
+
+/// A catalog with `count` public datasets titled `d-0`, `d-1`, ...
+fn many_datasets_catalog(count: usize) -> Catalog {
+    let mut catalog = Catalog::new("cat-many", NodeId::new("node-many"));
+    for index in 0..count {
+        let mut properties = BTreeMap::new();
+        properties.insert("title".to_string(), format!("d-{index}"));
+        catalog.datasets.push(Dataset {
+            id: format!("ds-{index}"),
+            properties,
+            distributions: Vec::new(),
+            policies: Vec::new(),
+        });
+    }
+    catalog
+}
+
+/// An allow-list callback that, like the broker's, stops deciding datasets
+/// once `cancelled` is true and returns what it has so far.
+fn allow_until_cancelled(catalog: &Catalog, cancelled: &dyn Fn() -> bool) -> BTreeSet<String> {
+    let mut visible = BTreeSet::new();
+    for dataset in &catalog.datasets {
+        if cancelled() {
+            return visible;
+        }
+        visible.insert(dataset_resource_iri(&catalog.origin_node, &dataset.id));
+    }
+    visible
+}
+
+/// A request cancelled while one catalog is being decided gets a partial
+/// result for it. That catalog must not be recorded as decided: the
+/// resumed build, same key and write sequence, has to decide it again.
+#[test]
+fn policy_filtered_query_resumes_a_catalog_cancelled_mid_decision() {
+    let cache = cache();
+    cache.store_catalog(many_datasets_catalog(6)).unwrap();
+    let token = CancellationToken::new();
+    let limits = SparqlLimits {
+        cancellation: Some(token.clone()),
+        ..SparqlLimits::default()
+    };
+    let seen = std::cell::Cell::new(0);
+    let cancelled = || {
+        seen.set(seen.get() + 1);
+        if seen.get() > 3 {
+            token.cancel();
+        }
+        token.is_cancelled()
+    };
+    let result = cache.sparql_query_json_policy_filtered(
+        TITLES,
+        "k",
+        |catalog| allow_until_cancelled(catalog, &cancelled),
+        &limits,
+    );
+    assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            TITLES,
+            "k",
+            |catalog| allow_until_cancelled(catalog, &|| false),
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    let values = binding_values(&body);
+    for index in 0..6 {
+        assert!(
+            values.iter().any(|v| v == &format!("d-{index}")),
+            "d-{index} missing: {values:?}"
+        );
+    }
+}
