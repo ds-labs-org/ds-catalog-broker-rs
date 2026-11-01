@@ -10,7 +10,9 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use serde_json::{Value, json};
-use wasmi::{Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
+use wasmi::{
+    Engine, Instance, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc,
+};
 
 fn wasm_bytes() -> &'static [u8] {
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
@@ -42,7 +44,7 @@ fn wasm_bytes() -> &'static [u8] {
 }
 
 struct Guest {
-    store: Store<()>,
+    store: Store<StoreLimits>,
     memory: Memory,
     alloc: TypedFunc<i32, i32>,
     dealloc: TypedFunc<(i32, i32), ()>,
@@ -51,10 +53,15 @@ struct Guest {
 
 impl Guest {
     fn new() -> Self {
+        Self::with_limits(StoreLimitsBuilder::new().build())
+    }
+
+    fn with_limits(limits: StoreLimits) -> Self {
         let engine = Engine::default();
         let module = Module::new(&engine, wasm_bytes()).expect("valid wasm module");
-        let mut store = Store::new(&engine, ());
-        let linker = <Linker<()>>::new(&engine);
+        let mut store = Store::new(&engine, limits);
+        store.limiter(|limits| limits);
+        let linker = <Linker<StoreLimits>>::new(&engine);
         let instance: Instance = linker
             .instantiate_and_start(&mut store, &module)
             .expect("module instantiates with no imports");
@@ -196,6 +203,26 @@ fn negative_alloc_length_is_clamped_not_a_huge_allocation() {
         .dealloc
         .call(&mut guest.store, (ptr, -1))
         .expect("dealloc(ptr, -1) does not trap");
+}
+
+/// The host caps the guest's memory at 8 MiB, so a 64 MiB allocation cannot
+/// be served. The guest must report that with a null pointer, not trap.
+#[test]
+fn unservable_alloc_returns_null_instead_of_trapping() {
+    let mut guest = Guest::with_limits(
+        StoreLimitsBuilder::new()
+            .memory_size(8 * 1024 * 1024)
+            .trap_on_grow_failure(false)
+            .build(),
+    );
+    let ptr = guest
+        .alloc
+        .call(&mut guest.store, 64 * 1024 * 1024)
+        .expect("alloc of an unservable size does not trap");
+    assert_eq!(ptr, 0, "an allocation that cannot be served returns 0");
+    // The instance still works afterwards.
+    let request = json!({"dataset_id": "d", "policies": [], "claims": {}}).to_string();
+    assert_eq!(guest.call(request.as_bytes())["decision"], "Allow");
 }
 
 #[test]

@@ -777,6 +777,117 @@ mod tests {
         assert!(response.reason.contains("policy-fr-only"));
     }
 
+    fn prohibition_only_request(
+        constraints: Vec<Constraint>,
+        claim_pairs: &[(&str, ClaimValue)],
+    ) -> EvaluateRequest {
+        EvaluateRequest {
+            dataset_id: "ds-1".to_string(),
+            policies: vec![policy("policy-1", vec![], vec![rule("use", constraints)])],
+            claims: claims(claim_pairs),
+        }
+    }
+
+    /// A prohibition constraint on a claim the caller did not present
+    /// cannot be shown to be false, so it denies instead of being skipped.
+    #[test]
+    fn prohibition_with_missing_claim_denies() {
+        let request = prohibition_only_request(vec![constraint("nationality", "neq", "DE")], &[]);
+        let response = evaluate(&request);
+        assert_eq!(response.decision, Decision::Deny);
+        assert!(
+            response.reason.contains("could not be evaluated"),
+            "reason was: {}",
+            response.reason
+        );
+    }
+
+    /// A prohibition with an operator this engine cannot evaluate denies.
+    #[test]
+    fn prohibition_with_unsupported_operator_denies() {
+        for operator in ["lt", "gt", "isPartOf", "isNoneOf", "egal"] {
+            let request = prohibition_only_request(
+                vec![constraint("age", operator, "18")],
+                &[("age", single("42"))],
+            );
+            assert_eq!(
+                evaluate(&request).decision,
+                Decision::Deny,
+                "operator {operator}"
+            );
+        }
+    }
+
+    /// A constraint that definitely fails still lets the prohibition's AND
+    /// fail, even when another constraint of the same rule is unevaluable.
+    #[test]
+    fn prohibition_with_a_definite_miss_does_not_apply() {
+        let request = prohibition_only_request(
+            vec![
+                constraint("nationality", "eq", "US"),
+                constraint("age", "lt", "18"),
+            ],
+            &[("nationality", single("DE")), ("age", single("10"))],
+        );
+        assert_eq!(evaluate(&request).decision, Decision::Allow);
+    }
+
+    /// A prohibition that fails closed also overrides a matching permission.
+    #[test]
+    fn unevaluable_prohibition_overrides_a_matching_permission() {
+        let request = EvaluateRequest {
+            dataset_id: "ds-1".to_string(),
+            policies: vec![policy(
+                "policy-1",
+                vec![rule("use", vec![])],
+                vec![rule("use", vec![constraint("age", "lt", "18")])],
+            )],
+            claims: claims(&[("age", single("42"))]),
+        };
+        assert_eq!(evaluate(&request).decision, Decision::Deny);
+    }
+
+    /// An unevaluable permission constraint stays a miss.
+    #[test]
+    fn unevaluable_permission_constraint_stays_a_miss() {
+        let request = EvaluateRequest {
+            dataset_id: "ds-1".to_string(),
+            policies: vec![
+                policy(
+                    "p1",
+                    vec![rule("use", vec![constraint("age", "lt", "18")])],
+                    vec![],
+                ),
+                policy("p2", vec![rule("use", vec![])], vec![]),
+            ],
+            claims: claims(&[("age", single("42"))]),
+        };
+        // p2's unconditional permission still allows.
+        assert_eq!(evaluate(&request).decision, Decision::Allow);
+    }
+
+    /// An empty right operand yields no candidates, so it cannot match an
+    /// empty-string claim.
+    #[test]
+    fn empty_is_any_of_does_not_match_an_empty_claim() {
+        for right in ["", " , ,"] {
+            let request = EvaluateRequest {
+                dataset_id: "ds-1".to_string(),
+                policies: vec![policy(
+                    "policy-1",
+                    vec![rule("use", vec![constraint("scope", "isAnyOf", right)])],
+                    vec![],
+                )],
+                claims: claims(&[("scope", single(""))]),
+            };
+            assert_eq!(
+                evaluate(&request).decision,
+                Decision::Deny,
+                "right {right:?}"
+            );
+        }
+    }
+
     /// The request/response types round-trip through JSON in exactly the
     /// shape the design doc's example shows (field names, `kind` variant
     /// spelling, flat claims map).
