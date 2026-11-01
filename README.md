@@ -105,8 +105,9 @@ implements it on [Oxigraph](https://crates.io/crates/oxigraph) (via
 catalog is naturally a set of named graphs and because SPARQL requires a
 real triple store. In-memory only, matching EDC's own federated-catalog
 cache — crawled data is repopulated on every restart, not durably
-stored. `ds-catalog-broker-rs` falls back to a plain `InMemoryCatalogCache`
-(a bare `HashMap`) when no harvester is configured.
+stored. It is the only backend: with no participant configured the broker
+serves an empty store, with `/sparql` enabled, and the tests run on the
+same in-memory Oxigraph store.
 
 **Real DCAT triples, not a JSON-blob bridge.** Each crawled `Catalog` is
 decomposed into `dcat:Catalog`/`dcat:Dataset`/`dcat:Distribution`/
