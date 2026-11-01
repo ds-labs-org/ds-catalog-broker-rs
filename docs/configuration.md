@@ -77,7 +77,7 @@ Every setting is optional.
 | `broker:crawlIntervalSecs` | `300` | Seconds between the starts of two crawl cycles. Positive integer. |
 | `broker:crawlTimeoutMs` | `30000` | How long one participant's crawl may take, credential presentation and response body included, before it counts as failed. Positive integer. |
 | `broker:crawlConcurrency` | `8` | How many participants are crawled at the same time. Positive integer. |
-| `broker:crawlMaxResponseBytes` | `16777216` | The most bytes of one participant's catalog response the crawler reads (the body is read in chunks and the crawl of that participant fails once it exceeds this). Positive integer. |
+| `broker:crawlMaxResponseBytes` | `16777216` | The most bytes the crawler reads from one response: a participant's catalog response and the reply to the OID4VP presentation at `broker:oid4vpResponseUri`. The body is read in chunks, and the crawl of that participant fails once it exceeds this (a larger `Content-Length` fails before any byte is read). Positive integer. |
 | `broker:catalogMaxAgeSecs` | `86400` | A participant's cached catalog is removed once its last successful crawl is older than this, so a participant that stays down stops being served. A failed crawl keeps the previous catalog until then. Positive integer. |
 | `broker:oauth2JwksUri` | unset | JWKS endpoint for OAuth2 Bearer gating of `/catalog` and `/sparql`. Unset leaves both unauthenticated. Must be https, or plain http to a loopback IP address, or the broker does not start; the response is capped at 1 MiB. See [oauth2-bearer-gating-2026-08-28.md](oauth2-bearer-gating-2026-08-28.md). |
 | `broker:oauth2Issuer` | unset | Expected `iss` claim; checked only if set. |
@@ -128,10 +128,13 @@ resource typed `broker:Holder`. Either can be an IRI or a blank node:
 
 The broker's outbound HTTP client (catalog requests, OID4VP presentations and
 the JWKS fetch) follows a redirect only to the same origin (scheme, host and
-port) as the request that was redirected, and only to https or plain http to
-a loopback address. Any other redirect fails that request, so a redirect
-cannot carry a bearer token or a `vp_token` to another host or down to plain
-http.
+port) as the request that was redirected, and at most ten redirects. Any
+other redirect fails that request, so a redirect cannot carry a bearer token
+or a `vp_token` to another host, another port or down to plain http. The
+first request of each chain goes to a URL checked when the config is read:
+a participant with a credential protocol must use https, or plain http to a
+loopback address, for `broker:catalogRequestUrl` and
+`broker:oid4vpResponseUri`.
 
 Every value is a string literal, except that `broker:catalogRequestUrl` and
 `broker:oid4vpResponseUri` may also be IRIs and `broker:credentialJwsFile`

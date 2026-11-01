@@ -48,7 +48,7 @@ Set as properties of the broker's Turtle config (see
 
 | Property | Required to enable | Meaning |
 |---|---|---|
-| `broker:oauth2JwksUri` | yes | JWKS endpoint of the authorization server. Unset → gating stays off, both routes behave exactly as before. |
+| `broker:oauth2JwksUri` | yes | JWKS endpoint of the authorization server. Must be an https URL, or plain http to a loopback address (a host name such as `localhost` is refused): the keys that decide who gets in are not fetched over a channel that can be tampered with. The fetch follows redirects only within the same origin, and the response is capped at 1 MiB. Unset → gating stays off, both routes behave exactly as before. |
 | `broker:oauth2Issuer` | no | Expected `iss` claim; checked only if set. |
 | `broker:oauth2Audience` | no | Expected `aud` claim; checked only if set. |
 | `broker:oauth2RequiredScope` | no | One scope that must appear in the token's space-delimited `scope` claim; checked only if set. |
