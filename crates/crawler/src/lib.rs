@@ -115,14 +115,16 @@ pub fn remote_allowed(url: &reqwest::Url) -> bool {
 /// The HTTP client for every outbound request the broker makes with a
 /// credential (catalog requests, OID4VP presentations) or that decides
 /// whom to trust (the JWKS fetch). It follows a redirect only to the same
-/// origin as the request that was redirected, and only when
-/// [`remote_allowed`] accepts the target. The https-or-loopback rule
-/// checked when the config is read therefore also holds after a
-/// redirect, and a redirect cannot carry a bearer token or a `vp_token`
-/// to another host or down to plain http.
+/// origin (scheme, host, port) as the request that was redirected, and at
+/// most ten redirects. Every first request goes to a URL the config
+/// checked (gated endpoints against [`remote_allowed`]), so a same-origin
+/// redirect stays within what was checked, and a redirect cannot carry a
+/// bearer token or a `vp_token` to another host, port or scheme. An
+/// ungated participant on a plain-http named host can redirect within
+/// its own origin.
 pub fn outbound_client() -> reqwest::Result<reqwest::Client> {
     let redirects = reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= 10 {
+        if attempt.previous().len() > 10 {
             return attempt.error("too many redirects");
         }
         let target = attempt.url().clone();
@@ -130,12 +132,11 @@ pub fn outbound_client() -> reqwest::Result<reqwest::Client> {
             .previous()
             .last()
             .is_some_and(|from| from.origin() == target.origin());
-        if remote_allowed(&target) && same_origin {
+        if same_origin {
             attempt.follow()
         } else {
             attempt.error(format!(
-                "refused a redirect to {}: a redirect must stay on the same origin and keep \
-                 to https, or plain http to a loopback address",
+                "refused a redirect to {}: a redirect must stay on the same origin",
                 target.origin().ascii_serialization()
             ))
         }
