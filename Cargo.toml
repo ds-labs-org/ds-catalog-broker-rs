@@ -6,6 +6,7 @@ members = [
     "crates/ds-catalog-broker-rs",
     "crates/dcp-core",
     "crates/crawler",
+    "crates/policy-engine",
     # Vendored as git submodules (see vendor/README.md) - contreforts-kg is
     # the real Oxigraph-backed store this project's rdf-store crate builds
     # on; contreforts-core and contreforts-config are its own hard
@@ -104,3 +105,12 @@ oxigraph = { version = "0.5.11", default-features = false }
 spareval = { version = "0.2.7", default-features = false }
 contreforts-core = { path = "vendor/contreforts-core" }
 contreforts-config = { path = "vendor/contreforts-config" }
+# Pure-Rust WASM interpreter (no cranelift/JIT) used by policy-engine's
+# native-host test to prove its compiled evaluate.wasm module round-trips
+# through the real alloc/evaluate/dealloc ABI, not just the plain Rust
+# function - see the dataspace repo's case study
+# (docs/case-studies/2026-08-30-attribute-based-odrl-policy-enforcement.md,
+# https://labs.deepthought-solutions.net/Deepthought-Solutions/dataspace/src/branch/main/docs/case-studies/2026-08-30-attribute-based-odrl-policy-enforcement.md)
+# section 5.1 for why wasmi (over wasmtime) and why this exact version
+# (its API was verified directly against docs.rs/wasmi/1.1.0).
+wasmi = "1.1.0"

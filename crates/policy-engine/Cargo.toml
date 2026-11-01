@@ -1,0 +1,26 @@
+[package]
+name = "policy-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable, WASM-compilable attribute-based decision engine that evaluates a harvested ODRL Policy against a caller's identity claims - see the dataspace repo's case study, docs/case-studies/2026-08-30-attribute-based-odrl-policy-enforcement.md. Deliberately has no dependency on catalog-core (or on tokio/reqwest/anything host-specific): it defines its own minimal Policy/Rule/Constraint mirror so it stays compilable to wasm32-unknown-unknown and invocable identically from a Rust host and a JVM host."
+
+# cdylib so `cargo build --target wasm32-unknown-unknown --release` produces
+# a `.wasm` module exporting alloc/dealloc/evaluate (see src/ffi.rs); rlib
+# so this crate is also a normal, natively-testable Rust library - the core
+# `evaluate()` logic in src/lib.rs has zero WASM/FFI involvement and is
+# unit-tested that way (see "TDD the core evaluation logic" in the task
+# spec this crate was built from).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Only pulled in for the native wasmi round-trip test (tests/wasm_abi.rs) -
+# never compiled into the wasm32-unknown-unknown cdylib artifact itself,
+# since dev-dependencies aren't part of a `--release` library build.
+wasmi = { workspace = true }
