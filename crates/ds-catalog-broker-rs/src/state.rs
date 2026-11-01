@@ -125,8 +125,9 @@ pub fn crawl_limits_from_settings(settings: &config::BrokerSettings) -> crawler:
 /// Reads `broker:shutdownDelaySecs`: how long to keep serving after a
 /// shutdown signal, with `/ready` already failing. Unset: no delay.
 pub fn shutdown_delay_from_settings(settings: &config::BrokerSettings) -> Duration {
-    let _ = settings;
-    todo!()
+    settings
+        .positive_integer(config::SHUTDOWN_DELAY_SECS)
+        .map_or(Duration::ZERO, |secs| Duration::from_secs(secs as u64))
 }
 
 impl AppState {

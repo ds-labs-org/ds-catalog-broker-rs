@@ -93,6 +93,12 @@ fn build_holder(holder: &crawler::HolderConfig) -> Result<Arc<HolderIdentity>, S
 /// answers 503, so a load balancer stops routing new requests before the
 /// listener closes.
 pub async fn stop_after(shutdown: CancellationToken, delay: Duration) {
-    let _ = (shutdown, delay);
-    todo!()
+    shutdown.cancelled().await;
+    if !delay.is_zero() {
+        tracing::info!(
+            delay_secs = delay.as_secs(),
+            "shutting down; /ready now fails, closing the listener after the delay"
+        );
+        tokio::time::sleep(delay).await;
+    }
 }

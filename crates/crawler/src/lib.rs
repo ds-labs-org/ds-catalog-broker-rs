@@ -126,18 +126,26 @@ pub async fn crawl_once(
     // stream: a closure in the stream's type makes the future returned here
     // not provably `Send` for every lifetime, which `spawn_scheduler`'s
     // `tokio::spawn` needs.
-    let crawls: Vec<BoxFuture<'_, Result<(), String>>> = participants
+    // Each outcome carries the time its own crawl ended, not the cycle's.
+    let crawls: Vec<BoxFuture<'_, (Result<(), String>, std::time::SystemTime)>> = participants
         .iter()
-        .map(|participant| crawl_and_cache(http, participant, holder, cache, limits).boxed())
+        .map(|participant| {
+            crawl_and_cache(http, participant, holder, cache, limits)
+                .map(|outcome| (outcome, std::time::SystemTime::now()))
+                .boxed()
+        })
         .collect();
-    let outcomes: Vec<Result<(), String>> = stream::iter(crawls)
+    let outcomes: Vec<(Result<(), String>, std::time::SystemTime)> = stream::iter(crawls)
         .buffered(limits.concurrency.max(1))
         .collect()
         .await;
 
     let mut summary = CrawlSummary::default();
-    for (participant, outcome) in participants.iter().zip(outcomes) {
+    for (participant, (outcome, finished_at)) in participants.iter().zip(outcomes) {
         summary.attempted += 1;
+        summary
+            .finished_at
+            .insert(participant.id.clone(), finished_at);
         match outcome {
             Ok(()) => {
                 summary.succeeded += 1;
@@ -254,17 +262,25 @@ impl Harvester {
             self.last_success.insert(id.clone(), now);
         }
 
-        let mut expired: Vec<String> = self
+        let mut stale: Vec<String> = self
             .last_success
             .iter()
             .filter(|(_, at)| now.duration_since(**at) > self.limits.max_catalog_age)
             .map(|(id, _)| id.clone())
             .collect();
-        expired.sort();
-        for id in &expired {
-            self.last_success.remove(id);
-            if let Err(err) = self.cache.delete(&NodeId::new(id.clone())).await {
-                tracing::warn!(participant = %id, error = %err, "failed to remove a stale catalog");
+        stale.sort();
+        // A catalog counts as expired only once it is really gone; a failed
+        // delete keeps it in `last_success`, so the next cycle tries again.
+        let mut expired = Vec::with_capacity(stale.len());
+        for id in stale {
+            match self.cache.delete(&NodeId::new(id.clone())).await {
+                Ok(_) => {
+                    self.last_success.remove(&id);
+                    expired.push(id);
+                }
+                Err(err) => {
+                    tracing::warn!(participant = %id, error = %err, "failed to remove a stale catalog; retrying next cycle");
+                }
             }
         }
 
@@ -274,18 +290,20 @@ impl Harvester {
 
     /// Fold one cycle's outcome into [`Self::status`].
     fn record_status(&self, summary: &CrawlSummary, expired: &[String]) {
-        let now = std::time::SystemTime::now();
+        let cycle_end = std::time::SystemTime::now();
+        let finished = |id: &String| summary.finished_at.get(id).copied().unwrap_or(cycle_end);
         self.status.update(|status| {
             for id in &summary.succeeded_ids {
                 let entry = status.participants.entry(id.clone()).or_default();
-                entry.last_attempt = Some(now);
-                entry.last_success = Some(now);
+                let at = finished(id);
+                entry.last_attempt = Some(at);
+                entry.last_success = Some(at);
                 entry.last_error = None;
                 entry.cached = true;
             }
             for (id, error) in &summary.failures {
                 let entry = status.participants.entry(id.clone()).or_default();
-                entry.last_attempt = Some(now);
+                entry.last_attempt = Some(finished(id));
                 entry.last_error = Some(error.clone());
             }
             for id in expired {
