@@ -21,6 +21,7 @@ pub mod oid4vp;
 
 pub use config::{
     ConfigError, CredentialProtocol, HolderConfig, ParticipantEntry, ParticipantsConfig,
+    UnknownCredentialProtocol,
 };
 
 use std::collections::HashMap;
@@ -280,9 +281,9 @@ async fn crawl_one(
             );
         }
         config::CredentialProtocol::Dcp => {
-            // Config validation (`ParticipantsConfig::validate`) already
-            // guarantees a `Dcp` participant has a `provider_did` and the
-            // file has a `[holder]` section, so a `holder` of `None` or a
+            // Config validation (`ParticipantsConfig::new`) already
+            // guarantees a `Dcp` participant has a `provider_did` and a
+            // holder is configured, so a `holder` of `None` or a
             // missing `provider_did` here means the caller built
             // `ParticipantsConfig`/`HolderIdentity` inconsistently by
             // hand rather than through that validation - still handled
@@ -306,8 +307,7 @@ async fn crawl_one(
         config::CredentialProtocol::Oid4Vp => {
             // Same defensive posture as the `Dcp` arm above: config
             // validation already guarantees an `Oid4Vp` participant has
-            // an `oid4vp_response_uri` and the file has a `[holder]`
-            // section, but this still fails per-participant, not with a
+            // an `oid4vp_response_uri` and a holder is configured, but this still fails per-participant, not with a
             // panic, if a hand-built config is inconsistent.
             let holder = holder.ok_or_else(|| {
                 format!(

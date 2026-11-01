@@ -10,9 +10,7 @@ description = "The Federated Catalog Semantic Harvester's crawl engine: polls a 
 catalog-core = { path = "../catalog-core" }
 rdf-store = { path = "../rdf-store" }
 dcp-core = { path = "../dcp-core" }
-serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 tracing = { workspace = true }

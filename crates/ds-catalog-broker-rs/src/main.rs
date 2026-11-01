@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crawler::ParticipantsConfig;
+use crawler::HolderConfig;
 use dcp_core::HolderIdentity;
 use ds_catalog_broker_rs::config::{self, BrokerSettings};
 use ds_catalog_broker_rs::oauth2::{OAuth2Config, OAuth2Verifier};
@@ -13,24 +13,11 @@ use rdf_store::memory::InMemoryCatalogCache;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
-/// Reads `broker:crawlerConfigPath` (optional). When set, loads and validates
-/// the TOML file at that path and builds this connector's own DCP holder
-/// identity from its `[holder]` section (if any). When unset, returns
-/// `None` and the caller must fall back to today's placeholder
-/// (`seed_sample_catalog`) - see `main`'s doc comment on why that
-/// fallback is a strict backward-compatibility requirement, not a default
-/// worth changing here.
-fn load_crawler_config(settings: &BrokerSettings) -> Option<ParticipantsConfig> {
-    let path = settings.get(config::CRAWLER_CONFIG_PATH)?;
-    let config = ParticipantsConfig::load(&path)
-        .unwrap_or_else(|err| panic!("failed to load crawlerConfigPath={path:?}: {err}"));
-    Some(config)
-}
-
 /// Reads the `broker:oauth2*` settings (see
 /// `docs/oauth2-bearer-gating-2026-08-28.md`'s config table) and builds an
 /// [`OAuth2Config`], the same "presence of the required setting decides
-/// opt-in" shape as `load_crawler_config`. `broker:oauth2JwksUri` unset ->
+/// opt-in" shape as the crawler (on when `broker:participant` is set).
+/// `broker:oauth2JwksUri` unset ->
 /// `None`, and gating stays off - byte-identical behavior to before this
 /// feature existed. `oauth2Issuer`/`oauth2Audience`/`oauth2RequiredScope`
 /// are all optional and independent of each other.
@@ -44,15 +31,19 @@ fn load_oauth2_config(settings: &BrokerSettings) -> Option<OAuth2Config> {
     })
 }
 
-fn build_holder(config: &ParticipantsConfig) -> Option<Arc<HolderIdentity>> {
-    config.holder.as_ref().map(|holder_config| {
-        Arc::new(HolderIdentity::new(
-            holder_config.own_did_host.clone(),
-            holder_config.insecure_http,
-            holder_config.credential_jws.clone(),
-            holder_config.required_scope.clone(),
-        ))
-    })
+/// Builds this connector's own DCP holder identity, reading its credential
+/// from `broker:credentialJwsFile`. An unreadable file panics on boot, like
+/// any other bad crawler config.
+fn build_holder(holder: &HolderConfig) -> Arc<HolderIdentity> {
+    let credential_jws = holder
+        .read_credential_jws()
+        .unwrap_or_else(|err| panic!("failed to load the holder credential: {err}"));
+    Arc::new(HolderIdentity::new(
+        holder.own_did_host.clone(),
+        holder.insecure_http,
+        credential_jws,
+        holder.required_scope.clone(),
+    ))
 }
 
 #[tokio::main]
@@ -63,7 +54,7 @@ async fn main() {
 
     // The Turtle config (see `ds_catalog_broker_rs::config`'s module doc).
     // An explicit `CONFIG_STORE_PATH` (path or URL) that cannot be read panics on boot,
-    // the same failure posture as a bad crawler config below.
+    // and so does an invalid participant or holder resource in it.
     let settings = BrokerSettings::load(&http_client)
         .await
         .unwrap_or_else(|err| panic!("failed to load the broker configuration: {err}"));
@@ -77,7 +68,7 @@ async fn main() {
     // `AppState::oauth2`'s doc comment). Set: fetched eagerly, here, before
     // `AppState` is built - a bad/unreachable JWKS panics on boot rather
     // than silently starting unauthenticated, the same failure posture as
-    // a bad `broker:crawlerConfigPath` below.
+    // a bad participant or holder in the config.
     let oauth2_verifier = match load_oauth2_config(&settings) {
         Some(config) => {
             let jwks_uri = config.jwks_uri.clone();
@@ -95,11 +86,10 @@ async fn main() {
         "oauth2 bearer gating configuration resolved (oauth2JwksUri unset means both /catalog and /sparql stay unauthenticated)"
     );
 
-    // broker:crawlerConfigPath unset: byte-identical to this connector's
-    // original behavior - a plain in-memory HashMap cache, seeded with one
-    // placeholder sample catalog, no crawler started.
+    // No broker:participant in the config: a plain in-memory HashMap cache,
+    // seeded with one placeholder sample catalog, no crawler started.
     //
-    // broker:crawlerConfigPath set: this connector now works the way EDC's own
+    // At least one broker:participant: this connector now works the way EDC's own
     // federated catalog does - a periodic, config-driven crawl populates a
     // real RDF (Oxigraph) store, which the DSP catalog endpoint then
     // serves. In-memory only, same as EDC's own federated-catalog cache:
@@ -107,14 +97,13 @@ async fn main() {
     // as a gap - see `rdf_store::oxigraph_backend`'s module doc for the
     // backend itself and `crates/crawler`'s doc comments for the crawl
     // loop. `InMemoryCatalogCache` (a plain `HashMap`, not backed by RDF
-    // at all) stays the default for everyone not opting into the crawler,
-    // per this function's own strict backward-compatibility requirement.
+    // at all) stays the default when no participant is configured.
     type CacheHolderSparql = (
         Arc<dyn CatalogCache>,
         Option<Arc<HolderIdentity>>,
         Option<Arc<rdf_store::oxigraph_backend::OxigraphCatalogCache>>,
     );
-    let (cache, holder, sparql): CacheHolderSparql = match load_crawler_config(&settings) {
+    let (cache, holder, sparql): CacheHolderSparql = match settings.crawler().cloned() {
         Some(config) => {
             // Kept as a concrete `Arc<OxigraphCatalogCache>` (not just the
             // `Arc<dyn CatalogCache>` coercion below) purely so `AppState`
@@ -126,7 +115,7 @@ async fn main() {
                     .expect("open in-memory Oxigraph store"),
             );
             let cache: Arc<dyn CatalogCache> = store.clone();
-            let holder = build_holder(&config);
+            let holder = config.holder.as_ref().map(build_holder);
             let limits = crawl_limits_from_settings(&settings);
             tracing::info!(
                 participants = config.participants.len(),
@@ -135,7 +124,7 @@ async fn main() {
                 timeout_ms = limits.participant_timeout.as_millis() as u64,
                 concurrency = limits.concurrency,
                 max_catalog_age_secs = limits.max_catalog_age.as_secs(),
-                "starting scheduled catalog crawler (crawlerConfigPath set); serving from an in-memory Oxigraph store, with /sparql enabled"
+                "starting scheduled catalog crawler; serving from an in-memory Oxigraph store, with /sparql enabled"
             );
             crawler::spawn_scheduler(
                 cache.clone(),
@@ -149,7 +138,7 @@ async fn main() {
         None => {
             // No crawler configured: the plain in-memory cache, seeded
             // with one sample catalog - this stands in for a real crawl
-            // result until broker:crawlerConfigPath is set. No SPARQL backend
+            // result until a broker:participant is configured. No SPARQL backend
             // either (see `AppState::sparql`'s doc comment): `/sparql`
             // answers 501 until a real Oxigraph-backed crawl is running.
             let cache: Arc<dyn CatalogCache> = Arc::new(InMemoryCatalogCache::new());

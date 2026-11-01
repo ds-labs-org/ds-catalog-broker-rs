@@ -1,129 +1,107 @@
-//! Local-config participant registry for the scheduled crawler.
+//! The crawler's participant registry and holder identity.
 //!
 //! This stands in for a real dataspace participant directory (a
 //! catalog-of-catalogs, or a registry service queried at runtime): for
 //! now, "which DSP catalog endpoints does this connector poll" is a
-//! hand-maintained TOML file. See the `dataspace` study repo's
-//! `docs/adr/` for whether/when this gets replaced by something dynamic -
-//! that is a governance-adjacent decision (who gets to add a participant)
-//! out of scope for this crate.
+//! hand-maintained list in the broker's Turtle config - `broker:Participant`
+//! and `broker:Holder` resources linked from `broker:BrokerConfig`, read by
+//! `ds_catalog_broker_rs::config` and documented in `docs/configuration.md`.
+//! See the `dataspace` study repo's `docs/adr/` for whether/when this gets
+//! replaced by something dynamic - that is a governance-adjacent decision
+//! (who gets to add a participant) out of scope for this crate.
 //!
-//! Example file:
-//!
-//! ```toml
-//! interval_secs = 300
-//!
-//! [[participants]]
-//! id = "participant-a"
-//! name = "Participant A"
-//! catalog_request_url = "http://127.0.0.1:19001/dsp/catalog/request"
-//! # credential_protocol omitted - defaults to "none" (unauthenticated)
-//!
-//! [[participants]]
-//! id = "gated-participant"
-//! name = "DCP-gated participant"
-//! catalog_request_url = "http://127.0.0.1:19002/dsp/catalog/request"
-//! credential_protocol = "dcp"
-//! provider_did = "did:web:localhost%3A19002:dsp"
-//!
-//! [[participants]]
-//! id = "oid4vp-gated-participant"
-//! name = "OID4VP-gated participant"
-//! catalog_request_url = "http://127.0.0.1:19003/dsp/catalog/request"
-//! credential_protocol = "oid4vp"
-//! oid4vp_response_uri = "http://127.0.0.1:19003/oid4vp/response"
-//!
-//! [holder]
-//! own_did_host = "localhost:19100"
-//! insecure_http = true
-//! credential_jws = "..."
-//! required_scope = "org.eclipse.dspace.dcp.vc.type:FederatedCatalogAccessCredential:read"
-//! ```
+//! This module only holds the types and their invariants; it does not parse
+//! anything. Build a [`ParticipantsConfig`] with [`ParticipantsConfig::new`],
+//! which enforces the `credential_protocol` invariants documented on
+//! [`ParticipantEntry`].
 
-use serde::Deserialize;
+use std::path::PathBuf;
+use std::str::FromStr;
 
-/// The parsed, *validated* contents of a crawler config file. Construct
-/// via [`ParticipantsConfig::load`] or [`ParticipantsConfig::parse`] -
-/// both enforce the `credential_protocol` invariants documented on
-/// [`ParticipantEntry`], so a value of this type is always internally
-/// consistent by the time crawl code ever sees it.
-#[derive(Debug, Clone, Deserialize)]
+/// The validated crawler configuration. Construct via
+/// [`ParticipantsConfig::new`] - it enforces the `credential_protocol`
+/// invariants documented on [`ParticipantEntry`], so a value of this type
+/// is internally consistent by the time crawl code sees it.
+#[derive(Debug, Clone)]
 pub struct ParticipantsConfig {
     /// How often to run a full crawl cycle over every configured
     /// participant.
     pub interval_secs: u64,
-    #[serde(default)]
     pub participants: Vec<ParticipantEntry>,
     /// This crawler's own DCP holder identity. Required exactly when at
-    /// least one participant has `credential_protocol = "dcp"` or
-    /// `"oid4vp"` - see [`ParticipantsConfig::validate`]. Both protocols
-    /// present the same underlying holder identity (key pair +
-    /// credential), just wrapped in a different wire message.
-    #[serde(default)]
+    /// least one participant's `credential_protocol` is `Dcp` or `Oid4Vp` -
+    /// see [`ParticipantsConfig::new`]. Both protocols present the same
+    /// underlying holder identity (key pair + credential), just wrapped in
+    /// a different wire message.
     pub holder: Option<HolderConfig>,
 }
 
 /// Which credential-presentation protocol a participant's catalog
 /// endpoint requires, if any. See `docs/oid4vp-holder-2026-08-28.md` for
 /// why this is an enum rather than a second parallel bool alongside the
-/// old `requires_dcp`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// old `requires_dcp`. Written in the config as `"none"`, `"dcp"` or
+/// `"oid4vp"` (see [`FromStr`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CredentialProtocol {
-    /// No credential presented - today's unauthenticated case (still a
-    /// real, non-empty `Authorization` header on the wire, see
+    /// No credential presented - the unauthenticated case (still a real,
+    /// non-empty `Authorization` header on the wire, see
     /// `OPEN_PARTICIPANT_PLACEHOLDER_AUTH` in `crawler::lib`, but no
     /// credential-backed identity).
     #[default]
     None,
     /// A DCP self-issued token (`Authorization: Bearer <token>`) minted
     /// via `dcp_core::HolderIdentity::mint_self_issued_token`. Requires
-    /// `provider_did` on the entry and a `[holder]` section on the file.
+    /// `provider_did` on the entry and a holder on the config.
     Dcp,
     /// An OID4VP `vp_token` + `presentation_submission`, POSTed to
     /// `oid4vp_response_uri` to obtain a short-lived access token that is
     /// then attached as `Authorization: Bearer <access_token>` on the
     /// same catalog request - see `crawler::oid4vp::present`. Requires
-    /// `oid4vp_response_uri` on the entry and a `[holder]` section on the
-    /// file (same holder identity DCP uses, different presentation wire
-    /// shape).
-    // `rename_all = "snake_case"` would otherwise split the digit/letter
-    // boundary and expect "oid4_vp" - "oid4vp" (no underscore) is the
-    // actual wire value the design doc and every config example use.
-    #[serde(rename = "oid4vp")]
+    /// `oid4vp_response_uri` on the entry and a holder on the config (same
+    /// holder identity DCP uses, different presentation wire shape).
     Oid4Vp,
 }
 
+/// A `credential_protocol` value other than `none`, `dcp` or `oid4vp`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown credential protocol {0:?} (expected none, dcp or oid4vp)")]
+pub struct UnknownCredentialProtocol(pub String);
+
+impl FromStr for CredentialProtocol {
+    type Err = UnknownCredentialProtocol;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "none" => Ok(Self::None),
+            "dcp" => Ok(Self::Dcp),
+            "oid4vp" => Ok(Self::Oid4Vp),
+            other => Err(UnknownCredentialProtocol(other.to_string())),
+        }
+    }
+}
+
 /// One participant this crawler polls.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ParticipantEntry {
     pub id: String,
     pub name: String,
     pub catalog_request_url: String,
     /// Which credential-presentation protocol this participant's catalog
-    /// endpoint requires - see [`CredentialProtocol`]. Omitted entirely
-    /// in a TOML file (today's unauthenticated case) parses as
-    /// `CredentialProtocol::None`, matching how `requires_dcp` used to
-    /// default to `false`.
-    #[serde(default)]
+    /// endpoint requires - see [`CredentialProtocol`].
     pub credential_protocol: CredentialProtocol,
-    /// Required when `credential_protocol = "dcp"`: this participant's
+    /// Required when `credential_protocol` is `Dcp`: this participant's
     /// own DID - the audience of the self-issued token the crawler sends
     /// it.
-    #[serde(default)]
     pub provider_did: Option<String>,
-    /// Required when `credential_protocol = "oid4vp"`: the OID4VP
+    /// Required when `credential_protocol` is `Oid4Vp`: the OID4VP
     /// `direct_post` endpoint the crawler POSTs its `vp_token` +
     /// `presentation_submission` to, in exchange for a short-lived access
     /// token - see `crawler::oid4vp::present`.
-    #[serde(default)]
     pub oid4vp_response_uri: Option<String>,
 }
 
-/// This crawler's own DCP holder identity configuration. Optional at the
-/// file level - omit entirely if no participant in the file
-/// `requires_dcp`.
-#[derive(Debug, Clone, Deserialize)]
+/// This crawler's own DCP holder identity configuration.
+#[derive(Debug, Clone)]
 pub struct HolderConfig {
     /// This crawler's own `did:web` host\[:port\] -
     /// `did:web:<own_did_host>:dsp:holder` is derived from it (see
@@ -131,91 +109,85 @@ pub struct HolderConfig {
     pub own_did_host: String,
     /// Resolve `did:web` DIDs over plain `http://` instead of `https://` -
     /// for local/test environments.
-    #[serde(default)]
     pub insecure_http: bool,
-    /// The pre-issued Verifiable Credential (JWS compact string) this
-    /// connector presents as itself.
+    /// A local file holding the pre-issued Verifiable Credential (JWS
+    /// compact string) this connector presents as itself.
     ///
-    /// Yes, this genuinely lives in plain config, unencrypted. That's a
-    /// deliberate tradeoff for this project's current scope, not an
-    /// oversight: a VC is a *bearer credential* - whoever holds the JWS
-    /// can present it - so in a real deployment this belongs in a secret
-    /// store (or a proper wallet/holder agent) with access-controlled
-    /// retrieval, not a checked-in or plaintext-on-disk TOML file. This
+    /// A VC is a *bearer credential* - whoever holds the JWS can present
+    /// it - so it is kept out of the config document itself, which may be
+    /// fetched over HTTP. The file is still plain, unencrypted text: this
     /// project has no secret-management story yet (see the `dataspace`
-    /// study repo's `authority/` placeholder for the same
-    /// not-yet-solved-here class of problem), so for now the honest
-    /// choice is to store it in the open and say so here, rather than
-    /// give it a false sense of protection.
-    pub credential_jws: String,
+    /// study repo's `authority/` placeholder), so protecting it is left to
+    /// the file's permissions.
+    pub credential_jws_file: PathBuf,
     /// The DCP scope this holder's credential is expected to satisfy.
     pub required_scope: String,
 }
 
-/// A crawler config file that failed to load or violated one of the
-/// `credential_protocol` invariants. Returned by [`ParticipantsConfig::load`] /
-/// [`ParticipantsConfig::parse`] rather than panicking, so a bad config
-/// file fails fast and legibly at startup instead of surfacing deep
-/// inside a crawl loop.
+impl HolderConfig {
+    /// Read the credential from [`Self::credential_jws_file`], with
+    /// surrounding whitespace (a trailing newline, say) trimmed.
+    pub fn read_credential_jws(&self) -> Result<String, ConfigError> {
+        let raw = std::fs::read_to_string(&self.credential_jws_file).map_err(|source| {
+            ConfigError::CredentialFile {
+                path: self.credential_jws_file.display().to_string(),
+                source,
+            }
+        })?;
+        let jws = raw.trim();
+        if jws.is_empty() {
+            return Err(ConfigError::EmptyCredentialFile {
+                path: self.credential_jws_file.display().to_string(),
+            });
+        }
+        Ok(jws.to_string())
+    }
+}
+
+/// A crawler configuration that violates one of the invariants
+/// [`ParticipantsConfig::new`] enforces, or a holder credential file that
+/// can't be read. Returned rather than panicking, so a bad config fails
+/// fast and legibly at startup instead of surfacing deep inside a crawl
+/// loop.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("failed to read crawler config file {path}: {source}")]
-    Io {
+    #[error("two participants have the id '{id}'")]
+    DuplicateParticipantId { id: String },
+    #[error("participant '{id}' has credential protocol dcp but no provider DID is set")]
+    MissingProviderDid { id: String },
+    #[error("participant '{id}' has credential protocol oid4vp but no OID4VP response URI is set")]
+    MissingOid4VpResponseUri { id: String },
+    #[error(
+        "participant '{id}' has a credential protocol that requires a holder identity, but no holder is configured"
+    )]
+    MissingHolder { id: String },
+    #[error("failed to read the holder credential file {path}: {source}")]
+    CredentialFile {
         path: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse crawler config file {path}: {source}")]
-    Parse {
-        path: String,
-        #[source]
-        source: toml::de::Error,
-    },
-    #[error("participant '{id}' has credential_protocol = dcp but no provider_did is set")]
-    MissingProviderDid { id: String },
-    #[error(
-        "participant '{id}' has credential_protocol = oid4vp but no oid4vp_response_uri is set"
-    )]
-    MissingOid4VpResponseUri { id: String },
-    #[error(
-        "participant '{id}' has a credential_protocol that requires a holder identity, but this config file has no [holder] section"
-    )]
-    MissingHolderSection { id: String },
+    #[error("the holder credential file {path} is empty")]
+    EmptyCredentialFile { path: String },
 }
 
 impl ParticipantsConfig {
-    /// Load and parse a crawler config file from `path`, then validate it.
-    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
-        let path_ref = path.as_ref();
-        let path_display = path_ref.display().to_string();
-        let raw = std::fs::read_to_string(path_ref).map_err(|source| ConfigError::Io {
-            path: path_display.clone(),
-            source,
-        })?;
-        Self::parse(&raw, &path_display)
-    }
-
-    /// Parse `raw` TOML text (with `path_for_errors` used only to label
-    /// any error), then validate it. Exposed separately from [`Self::load`]
-    /// so tests can exercise parsing/validation without touching the
-    /// filesystem.
-    pub fn parse(raw: &str, path_for_errors: &str) -> Result<Self, ConfigError> {
-        let config: ParticipantsConfig =
-            toml::from_str(raw).map_err(|source| ConfigError::Parse {
-                path: path_for_errors.to_string(),
-                source,
-            })?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    /// Enforces the `credential_protocol` invariants documented on
-    /// [`ParticipantEntry`]: a `Dcp` participant must carry a
-    /// `provider_did`, an `Oid4Vp` participant must carry an
-    /// `oid4vp_response_uri`, and either way the file must have a
-    /// `[holder]` section for the crawler to actually authenticate as.
-    fn validate(&self) -> Result<(), ConfigError> {
-        for participant in &self.participants {
+    /// Build a config, checking that participant ids are unique, that a
+    /// `Dcp` participant carries a `provider_did`, that an `Oid4Vp`
+    /// participant carries an `oid4vp_response_uri`, and that either way a
+    /// holder is configured for the crawler to authenticate as.
+    pub fn new(
+        interval_secs: u64,
+        participants: Vec<ParticipantEntry>,
+        holder: Option<HolderConfig>,
+    ) -> Result<Self, ConfigError> {
+        let mut ids = std::collections::BTreeSet::new();
+        for participant in &participants {
+            if !ids.insert(participant.id.as_str()) {
+                return Err(ConfigError::DuplicateParticipantId {
+                    id: participant.id.clone(),
+                });
+            }
             match participant.credential_protocol {
                 CredentialProtocol::None => continue,
                 CredentialProtocol::Dcp => {
@@ -233,13 +205,17 @@ impl ParticipantsConfig {
                     }
                 }
             }
-            if self.holder.is_none() {
-                return Err(ConfigError::MissingHolderSection {
+            if holder.is_none() {
+                return Err(ConfigError::MissingHolder {
                     id: participant.id.clone(),
                 });
             }
         }
-        Ok(())
+        Ok(Self {
+            interval_secs,
+            participants,
+            holder,
+        })
     }
 }
 
@@ -247,202 +223,122 @@ impl ParticipantsConfig {
 mod tests {
     use super::*;
 
-    const VALID_CONFIG: &str = r#"
-        interval_secs = 300
+    fn open(id: &str) -> ParticipantEntry {
+        ParticipantEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            catalog_request_url: "http://127.0.0.1:19001/dsp/catalog/request".to_string(),
+            credential_protocol: CredentialProtocol::None,
+            provider_did: None,
+            oid4vp_response_uri: None,
+        }
+    }
 
-        [[participants]]
-        id = "participant-a"
-        name = "Participant A"
-        catalog_request_url = "http://127.0.0.1:19001/dsp/catalog/request"
-
-        [[participants]]
-        id = "gated-participant"
-        name = "DCP-gated participant"
-        catalog_request_url = "http://127.0.0.1:19002/dsp/catalog/request"
-        credential_protocol = "dcp"
-        provider_did = "did:web:localhost%3A19002:dsp"
-
-        [holder]
-        own_did_host = "localhost:19100"
-        insecure_http = true
-        credential_jws = "header.payload.signature"
-        required_scope = "org.eclipse.dspace.dcp.vc.type:FederatedCatalogAccessCredential:read"
-    "#;
-
-    #[test]
-    fn parses_a_valid_config_file() {
-        let config = ParticipantsConfig::parse(VALID_CONFIG, "test.toml").expect("should parse");
-        assert_eq!(config.interval_secs, 300);
-        assert_eq!(config.participants.len(), 2);
-
-        let a = &config.participants[0];
-        assert_eq!(a.id, "participant-a");
-        assert_eq!(a.name, "Participant A");
-        assert_eq!(
-            a.catalog_request_url,
-            "http://127.0.0.1:19001/dsp/catalog/request"
-        );
-        assert!(matches!(a.credential_protocol, CredentialProtocol::None));
-        assert!(a.provider_did.is_none());
-        assert!(a.oid4vp_response_uri.is_none());
-
-        let gated = &config.participants[1];
-        assert!(matches!(gated.credential_protocol, CredentialProtocol::Dcp));
-        assert_eq!(
-            gated.provider_did.as_deref(),
-            Some("did:web:localhost%3A19002:dsp")
-        );
-
-        let holder = config.holder.expect("holder section present");
-        assert_eq!(holder.own_did_host, "localhost:19100");
-        assert!(holder.insecure_http);
-        assert_eq!(holder.credential_jws, "header.payload.signature");
-        assert_eq!(
-            holder.required_scope,
-            "org.eclipse.dspace.dcp.vc.type:FederatedCatalogAccessCredential:read"
-        );
+    fn holder() -> HolderConfig {
+        HolderConfig {
+            own_did_host: "localhost:19100".to_string(),
+            insecure_http: true,
+            credential_jws_file: PathBuf::from("/nonexistent/holder.jws"),
+            required_scope: "some-scope".to_string(),
+        }
     }
 
     #[test]
-    fn a_participant_with_no_credential_protocol_field_defaults_to_none_and_needs_nothing_else() {
-        let raw = r#"
-            interval_secs = 60
+    fn credential_protocols_parse_from_their_config_spelling() {
+        assert_eq!("none".parse(), Ok(CredentialProtocol::None));
+        assert_eq!("dcp".parse(), Ok(CredentialProtocol::Dcp));
+        assert_eq!("oid4vp".parse(), Ok(CredentialProtocol::Oid4Vp));
+        assert!("oid4_vp".parse::<CredentialProtocol>().is_err());
+    }
 
-            [[participants]]
-            id = "open-participant"
-            name = "Open participant"
-            catalog_request_url = "http://127.0.0.1:19001/dsp/catalog/request"
-        "#;
-        let config = ParticipantsConfig::parse(raw, "test.toml").expect("should parse");
-        assert!(matches!(
-            config.participants[0].credential_protocol,
-            CredentialProtocol::None
-        ));
-        assert!(config.holder.is_none());
+    #[test]
+    fn open_participants_need_no_holder() {
+        let config = ParticipantsConfig::new(60, vec![open("a"), open("b")], None).unwrap();
+        assert_eq!(config.participants.len(), 2);
+    }
+
+    #[test]
+    fn rejects_duplicate_participant_ids() {
+        let err = ParticipantsConfig::new(60, vec![open("a"), open("a")], None).unwrap_err();
+        assert!(matches!(err, ConfigError::DuplicateParticipantId { id } if id == "a"));
+    }
+
+    #[test]
+    fn accepts_dcp_with_provider_did_and_holder() {
+        let mut gated = open("gated");
+        gated.credential_protocol = CredentialProtocol::Dcp;
+        gated.provider_did = Some("did:web:localhost%3A19002:dsp".to_string());
+        ParticipantsConfig::new(60, vec![gated], Some(holder())).unwrap();
     }
 
     #[test]
     fn rejects_dcp_without_provider_did() {
-        let raw = r#"
-            interval_secs = 60
-
-            [[participants]]
-            id = "gated-participant"
-            name = "DCP-gated participant"
-            catalog_request_url = "http://127.0.0.1:19002/dsp/catalog/request"
-            credential_protocol = "dcp"
-
-            [holder]
-            own_did_host = "localhost:19100"
-            credential_jws = "header.payload.signature"
-            required_scope = "some-scope"
-        "#;
-        let err = ParticipantsConfig::parse(raw, "test.toml").expect_err("should reject");
-        match err {
-            ConfigError::MissingProviderDid { id } => assert_eq!(id, "gated-participant"),
-            other => panic!("expected MissingProviderDid, got {other:?}"),
-        }
+        let mut gated = open("gated");
+        gated.credential_protocol = CredentialProtocol::Dcp;
+        let err = ParticipantsConfig::new(60, vec![gated], Some(holder())).unwrap_err();
+        assert!(matches!(err, ConfigError::MissingProviderDid { id } if id == "gated"));
     }
 
     #[test]
-    fn rejects_dcp_without_holder_section() {
-        let raw = r#"
-            interval_secs = 60
-
-            [[participants]]
-            id = "gated-participant"
-            name = "DCP-gated participant"
-            catalog_request_url = "http://127.0.0.1:19002/dsp/catalog/request"
-            credential_protocol = "dcp"
-            provider_did = "did:web:localhost%3A19002:dsp"
-        "#;
-        let err = ParticipantsConfig::parse(raw, "test.toml").expect_err("should reject");
-        match err {
-            ConfigError::MissingHolderSection { id } => assert_eq!(id, "gated-participant"),
-            other => panic!("expected MissingHolderSection, got {other:?}"),
-        }
+    fn rejects_dcp_without_holder() {
+        let mut gated = open("gated");
+        gated.credential_protocol = CredentialProtocol::Dcp;
+        gated.provider_did = Some("did:web:localhost%3A19002:dsp".to_string());
+        let err = ParticipantsConfig::new(60, vec![gated], None).unwrap_err();
+        assert!(matches!(err, ConfigError::MissingHolder { id } if id == "gated"));
     }
 
     #[test]
-    fn parses_an_oid4vp_participant_with_response_uri_set() {
-        let raw = r#"
-            interval_secs = 60
-
-            [[participants]]
-            id = "oid4vp-participant"
-            name = "OID4VP-gated participant"
-            catalog_request_url = "http://127.0.0.1:19003/dsp/catalog/request"
-            credential_protocol = "oid4vp"
-            oid4vp_response_uri = "http://127.0.0.1:19003/oid4vp/response"
-
-            [holder]
-            own_did_host = "localhost:19100"
-            credential_jws = "header.payload.signature"
-            required_scope = "some-scope"
-        "#;
-        let config = ParticipantsConfig::parse(raw, "test.toml").expect("should parse");
-        let p = &config.participants[0];
-        assert!(matches!(p.credential_protocol, CredentialProtocol::Oid4Vp));
-        assert_eq!(
-            p.oid4vp_response_uri.as_deref(),
-            Some("http://127.0.0.1:19003/oid4vp/response")
-        );
-        assert!(p.provider_did.is_none());
+    fn accepts_oid4vp_with_response_uri_and_holder() {
+        let mut gated = open("gated");
+        gated.credential_protocol = CredentialProtocol::Oid4Vp;
+        gated.oid4vp_response_uri = Some("http://127.0.0.1:19003/oid4vp/response".to_string());
+        ParticipantsConfig::new(60, vec![gated], Some(holder())).unwrap();
     }
 
     #[test]
     fn rejects_oid4vp_without_response_uri() {
-        let raw = r#"
-            interval_secs = 60
-
-            [[participants]]
-            id = "oid4vp-participant"
-            name = "OID4VP-gated participant"
-            catalog_request_url = "http://127.0.0.1:19003/dsp/catalog/request"
-            credential_protocol = "oid4vp"
-
-            [holder]
-            own_did_host = "localhost:19100"
-            credential_jws = "header.payload.signature"
-            required_scope = "some-scope"
-        "#;
-        let err = ParticipantsConfig::parse(raw, "test.toml").expect_err("should reject");
-        match err {
-            ConfigError::MissingOid4VpResponseUri { id } => assert_eq!(id, "oid4vp-participant"),
-            other => panic!("expected MissingOid4VpResponseUri, got {other:?}"),
-        }
+        let mut gated = open("gated");
+        gated.credential_protocol = CredentialProtocol::Oid4Vp;
+        let err = ParticipantsConfig::new(60, vec![gated], Some(holder())).unwrap_err();
+        assert!(matches!(err, ConfigError::MissingOid4VpResponseUri { id } if id == "gated"));
     }
 
     #[test]
-    fn rejects_oid4vp_without_holder_section() {
-        let raw = r#"
-            interval_secs = 60
-
-            [[participants]]
-            id = "oid4vp-participant"
-            name = "OID4VP-gated participant"
-            catalog_request_url = "http://127.0.0.1:19003/dsp/catalog/request"
-            credential_protocol = "oid4vp"
-            oid4vp_response_uri = "http://127.0.0.1:19003/oid4vp/response"
-        "#;
-        let err = ParticipantsConfig::parse(raw, "test.toml").expect_err("should reject");
-        match err {
-            ConfigError::MissingHolderSection { id } => assert_eq!(id, "oid4vp-participant"),
-            other => panic!("expected MissingHolderSection, got {other:?}"),
-        }
+    fn rejects_oid4vp_without_holder() {
+        let mut gated = open("gated");
+        gated.credential_protocol = CredentialProtocol::Oid4Vp;
+        gated.oid4vp_response_uri = Some("http://127.0.0.1:19003/oid4vp/response".to_string());
+        let err = ParticipantsConfig::new(60, vec![gated], None).unwrap_err();
+        assert!(matches!(err, ConfigError::MissingHolder { id } if id == "gated"));
     }
 
     #[test]
-    fn rejects_malformed_toml() {
-        let err =
-            ParticipantsConfig::parse("not = [valid", "test.toml").expect_err("should reject");
-        assert!(matches!(err, ConfigError::Parse { .. }));
+    fn reads_and_trims_the_credential_file() {
+        let dir = std::env::temp_dir().join(format!("crawler-holder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("holder.jws");
+        std::fs::write(&file, "header.payload.signature\n").unwrap();
+        let mut config = holder();
+        config.credential_jws_file = file.clone();
+        assert_eq!(
+            config.read_credential_jws().unwrap(),
+            "header.payload.signature"
+        );
+
+        std::fs::write(&file, "  \n").unwrap();
+        assert!(matches!(
+            config.read_credential_jws(),
+            Err(ConfigError::EmptyCredentialFile { .. })
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn load_reports_a_clear_error_for_a_missing_file() {
-        let err = ParticipantsConfig::load("/nonexistent/path/to/crawler-config.toml")
-            .expect_err("should fail");
-        assert!(matches!(err, ConfigError::Io { .. }));
+    fn a_missing_credential_file_is_an_error() {
+        assert!(matches!(
+            holder().read_credential_jws(),
+            Err(ConfigError::CredentialFile { .. })
+        ));
     }
 }

@@ -17,8 +17,9 @@ brief.
   component instead of a participant's control-plane. `HarvestSeedExtension`
   seeds its `TargetNodeDirectory`; `run-fedcat-crawler.sh` launches it,
   same env-var-driven pattern as `../crawler-edc-fixture/run-instance.sh`.
-- `participants.toml` - `crates/crawler` config pointing at the same two
-  participants (`requires_dcp = false`, `interval_secs = 5`).
+- `participants.ttl` - the two `broker:Participant` resources (no
+  credential protocol) that `run-harvest-bench.sh` appends to the broker
+  config it generates, with `broker:crawlIntervalSecs 5`.
 - `catalog-request.k6.js` - the load-test script, generalized from
   `../benchmark-2026-08-27.md`'s own (adds `METHOD`/`BODY` env vars so the
   same script drives EDC's Management API `POST v3/catalogs/request` and
@@ -32,7 +33,7 @@ brief.
 - `run-harvest-bench.sh` - the end-to-end driver. Starts the two new
   HARVEST-D/E participants (via `../crawler-edc-fixture/run-instance.sh`,
   unmodified), then runs each system under test in turn (EDC's crawler,
-  then this project's `ds-catalog-broker-rs` with `CRAWLER_CONFIG_PATH` set),
+  then this project's `ds-catalog-broker-rs` with participants configured),
   sampling RSS/CPU and running k6 while each system's harvest loop keeps
   running, checking correctness before and after each load-test window,
   and tearing everything down (trap-based cleanup) even on failure.

@@ -58,14 +58,15 @@ instances on three different port blocks via a plain `java -cp ...
 org.eclipse.edc.boot.system.runtime.BaseRuntime`, no Gradle daemon needed
 per instance.
 
-`participants.toml` — a `crates/crawler` config (schema per
-`crates/crawler/src/config.rs`'s `ParticipantsConfig`/`ParticipantEntry`)
-pointing at the three instances' real, versioned DSP catalog-request
-URLs, `requires_dcp = false` for all three.
+`config_graph.ttl` — a broker config (shape per
+`docs/configuration.md`) whose three `broker:Participant` resources point
+at the three instances' real, versioned DSP catalog-request URLs, with no
+credential protocol on any of them. (This was a `participants.toml` when
+the run below was recorded; the config moved into Turtle since.)
 
 `crates/crawler/tests/crawl_real_edc.rs` — a `#[ignore]`d integration
 test (depends on the three external processes above, so it must not run
-in `cargo test --workspace`'s normal path) that loads `participants.toml`,
+in `cargo test --workspace`'s normal path) that loads `config_graph.ttl`,
 runs one real `crawler::crawl_once` cycle, and **asserts** (not eyeballs)
 that the cache ends up with exactly the six expected dataset ids spread
 across three `Catalog` entries.
@@ -191,7 +192,7 @@ PID_C=$!   # 290611
 ```
 
 Independently confirmed via `ss -tlnp` that each PID actually owns its
-expected DSP port (`18921`/`19021`/`19121`, matching `participants.toml`):
+expected DSP port (`18921`/`19021`/`19121`, matching `config_graph.ttl`):
 
 ```
 $ ss -tlnp | grep -E "18901|18911|18921|18931|18961|19001|19011|19021|19031|19061|19101|19111|19121|19131|19161"
@@ -347,8 +348,8 @@ relying party against EDC" remains deferred, as it was before this step.
 - `compliance/crawler-edc-fixture/logs/instance-{a,b,c}.log` — real
   startup/seed logs from the three instances used for the passing run
   documented above, kept as evidence.
-- `compliance/crawler-edc-fixture/participants.toml` — the crawler config
-  used.
+- `compliance/crawler-edc-fixture/config_graph.ttl` — the crawler config
+  (originally `participants.toml`).
 - `crates/crawler/tests/crawl_real_edc.rs` — the `#[ignore]`d proof test.
 - `crates/crawler/src/lib.rs` — the one-line-of-behavior fix (send a
   placeholder `Authorization` header to non-DCP participants) plus its

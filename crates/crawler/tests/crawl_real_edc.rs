@@ -13,12 +13,13 @@
 
 use std::collections::BTreeSet;
 
-use crawler::{CrawlLimits, ParticipantsConfig, crawl_once};
+use crawler::{CrawlLimits, crawl_once};
+use ds_catalog_broker_rs::config::BrokerSettings;
 use rdf_store::memory::InMemoryCatalogCache;
 use rdf_store::{CatalogCache, CatalogQuery};
 
-const PARTICIPANTS_TOML: &str =
-    include_str!("../../../compliance/crawler-edc-fixture/participants.toml");
+const FIXTURE_CONFIG: &str =
+    include_str!("../../../compliance/crawler-edc-fixture/config_graph.ttl");
 
 /// The six dataset ids `compliance/crawler-edc-fixture`'s three instances
 /// are expected to be seeded with (instance A: 2, B: 1, C: 3) - see
@@ -31,11 +32,15 @@ const EXPECTED_DATASET_IDS: [&str; 6] = [
 #[tokio::test]
 #[ignore = "requires three real Eclipse EDC 0.18.0 instances running - see compliance/crawler-edc-fixture/"]
 async fn crawls_three_real_edc_instances_and_aggregates_all_seeded_datasets() {
-    let config = ParticipantsConfig::parse(
-        PARTICIPANTS_TOML,
-        "compliance/crawler-edc-fixture/participants.toml",
+    let settings = BrokerSettings::from_turtle(
+        FIXTURE_CONFIG.as_bytes(),
+        None,
+        "compliance/crawler-edc-fixture/config_graph.ttl",
     )
-    .expect("participants.toml should parse and validate");
+    .expect("config_graph.ttl should parse and validate");
+    let config = settings
+        .crawler()
+        .expect("config_graph.ttl lists participants");
     assert_eq!(
         config.participants.len(),
         3,

@@ -11,7 +11,7 @@
  * A TargetNode's url is the participant's *base* DSP protocol endpoint
  * including the version segment (e.g. "http://127.0.0.1:19221/api/dsp/2025-1")
  * - NOT the full ".../catalog/request" path used by crates/crawler's own
- * participants.toml. Confirmed by reading FederatedCatalogTest's own node
+ * participant config (compliance/harvest-bench/participants.ttl). Confirmed by reading FederatedCatalogTest's own node
  * construction (CONNECTOR_PROTOCOL.path() + "/" + V_2025_1_VERSION, no
  * "/catalog/request" suffix) - DspCatalogRequestAction/ProtocolRemoteMessageDispatcher
  * resolve the message-type-specific path suffix themselves from this base.
