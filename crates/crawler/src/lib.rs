@@ -2269,4 +2269,169 @@ mod tests {
         assert_eq!(report.expired, vec!["flaky"], "the delete is retried");
         assert!(!harvester.status().snapshot().participants["flaky"].cached);
     }
+
+    // --- #40: unparseable policy content is kept as an unmappable marker ---
+
+    fn parse_one_policy(policy: Value) -> Policy {
+        let body = json!({"@id": "cat-1", "dataset": [{"@id": "D", "hasPolicy": [policy]}]});
+        let catalog = parse_catalog_response(&body, &participant("p40"));
+        catalog.datasets[0].policies[0].clone()
+    }
+
+    fn is_marker(c: &Constraint) -> bool {
+        c.is_unmappable()
+    }
+
+    #[test]
+    fn incomplete_atomic_constraint_becomes_an_unmappable_marker() {
+        let policy = parse_one_policy(json!({"permission": [{
+            "action": "use",
+            "constraint": [{"leftOperand": "purpose", "operator": "eq"}]
+        }]}));
+        let constraints = &policy.permissions[0].constraints;
+        assert_eq!(constraints.len(), 1);
+        assert!(is_marker(&constraints[0]), "{constraints:?}");
+    }
+
+    #[test]
+    fn unrecognized_constraint_shape_becomes_an_unmappable_marker() {
+        let policy = parse_one_policy(json!({"permission": [{
+            "action": "use",
+            "constraint": [{"foo": "bar"}, "not-an-object"]
+        }]}));
+        let constraints = &policy.permissions[0].constraints;
+        assert_eq!(constraints.len(), 2);
+        assert!(constraints.iter().all(is_marker));
+    }
+
+    #[test]
+    fn over_deep_group_child_is_marked_not_dropped() {
+        let mut deep = json!({"leftOperand": "a", "operator": "eq", "rightOperand": "b"});
+        for _ in 0..(MAX_CONSTRAINT_DEPTH + 5) {
+            deep = json!({"odrl:and": [deep]});
+        }
+        let leaf = json!({"leftOperand": "x", "operator": "eq", "rightOperand": "y"});
+        let policy = parse_one_policy(json!({"permission": [{
+            "action": "use",
+            "constraint": [{"odrl:and": [leaf, deep]}]
+        }]}));
+        let Constraint::Logical(catalog_core::LogicalConstraint::And(children)) =
+            &policy.permissions[0].constraints[0]
+        else {
+            panic!("expected an and group");
+        };
+        assert_eq!(children.len(), 2, "the deep child must not be dropped");
+        // Walk down the deep child: it must end in a marker within the
+        // depth bound the store accepts.
+        let mut node = &children[1];
+        let mut depth = 1;
+        loop {
+            match node {
+                Constraint::Logical(catalog_core::LogicalConstraint::And(c)) => {
+                    node = &c[0];
+                    depth += 1;
+                }
+                other => {
+                    assert!(is_marker(other), "{other:?}");
+                    break;
+                }
+            }
+        }
+        assert!(depth <= MAX_CONSTRAINT_DEPTH, "depth {depth}");
+    }
+
+    #[test]
+    fn bare_and_prefixed_aliases_are_read_everywhere() {
+        let policy = parse_one_policy(json!({
+            "odrl:assignee": "did:web:a",
+            "odrl:prohibition": [{
+                "odrl:action": "odrl:distribute",
+                "odrl:constraint": [{"and": [
+                    {"odrl:leftOperand": "count", "odrl:operator": "lt", "odrl:rightOperand": "3"}
+                ]}]
+            }],
+            "http://www.w3.org/ns/odrl/2/permission": {"action": "use"},
+            "obligation": {"action": "delete"}
+        }));
+        assert_eq!(policy.assignee.as_deref(), Some("did:web:a"));
+        assert_eq!(policy.prohibitions.len(), 1);
+        assert_eq!(
+            policy.prohibitions[0].constraints,
+            vec![Constraint::and(vec![Constraint::atomic("count", "lt", "3")])]
+        );
+        assert_eq!(policy.permissions.len(), 1);
+        assert_eq!(policy.obligations.len(), 1);
+    }
+
+    #[test]
+    fn odrl_prefixed_has_policy_is_read() {
+        let body = json!({"@id": "c", "dataset": [{
+            "@id": "D",
+            "odrl:hasPolicy": {"permission": {"action": "use"}}
+        }]});
+        let catalog = parse_catalog_response(&body, &participant("p40"));
+        assert_eq!(catalog.datasets[0].policies.len(), 1);
+    }
+
+    #[test]
+    fn json_ld_value_objects_are_normalized() {
+        let policy = parse_one_policy(json!({
+            "assignee": {"@id": "did:web:a"},
+            "permission": [{
+                "action": {"@id": "odrl:use"},
+                "constraint": [
+                    {"leftOperand": {"@id": "odrl:purpose"}, "operator": {"@id": "odrl:eq"},
+                     "rightOperand": {"@value": "research", "@type": "xsd:string"}},
+                    {"leftOperand": "count", "operator": "lteq", "rightOperand": 10},
+                    {"leftOperand": "flag", "operator": "eq", "rightOperand": true}
+                ]
+            }]
+        }));
+        assert_eq!(policy.assignee.as_deref(), Some("did:web:a"));
+        assert_eq!(policy.permissions[0].action, "odrl:use");
+        assert_eq!(
+            policy.permissions[0].constraints,
+            vec![
+                Constraint::atomic("odrl:purpose", "odrl:eq", "research"),
+                Constraint::atomic("count", "lteq", "10"),
+                Constraint::atomic("flag", "eq", "true"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unparseable_right_operand_is_marked() {
+        let policy = parse_one_policy(json!({"permission": [{
+            "action": "use",
+            "constraint": [{"leftOperand": "x", "operator": "isAnyOf", "rightOperand": ["a", "b"]}]
+        }]}));
+        assert!(is_marker(&policy.permissions[0].constraints[0]));
+    }
+
+    #[test]
+    fn rule_without_a_readable_action_is_kept_with_a_marker() {
+        let policy = parse_one_policy(json!({"prohibition": [
+            {"constraint": [{"leftOperand": "a", "operator": "eq", "rightOperand": "b"}]},
+            {"action": [1, 2]}
+        ]}));
+        assert_eq!(policy.prohibitions.len(), 2);
+        for rule in &policy.prohibitions {
+            assert!(rule.constraints.iter().any(is_marker), "{rule:?}");
+        }
+    }
+
+    #[test]
+    fn unreadable_assignee_is_kept_as_a_marker_rule() {
+        let policy = parse_one_policy(json!({
+            "assignee": {"unexpected": true},
+            "permission": {"action": "use"}
+        }));
+        let marked = policy
+            .permissions
+            .iter()
+            .chain(&policy.prohibitions)
+            .chain(&policy.obligations)
+            .any(|r| r.constraints.iter().any(is_marker));
+        assert!(marked, "{policy:?}");
+    }
 }
