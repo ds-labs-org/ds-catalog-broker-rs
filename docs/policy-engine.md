@@ -27,12 +27,20 @@ named by `left_operand`:
 | `neq` | the claim is present and does not equal or contain `right_operand` |
 | `isAnyOf` | the claim equals or contains any entry of the comma-separated `right_operand` |
 
-A missing claim never matches, `neq` included. An unknown operator never
-matches. The constraints of one rule are ANDed.
+A missing claim and an unknown operator are unevaluable, `neq` included.
+Empty entries in an `isAnyOf` list are ignored, so an empty list matches
+nothing. The constraints of one rule are ANDed: one definite miss makes the
+rule a miss, otherwise one unevaluable constraint makes the rule
+unevaluable. A permission applies only when every constraint matches. A
+prohibition applies when every constraint matches or is unevaluable, and its
+reason reads `could not be evaluated, failing closed`.
+
+Policy-level obligations are parsed and ignored. An allowed request carries
+no signal that a duty exists.
 
 Rules combine across every attached policy, in this order:
 
-1. Deny if any prohibition matches.
+1. Deny if any prohibition applies.
 2. Allow if no policy declares any permission.
 3. Allow if any permission matches.
 4. Deny.
@@ -99,7 +107,9 @@ A host calls them in this order:
    the response.
 
 `dealloc` must receive the same length the buffer was allocated with. A
-negative length is treated as 0. Request JSON that does not match the
+negative length is treated as 0. `alloc` returns 0 when the allocator cannot
+serve the length, for example when the host caps the guest's memory, and the
+host must check for it before writing. Request JSON that does not match the
 schema does not trap: the response is `Deny`, with an empty `dataset_id`
 and a reason starting `policy-engine: request JSON did not match the
 schema`.
@@ -119,7 +129,8 @@ cargo test -p policy-engine
 - `tests/wasm_abi.rs` builds the module with the command above, loads it
   into a `wasmi` instance, and runs the full alloc, evaluate, dealloc
   sequence. It also checks malformed input, repeated calls on one
-  instance, negative lengths and the export list. The test needs the
+  instance, negative lengths, an allocation that exceeds the host's memory
+  limit and the export list. The test needs the
   `wasm32-unknown-unknown` target installed and fails with an install hint
   when the build fails.
 
