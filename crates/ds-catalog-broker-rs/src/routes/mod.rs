@@ -14,7 +14,7 @@ mod holder;
 mod management;
 pub(crate) mod policy;
 mod ready;
-mod sparql;
+pub(crate) mod sparql;
 
 use catalog::get_catalog;
 use holder::{holder_did_document_route, holder_presentation_query_route};

@@ -2,6 +2,7 @@
 //! analysis §3.3).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Form,
@@ -199,7 +200,7 @@ pub(super) async fn sparql_route(
         let _slot = slot;
         if cancellation_requested(&limits) {
             // Timed out or abandoned while waiting for a blocking thread.
-            return Err(Evaluation::Sparql(SparqlError::Cancelled));
+            return Err(SparqlError::Cancelled);
         }
         if should_filter_by_policy(&state) {
             let engine_claims = engine_claims_from_bearer(claims.as_ref());
@@ -213,7 +214,6 @@ pub(super) async fn sparql_route(
         } else {
             state.cache.sparql_query_json_limited(&query, None, &limits)
         }
-        .map_err(Evaluation::Sparql)
     });
     let stopping = async move {
         match draining {
@@ -234,7 +234,7 @@ pub(super) async fn sparql_route(
     };
     let result = match finished {
         Ok(Ok(Ok(body))) => Ok(body),
-        Ok(Ok(Err(Evaluation::Sparql(err)))) => Err(err),
+        Ok(Ok(Err(err))) => Err(err),
         Ok(Err(join_error)) => {
             tracing::error!(error = %join_error, "SPARQL evaluation task panicked");
             return internal_error("SPARQL evaluation failed");
@@ -251,21 +251,27 @@ pub(super) async fn sparql_route(
             body,
         )
             .into_response(),
-        Err(
-            err @ (SparqlError::Parse(_)
-            | SparqlError::Evaluation(_)
-            | SparqlError::UnsupportedGraphResult),
-        ) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-        Err(SparqlError::Store(err)) => {
+        Err(err) => error_response(err, timeout),
+    }
+}
+
+/// The HTTP answer for a failed query - see [`sparql_route`] for each
+/// status. `timeout` is only quoted in the answer to a cancelled query.
+pub(crate) fn error_response(err: SparqlError, timeout: Duration) -> axum::response::Response {
+    match err {
+        err @ (SparqlError::Parse(_)
+        | SparqlError::Evaluation(_)
+        | SparqlError::UnsupportedGraphResult) => {
+            (StatusCode::BAD_REQUEST, err.to_string()).into_response()
+        }
+        SparqlError::Store(err) => {
             tracing::error!(error = %err, "catalog store read failed during SPARQL query");
             internal_error("SPARQL evaluation failed")
         }
-        Err(SparqlError::StoreBusy) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            SparqlError::StoreBusy.to_string(),
-        )
-            .into_response(),
-        Err(SparqlError::Cancelled) => (
+        err @ SparqlError::StoreBusy => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
+        SparqlError::Cancelled => (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "SPARQL query ran past the {} ms time limit and was stopped - add a LIMIT or \
@@ -274,20 +280,14 @@ pub(super) async fn sparql_route(
             ),
         )
             .into_response(),
-        Err(err @ SparqlError::TooManyRows(_)) => {
+        err @ SparqlError::TooManyRows(_) => {
             (StatusCode::BAD_REQUEST, err.to_string()).into_response()
         }
-        Err(err @ SparqlError::Serialize(_)) => {
+        err @ SparqlError::Serialize(_) => {
             tracing::error!(error = %err, "failed to serialize SPARQL results");
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
     }
-}
-
-/// Why the blocking half of [`sparql_route`] failed.
-enum Evaluation {
-    /// The query itself failed - see [`SparqlError`] for each status.
-    Sparql(SparqlError),
 }
 
 /// Cancels the evaluation's token when dropped, so an evaluation whose
