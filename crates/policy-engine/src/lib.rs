@@ -873,6 +873,30 @@ mod tests {
         assert_eq!(evaluate(&request).decision, Decision::Deny);
     }
 
+    /// The request carries no action, so `Rule::action` is never compared.
+    /// A prohibition on one action denies the dataset for every use, and a
+    /// permission for one action allows every use.
+    #[test]
+    fn rule_action_is_not_compared() {
+        let deny = EvaluateRequest {
+            dataset_id: "ds-1".to_string(),
+            policies: vec![policy(
+                "p1",
+                vec![rule("read", vec![])],
+                vec![rule("distribute", vec![])],
+            )],
+            claims: claims(&[]),
+        };
+        assert_eq!(evaluate(&deny).decision, Decision::Deny);
+
+        let allow = EvaluateRequest {
+            dataset_id: "ds-1".to_string(),
+            policies: vec![policy("p1", vec![rule("read", vec![])], vec![])],
+            claims: claims(&[]),
+        };
+        assert_eq!(evaluate(&allow).decision, Decision::Allow);
+    }
+
     /// An unevaluable permission constraint stays a miss.
     #[test]
     fn unevaluable_permission_constraint_stays_a_miss() {
