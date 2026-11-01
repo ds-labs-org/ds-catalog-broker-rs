@@ -221,7 +221,7 @@ impl OAuth2Verifier {
             // expected issuer configured (verified against
             // `validation.rs`'s `(claims.iss, options.iss.as_ref())` match:
             // the only failing arms require `TryParse::Parsed`). Requiring
-            // the claim closes that bypass: configuring `OAUTH2_ISSUER`
+            // the claim closes that bypass: configuring `broker:oauth2Issuer`
             // must mean every accepted token actually carries a matching
             // `iss`, not "carries one if it happens to have one at all".
             validation.required_spec_claims.insert("iss".to_string());
@@ -235,7 +235,7 @@ impl OAuth2Verifier {
             // `jsonwebtoken`'s `Validation` otherwise rejects *any* token
             // that merely carries an `aud` claim once `validate_aud`
             // defaults to `true` and no expected audience was set - not
-            // what "OAUTH2_AUDIENCE unset -> unchecked" (design doc) means.
+            // what "broker:oauth2Audience unset -> unchecked" (design doc) means.
             validation.validate_aud = false;
         }
 
@@ -684,7 +684,7 @@ mod tests {
     /// is *present* on the token (`(TryParse::Parsed(_), Some(_))` is the
     /// only branch that can fail; a token with no `aud` claim at all falls
     /// through to the catch-all `_ => {}` and passes). So a validly-signed
-    /// token that simply omits `aud` bypasses `OAUTH2_AUDIENCE` entirely,
+    /// token that simply omits `aud` bypasses `broker:oauth2Audience` entirely,
     /// even though the operator configured it specifically to restrict
     /// which audience's tokens this resource server accepts. `iss`
     /// configured must likewise force the `iss` claim to be present.
@@ -710,7 +710,7 @@ mod tests {
     }
 
     /// Same bypass as above, for `iss`: a token with no `iss` claim at all
-    /// must not silently pass when `OAUTH2_ISSUER` is configured.
+    /// must not silently pass when `broker:oauth2Issuer` is configured.
     #[tokio::test]
     async fn verify_rejects_a_token_with_no_iss_claim_at_all_when_issuer_is_configured() {
         let key = generate_key("key-1");
@@ -735,7 +735,7 @@ mod tests {
     /// Regression guard for a real `jsonwebtoken` footgun: `Validation`
     /// defaults to rejecting any token that carries an `aud` claim unless
     /// an expected audience was explicitly set, even when the caller never
-    /// asked for audience checking at all. `OAUTH2_AUDIENCE` unset must
+    /// asked for audience checking at all. `broker:oauth2Audience` unset must
     /// mean "don't check `aud`", not "reject any token that happens to
     /// have one" - see the design doc's config table ("checked only if
     /// set").

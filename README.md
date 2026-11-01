@@ -136,7 +136,8 @@ serving surfaces also *filter* what they re-serve against a caller's
 entitlement under a harvested dataset's own ODRL policy, evaluated via
 [`ds-odrl-engine-rs`](https://labs.deepthought-solutions.net/Deepthought-Solutions/ds-odrl-engine-rs)
 (`crates/ds-catalog-broker-rs/src/odrl_filter.rs`), driven by an explicit,
-env-var-configured `PolicyFilterConfig` rather than a hardcoded judgment
+Turtle-configured `PolicyFilterConfig` (see
+[docs/configuration.md](docs/configuration.md)) rather than a hardcoded judgment
 call (unmappable-constraint handling, default visibility for
 policy-free/empty-permissions datasets, and whether filtering runs when
 OAuth2 is disabled).
