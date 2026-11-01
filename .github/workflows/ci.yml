@@ -5,7 +5,7 @@ name: CI
 # check in a PR: fmt and clippy are fast-fail static gates, test is the
 # real correctness gate.
 #
-# All three target the 5 product crates explicitly (PRODUCT_CRATES) rather
+# All three target the 6 product crates explicitly (PRODUCT_CRATES) rather
 # than `--workspace`: the vendored submodules under vendor/ (contreforts-kg,
 # contreforts-core, contreforts-core/declaration, contreforts-config) are
 # real workspace members so this repo's root Cargo.toml can pin their
@@ -33,7 +33,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  PRODUCT_CRATES: -p catalog-core -p rdf-store -p ds-catalog-broker-rs -p dcp-core -p crawler
+  PRODUCT_CRATES: -p catalog-core -p rdf-store -p ds-catalog-broker-rs -p dcp-core -p crawler -p policy-engine
 
 jobs:
   fmt:
@@ -68,7 +68,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      # policy-engine's tests/wasm_abi.rs builds the crate for
+      # wasm32-unknown-unknown, so the target must be installed.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo test ${{ env.PRODUCT_CRATES }}
 

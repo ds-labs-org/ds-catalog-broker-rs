@@ -11,6 +11,16 @@
 //! WASM/FFI involvement, testable exactly like any other Rust library
 //! function. The WASM ABI built on top of it lives in [`ffi`].
 //!
+//! # Status
+//!
+//! This crate is a prototype and nothing in the workspace depends on it.
+//! It supports the `eq`, `neq` and `isAnyOf` operators and combines all
+//! attached policies with deny-overrides. It has no profiles, no duties
+//! and no error result. The case study's 2026-09-05 update records that
+//! those were built later in the separate `ds-odrl-engine-rs` repository,
+//! which is what `ds-catalog-broker-rs` uses for its filtering. See
+//! `docs/policy-engine.md` in this repository for the ABI and the build.
+//!
 //! # Scope boundary
 //!
 //! This crate does not verify eIDAS2/EUDI Wallet presentations, does not
