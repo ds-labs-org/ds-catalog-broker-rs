@@ -5,7 +5,11 @@ use super::*;
 impl OxigraphCatalogCache {
     /// Write every triple for `catalog` into `graph` - see the
     /// `oxigraph_backend` module doc for the exact mapping.
-    pub(super) fn write_catalog(&self, catalog: &Catalog, graph: &NamedNode) -> StoreResult<()> {
+    pub(super) fn write_catalog(
+        &self,
+        catalog: &Catalog,
+        graph: &mut GraphWrite,
+    ) -> StoreResult<()> {
         let base = node_base(&catalog.origin_node);
         let catalog_node = catalog_iri(&base, &catalog.id);
 
@@ -158,7 +162,7 @@ impl OxigraphCatalogCache {
         policy: &Policy,
         policy_node: &NamedNode,
         index: usize,
-        graph: &NamedNode,
+        graph: &mut GraphWrite,
     ) -> StoreResult<()> {
         self.insert(
             policy_node,
@@ -230,7 +234,7 @@ impl OxigraphCatalogCache {
         policy_node: &NamedNode,
         predicate: &NamedNode,
         segment: &str,
-        graph: &NamedNode,
+        graph: &mut GraphWrite,
     ) -> StoreResult<()> {
         for (index, rule) in rules.iter().enumerate() {
             let rule_node = rule_iri(policy_node.as_str(), segment, index);
@@ -250,7 +254,7 @@ impl OxigraphCatalogCache {
         rule: &Rule,
         rule_node: &NamedNode,
         index: usize,
-        graph: &NamedNode,
+        graph: &mut GraphWrite,
     ) -> StoreResult<()> {
         self.insert(
             rule_node,
@@ -305,7 +309,7 @@ impl OxigraphCatalogCache {
         constraint_node: &NamedNode,
         index: usize,
         depth: usize,
-        graph: &NamedNode,
+        graph: &mut GraphWrite,
     ) -> StoreResult<()> {
         self.insert(
             constraint_node,

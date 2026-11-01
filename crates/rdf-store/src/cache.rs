@@ -44,12 +44,18 @@ impl CatalogQuery {
 ///
 /// Implementations must be safe to share across crawl tasks (`Send +
 /// Sync`) since a real crawler runs multiple concurrent fetches.
+///
+/// Writes are atomic per origin node: a `query` running alongside an
+/// `upsert` or `delete` of the same node sees the catalog as it was
+/// before the write or as it is after it, never a partly written one.
 #[async_trait]
 pub trait CatalogCache: Send + Sync {
     /// Insert or replace the named graph for `catalog.origin_node`.
     ///
     /// Re-crawling the same node always overwrites its prior catalog
-    /// wholesale, matching EDC's upsert-by-origin-node-url behavior.
+    /// wholesale, matching EDC's upsert-by-origin-node-url behavior. The
+    /// old catalog stays readable until the new one replaces it in one
+    /// step.
     async fn upsert(&self, catalog: Catalog) -> StoreResult<()>;
 
     /// Return stored catalogs matching `query`.

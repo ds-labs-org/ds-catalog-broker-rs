@@ -347,7 +347,7 @@ use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::{PreparedSparqlQuery, QueryEvaluationError, QueryResults, SparqlEvaluator};
 use oxigraph::store::StorageError;
 use spareval::{InternalQuad, QueryableDataset};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 use crate::{CatalogCache, CatalogQuery, StoreError, StoreResult};
@@ -481,35 +481,80 @@ impl OxigraphCatalogCache {
         Ok(Self { store })
     }
 
-    /// Quads matching the given pattern, always scoped to `graph` -
-    /// every read this backend does is graph-scoped, so `graph` is a
-    /// required parameter here rather than another `Option`.
+    /// Every quad of `graph`, read from one store snapshot - so the
+    /// whole catalog is decoded from a single consistent state, even
+    /// while another task upserts the same participant.
+    fn snapshot(&self, graph: &NamedNode) -> StoreResult<GraphSnapshot> {
+        Ok(self
+            .snapshots(Some(graph))?
+            .remove(graph)
+            .unwrap_or_default())
+    }
+
+    /// The quads of `graph`, or of every named graph when `None`, read
+    /// from one store snapshot and grouped by graph - so reading every
+    /// catalog sees all participants in the same store state.
+    fn snapshots(
+        &self,
+        graph: Option<&NamedNode>,
+    ) -> StoreResult<HashMap<NamedNode, GraphSnapshot>> {
+        let mut graphs: HashMap<NamedNode, GraphSnapshot> = HashMap::new();
+        for quad in self
+            .store
+            .inner()
+            .quads_for_pattern(None, None, None, graph.map(|g| g.into()))
+        {
+            let quad = quad?;
+            // This backend only ever writes named-node graphs.
+            let GraphName::NamedNode(name) = &quad.graph_name else {
+                continue;
+            };
+            let snapshot = graphs.entry(name.clone()).or_default();
+            snapshot
+                .by_subject
+                .entry(quad.subject.clone())
+                .or_default()
+                .push(snapshot.quads.len());
+            snapshot.quads.push(quad);
+        }
+        Ok(graphs)
+    }
+
+    /// Quads of `graph` matching the given pattern, in store order.
     fn quads(
         &self,
         subject: Option<&NamedNode>,
         predicate: Option<&NamedNode>,
         object: Option<&Term>,
-        graph: &NamedNode,
+        graph: &GraphSnapshot,
     ) -> StoreResult<Vec<Quad>> {
-        self.store
-            .inner()
-            .quads_for_pattern(
-                subject.map(|s| s.into()),
-                predicate.map(|p| p.into()),
-                object.map(|o| o.into()),
-                Some(graph.into()),
-            )
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
+        let candidates: Box<dyn Iterator<Item = &Quad>> = match subject {
+            Some(subject) => Box::new(
+                graph
+                    .by_subject
+                    .get(&NamedOrBlankNode::from(subject.clone()))
+                    .into_iter()
+                    .flatten()
+                    .map(|&index| &graph.quads[index]),
+            ),
+            None => Box::new(graph.quads.iter()),
+        };
+        Ok(candidates
+            .filter(|quad| {
+                predicate.is_none_or(|p| &quad.predicate == p)
+                    && object.is_none_or(|o| &quad.object == o)
+            })
+            .cloned()
+            .collect())
     }
 
-    /// The first object found for `(subject, predicate, ?, graph)`, if
-    /// any.
+    /// The first object found for `(subject, predicate, ?)` in `graph`,
+    /// if any.
     fn first_object(
         &self,
         subject: &NamedNode,
         predicate: &NamedNode,
-        graph: &NamedNode,
+        graph: &GraphSnapshot,
     ) -> StoreResult<Option<Term>> {
         Ok(self
             .quads(Some(subject), Some(predicate), None, graph)?
@@ -518,7 +563,7 @@ impl OxigraphCatalogCache {
             .map(|quad| quad.object))
     }
 
-    fn sequence_index(&self, subject: &NamedNode, graph: &NamedNode) -> StoreResult<usize> {
+    fn sequence_index(&self, subject: &NamedNode, graph: &GraphSnapshot) -> StoreResult<usize> {
         let term = self
             .first_object(subject, &sequence_index_pred(), graph)?
             .ok_or_else(|| {
@@ -538,39 +583,56 @@ impl OxigraphCatalogCache {
         }
     }
 
-    /// Whether `graph` currently holds any quad at all.
-    fn graph_nonempty(&self, graph: &NamedNode) -> StoreResult<bool> {
-        Ok(!self.quads(None, None, None, graph)?.is_empty())
-    }
-
-    /// Remove every quad in `graph`, regardless of subject - the
-    /// "replace wholesale" half of `upsert`, and all of `delete`.
-    fn clear_named_graph(&self, graph: &NamedNode) -> StoreResult<()> {
-        self.store.inner().remove_named_graph(graph)?;
-        Ok(())
-    }
-
+    /// Buffer one quad of the catalog being written; `upsert` applies the
+    /// whole buffer in one transaction.
     fn insert(
         &self,
         subject: &NamedNode,
         predicate: &NamedNode,
         object: &Term,
-        graph: &NamedNode,
+        graph: &mut GraphWrite,
     ) -> StoreResult<()> {
-        self.store
-            .insert_in_named_graph(subject, predicate, object, graph)?;
+        graph.quads.push(Quad::new(
+            subject.clone(),
+            predicate.clone(),
+            object.clone(),
+            graph.name.clone(),
+        ));
         Ok(())
     }
+}
+
+/// The quads of one named graph, read from a single store snapshot in
+/// store order and indexed by subject - what `read`'s decoding works from.
+#[derive(Default)]
+pub(super) struct GraphSnapshot {
+    quads: Vec<Quad>,
+    by_subject: HashMap<NamedOrBlankNode, Vec<usize>>,
+}
+
+/// The quads of a catalog being written, collected before any of them
+/// reaches the store.
+pub(super) struct GraphWrite {
+    name: NamedNode,
+    quads: Vec<Quad>,
 }
 
 #[async_trait]
 impl CatalogCache for OxigraphCatalogCache {
     async fn upsert(&self, catalog: Catalog) -> StoreResult<()> {
-        let graph = node_iri(&catalog.origin_node);
-        // Insert-or-replace: clear any prior graph for this node first
-        // (EDC's upsert-by-origin-node-url behavior).
-        self.clear_named_graph(&graph)?;
-        self.write_catalog(&catalog, &graph)?;
+        let mut graph = GraphWrite {
+            name: node_iri(&catalog.origin_node),
+            quads: Vec::new(),
+        };
+        self.write_catalog(&catalog, &mut graph)?;
+        // Insert-or-replace (EDC's upsert-by-origin-node-url behavior):
+        // the old graph is removed and the new one written in a single
+        // transaction, so a reader sees one catalog or the other, never
+        // a partly written one.
+        let mut transaction = self.store.inner().start_transaction()?;
+        transaction.remove_named_graph(&graph.name)?;
+        transaction.extend(&graph.quads);
+        transaction.commit()?;
         Ok(())
     }
 
@@ -579,24 +641,15 @@ impl CatalogCache for OxigraphCatalogCache {
 
         match &query.origin_node {
             Some(node) => {
-                let graph = node_iri(node);
+                let graph = self.snapshot(&node_iri(node))?;
                 if let Some(catalog) = self.load_catalog(node, &graph)? {
                     results.push(catalog);
                 }
             }
             None => {
-                let graph_names: Vec<NamedOrBlankNode> = self
-                    .store
-                    .inner()
-                    .named_graphs()
-                    .collect::<Result<_, _>>()?;
-                for graph in graph_names {
-                    let NamedOrBlankNode::NamedNode(graph_iri) = graph else {
-                        // This backend never writes blank-node graphs.
-                        continue;
-                    };
+                for (graph_iri, graph) in self.snapshots(None)? {
                     let node = decode_node_id(&graph_iri)?;
-                    if let Some(catalog) = self.load_catalog(&node, &graph_iri)? {
+                    if let Some(catalog) = self.load_catalog(&node, &graph)? {
                         results.push(catalog);
                     }
                 }
@@ -616,9 +669,17 @@ impl CatalogCache for OxigraphCatalogCache {
 
     async fn delete(&self, node: &NodeId) -> StoreResult<bool> {
         let graph = node_iri(node);
-        let existed = self.graph_nonempty(&graph)?;
+        // Checked and removed in one transaction, so a concurrent upsert
+        // lands wholly before or wholly after the delete.
+        let mut transaction = self.store.inner().start_transaction()?;
+        let existed = transaction
+            .quads_for_pattern(None, None, None, Some(graph.as_ref().into()))
+            .next()
+            .transpose()?
+            .is_some();
         if existed {
-            self.clear_named_graph(&graph)?;
+            transaction.remove_named_graph(&graph)?;
+            transaction.commit()?;
         }
         Ok(existed)
     }
