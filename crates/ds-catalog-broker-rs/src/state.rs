@@ -52,6 +52,10 @@ pub struct AppState {
     /// One permit per `/sparql` evaluation allowed to run at once
     /// ([`SparqlLimitsConfig::max_concurrent`]); set with `sparql_limits`.
     pub sparql_slots: Arc<tokio::sync::Semaphore>,
+    /// One permit per full-store decode (`GET /catalog`, the management
+    /// catalog request) allowed to run at once on the blocking pool; more
+    /// requests wait for a permit. Sized to the machine's parallelism.
+    pub catalog_slots: Arc<tokio::sync::Semaphore>,
     /// What the crawler reports, for `GET /ready`. `None` when no crawler
     /// runs (no `broker:participant`), in which case the broker is ready
     /// as soon as it serves.
@@ -156,6 +160,9 @@ impl AppState {
                 SparqlLimitsConfig::default().max_concurrent,
             )),
             sparql_limits: SparqlLimitsConfig::default(),
+            catalog_slots: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(2, |n| n.get().max(2)),
+            )),
             crawl_status: None,
             shutdown: None,
         }

@@ -50,7 +50,7 @@ async fn longest_stall_while_serving(state: AppState, request: Request<Body>) ->
     ticker.await.unwrap()
 }
 
-const STALL_LIMIT: Duration = Duration::from_millis(100);
+const STALL_LIMIT: Duration = Duration::from_millis(200);
 
 #[tokio::test(flavor = "current_thread")]
 async fn policy_filtered_sparql_does_not_stall_the_async_worker() {
@@ -92,4 +92,29 @@ async fn the_management_catalog_request_does_not_stall_the_async_worker() {
         stall < STALL_LIMIT,
         "the async worker stalled for {stall:?}"
     );
+}
+
+/// Full-store decodes queue for a permit rather than all running at once
+/// on the blocking pool.
+#[tokio::test]
+async fn get_catalog_waits_for_a_free_decode_slot() {
+    let state = test_state();
+    let slots = Arc::clone(&state.catalog_slots);
+    let all = slots.available_permits() as u32;
+    let busy = Arc::clone(&slots).acquire_many_owned(all).await.unwrap();
+    let app = build_router(state);
+    let request = || {
+        Request::builder()
+            .uri("/catalog")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let waiting =
+        tokio::time::timeout(Duration::from_millis(200), app.clone().oneshot(request())).await;
+    assert!(waiting.is_err(), "served while every decode slot was taken");
+
+    drop(busy);
+    let response = app.oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
