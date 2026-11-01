@@ -69,6 +69,8 @@ pub enum JwksError {
          plain http to a loopback address"
     )]
     InsecureUri { uri: String },
+    #[error("JWKS URI {uri} is not a valid URL")]
+    InvalidUri { uri: String },
     #[error("JWKS response from {uri} is larger than {limit} bytes")]
     TooLarge { uri: String, limit: usize },
     #[error(
@@ -149,7 +151,10 @@ impl OAuth2Verifier {
     /// survives that filtering (`JwksError::NoUsableKeys`).
     pub async fn fetch(client: &reqwest::Client, config: OAuth2Config) -> Result<Self, JwksError> {
         let uri = config.jwks_uri.clone();
-        if !reqwest::Url::parse(&uri).is_ok_and(|url| crawler::remote_allowed(&url)) {
+        let Ok(url) = reqwest::Url::parse(&uri) else {
+            return Err(JwksError::InvalidUri { uri });
+        };
+        if !crawler::remote_allowed(&url) {
             return Err(JwksError::InsecureUri { uri });
         }
         let response = client
