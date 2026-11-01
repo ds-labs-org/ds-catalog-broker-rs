@@ -676,3 +676,45 @@ fn a_huge_sparql_max_concurrent_is_capped_rather_than_panicking() {
     let state = test_state().with_sparql_limits(SparqlLimitsConfig::from_settings(&settings));
     assert!(state.sparql_slots.available_permits() > 0);
 }
+
+// --- Status mapping of SPARQL failures ---------------------------------
+
+async fn error_answer(err: rdf_store::oxigraph_backend::SparqlError) -> (StatusCode, String) {
+    let response = crate::routes::sparql::error_response(err, Duration::from_millis(250));
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// A failed store read is the broker's fault: 500, and the body names
+/// nothing of the store.
+#[tokio::test]
+async fn a_store_read_failure_answers_500_with_a_fixed_body() {
+    use rdf_store::oxigraph_backend::SparqlError;
+    let (status, body) = error_answer(SparqlError::Store(
+        "corrupt quad in /var/lib/broker/store".to_string(),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("SPARQL evaluation failed"), "body: {body}");
+    assert!(!body.contains("corrupt"), "body: {body}");
+    assert!(!body.contains("/var/lib"), "body: {body}");
+}
+
+/// A store that kept changing is a temporary condition: 503, not 400.
+#[tokio::test]
+async fn a_store_that_keeps_changing_answers_503() {
+    use rdf_store::oxigraph_backend::SparqlError;
+    let (status, body) = error_answer(SparqlError::StoreBusy).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("kept changing"), "body: {body}");
+    assert!(body.contains("retry"), "body: {body}");
+}
+
+/// An error in the caller's own query stays 400.
+#[tokio::test]
+async fn a_query_evaluation_error_answers_400() {
+    use rdf_store::oxigraph_backend::SparqlError;
+    let (status, _) = error_answer(SparqlError::Evaluation("bad filter".to_string())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
