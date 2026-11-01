@@ -1,0 +1,35 @@
+# crates/crawler participants for the harvesting benchmark
+# (compliance/harvest-benchmark-2026-08-27.md). run-harvest-bench.sh appends
+# this to the broker:BrokerConfig it generates, which links both resources
+# with broker:participant and sets broker:crawlIntervalSecs 5.
+#
+# Points at the same two new real Eclipse EDC 0.18.0 participant instances
+# EDC's own federated-catalog crawler is benchmarked against
+# (compliance/harvest-bench/edc-fedcat-runtime/), started via the existing,
+# unmodified ../crawler-edc-fixture/run-instance.sh +
+# spike.CatalogFixtureExtension mechanism - see
+# ../crawler-edc-integration-test.md for that mechanism's own proof.
+#
+# No broker:credentialProtocol (the default, "none") on either, matching
+# every prior benchmark's own documented scope decision (real EDC-side
+# DCP/OID4VP is out of scope - see ../benchmark-dcp-2026-08-27.md).
+#
+# The 5 s interval is short and observable, matching the period this
+# benchmark also configures for EDC's own crawler
+# (edc.catalog.cache.execution.period.seconds, see
+# edc-fedcat-runtime/run-fedcat-crawler.sh) so both systems' background
+# harvesting loops re-crawl at comparable frequency during the load-test
+# window.
+#
+# Shape: docs/configuration.md ("Participants and holder").
+@prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .
+
+<urn:harvest-bench:d> a broker:Participant ;
+    broker:participantId "harvest-d" ;
+    broker:participantName "Harvest participant D (3 datasets)" ;
+    broker:catalogRequestUrl "http://127.0.0.1:19221/api/dsp/2025-1/catalog/request" .
+
+<urn:harvest-bench:e> a broker:Participant ;
+    broker:participantId "harvest-e" ;
+    broker:participantName "Harvest participant E (7 datasets)" ;
+    broker:catalogRequestUrl "http://127.0.0.1:19321/api/dsp/2025-1/catalog/request" .

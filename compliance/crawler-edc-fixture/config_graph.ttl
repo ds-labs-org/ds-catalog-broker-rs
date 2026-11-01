@@ -1,0 +1,30 @@
+# Real-EDC crawler proof config (compliance/crawler-edc-integration-test.md).
+#
+# Three independent, real Eclipse EDC 0.18.0 control-plane instances (see
+# run-instance.sh), each seeded with different, distinct dataset ids by
+# CatalogFixtureExtension. No broker:credentialProtocol on any of them (the
+# default, "none") - real EDC-side DCP/OID4VP is explicitly out of scope for
+# this step, see ../benchmark-dcp-2026-08-27.md and
+# ../crawler-edc-integration-test.md.
+#
+# Shape: docs/configuration.md ("Participants and holder").
+@prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .
+
+<urn:ds-catalog-broker:config> a broker:BrokerConfig ;
+    broker:crawlIntervalSecs 300 ;
+    broker:participant <urn:edc-fixture:a>, <urn:edc-fixture:b>, <urn:edc-fixture:c> .
+
+<urn:edc-fixture:a> a broker:Participant ;
+    broker:participantId "edc-instance-a" ;
+    broker:participantName "Real EDC instance A" ;
+    broker:catalogRequestUrl "http://127.0.0.1:18921/api/dsp/2025-1/catalog/request" .
+
+<urn:edc-fixture:b> a broker:Participant ;
+    broker:participantId "edc-instance-b" ;
+    broker:participantName "Real EDC instance B" ;
+    broker:catalogRequestUrl "http://127.0.0.1:19021/api/dsp/2025-1/catalog/request" .
+
+<urn:edc-fixture:c> a broker:Participant ;
+    broker:participantId "edc-instance-c" ;
+    broker:participantName "Real EDC instance C" ;
+    broker:catalogRequestUrl "http://127.0.0.1:19121/api/dsp/2025-1/catalog/request" .

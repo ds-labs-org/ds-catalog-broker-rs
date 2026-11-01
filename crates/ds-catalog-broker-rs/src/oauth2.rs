@@ -46,7 +46,7 @@ pub struct OAuth2Config {
 /// Failure fetching or parsing the JWKS at [`OAuth2Config::jwks_uri`] -
 /// returned by [`OAuth2Verifier::fetch`]. `main.rs` panics on any of
 /// these at startup, the same failure posture as a bad
-/// `broker:crawlerConfigPath` - see the design doc's config table.
+/// participant or holder in the config - see the design doc's config table.
 #[derive(Debug, Error)]
 pub enum JwksError {
     #[error("failed to fetch JWKS from {uri}: {source}")]

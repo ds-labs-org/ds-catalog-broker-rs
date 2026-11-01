@@ -72,10 +72,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 rand = "0.8"
 base64 = "0.22"
-# Parses crates/crawler's local-config participant registry TOML file
-# (ParticipantsConfig). Not used anywhere else in this workspace's own
-# crates today.
-toml = "0.8"
 # A real, spec-tested JWT library for the OAuth2 Bearer resource-server
 # check (docs/oauth2-bearer-gating-2026-08-28.md), gating GET /catalog and
 # GET/POST /sparql. Deliberately not the same choice as p256/rand above:

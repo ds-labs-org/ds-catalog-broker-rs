@@ -22,7 +22,7 @@ pub struct AppState {
     /// on `AppState` rather than being constructed per request.
     pub http: reqwest::Client,
     /// This connector's own DCP *holder* identity - set only when a
-    /// crawler config with a `[holder]` section was loaded (see `main.rs`).
+    /// `broker:Holder` is configured alongside at least one participant (see `main.rs`).
     /// `None` means this connector presents no credential of its own and
     /// the two `/dsp/holder/*` routes (`routes::holder`) 404.
     pub holder: Option<Arc<HolderIdentity>>,
@@ -31,7 +31,7 @@ pub struct AppState {
     /// reach `OxigraphCatalogCache::sparql_query_json` - a capability that
     /// exists on that concrete type, not on the `CatalogCache` trait (see
     /// that method's own doc comment for why). `Some` exactly when `cache`
-    /// is backed by Oxigraph (i.e. `broker:crawlerConfigPath` was set, see
+    /// is backed by Oxigraph (i.e. a `broker:participant` is configured, see
     /// `main.rs`); `None` when it's the plain in-memory backend, in which
     /// case `/sparql` answers 501 rather than pretending to support a
     /// query language that backend doesn't implement.

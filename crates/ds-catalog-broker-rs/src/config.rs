@@ -17,6 +17,14 @@
 //! Unset, the location is `contreforts-config`'s per-user default, `<os-data-dir>/config_store`.
 //! No setting is read from the environment.
 //!
+//! # The crawler's participants and holder
+//!
+//! The participant registry and the crawler's holder identity are separate resources in the
+//! same graph, linked from `broker:BrokerConfig` with `broker:participant` (any number) and
+//! `broker:holder` (at most one); see [`BrokerSettings::crawler`]. They are read strictly: a
+//! missing required property, a value that doesn't parse, or a link to a resource of the wrong
+//! type stops the broker, unlike a bad scalar setting, which falls back to its default.
+//!
 //! # No config store at all is not an error
 //!
 //! When `CONFIG_STORE_PATH` is unset and the per-user default datadir holds no
@@ -31,14 +39,15 @@
 //! `config_graph.ttl` from its `.bak.N` backups - both writes - see
 //! [`BrokerSettings::from_location`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use contreforts_config::{ConfigStore, ConfigStoreConfig, ConfigStoreError};
 use contreforts_core::namespaces::CONFIG_GRAPH;
+use crawler::{HolderConfig, ParticipantEntry, ParticipantsConfig};
 use oxigraph::io::{RdfFormat, RdfParser};
-use oxigraph::model::{GraphName, NamedNode, Term};
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::model::vocab::rdf;
+use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Term};
 use oxigraph::store::Store;
 use reqwest::Url;
 
@@ -69,7 +78,7 @@ impl Setting {
 }
 
 pub const HTTP_API_ADDR: Setting = Setting::new("httpApiAddr");
-pub const CRAWLER_CONFIG_PATH: Setting = Setting::new("crawlerConfigPath");
+pub const CRAWL_INTERVAL_SECS: Setting = Setting::new("crawlIntervalSecs");
 pub const CRAWL_TIMEOUT_MS: Setting = Setting::new("crawlTimeoutMs");
 pub const CRAWL_CONCURRENCY: Setting = Setting::new("crawlConcurrency");
 pub const CATALOG_MAX_AGE_SECS: Setting = Setting::new("catalogMaxAgeSecs");
@@ -89,7 +98,7 @@ pub const POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED: Setting =
 /// Every setting this broker reads, in `docs/configuration.md`'s order.
 pub const ALL_SETTINGS: &[Setting] = &[
     HTTP_API_ADDR,
-    CRAWLER_CONFIG_PATH,
+    CRAWL_INTERVAL_SECS,
     CRAWL_TIMEOUT_MS,
     CRAWL_CONCURRENCY,
     CATALOG_MAX_AGE_SECS,
@@ -104,16 +113,59 @@ pub const ALL_SETTINGS: &[Setting] = &[
     POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED,
 ];
 
+/// The crawl interval when `broker:crawlIntervalSecs` is unset.
+pub const DEFAULT_CRAWL_INTERVAL_SECS: u64 = 300;
+
+/// `broker:BrokerConfig` -> `broker:Participant`, any number of times.
+pub const PARTICIPANT_LINK: &str = "participant";
+/// `broker:BrokerConfig` -> `broker:Holder`, at most once.
+pub const HOLDER_LINK: &str = "holder";
+
+/// The properties of a `broker:Participant`.
+pub const PARTICIPANT_ID: &str = "participantId";
+pub const PARTICIPANT_NAME: &str = "participantName";
+pub const CATALOG_REQUEST_URL: &str = "catalogRequestUrl";
+pub const CREDENTIAL_PROTOCOL: &str = "credentialProtocol";
+pub const PROVIDER_DID: &str = "providerDid";
+pub const OID4VP_RESPONSE_URI: &str = "oid4vpResponseUri";
+
+/// The properties of the `broker:Holder`.
+pub const OWN_DID_HOST: &str = "ownDidHost";
+pub const INSECURE_HTTP: &str = "insecureHttp";
+pub const CREDENTIAL_JWS_FILE: &str = "credentialJwsFile";
+pub const REQUIRED_SCOPE: &str = "requiredScope";
+
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerConfigError {
     #[error(transparent)]
     Store(#[from] ConfigStoreError),
     #[error("the config graph holds {0} broker:BrokerConfig resources; expected at most one")]
     MultipleConfigResources(usize),
-    #[error(
-        "broker:{property} has {count} values on the broker:BrokerConfig resource; expected one"
-    )]
-    MultipleValues { property: String, count: usize },
+    #[error("broker:{property} has {count} values on {resource}; expected one")]
+    MultipleValues {
+        resource: String,
+        property: String,
+        count: usize,
+    },
+    #[error("{resource} has no broker:{property}, which is required")]
+    MissingProperty { resource: String, property: String },
+    #[error("broker:{property} on {resource} is {value:?}: {reason}")]
+    InvalidValue {
+        resource: String,
+        property: String,
+        value: String,
+        reason: String,
+    },
+    #[error("broker:{property} must point to a resource (an IRI or a blank node), not {value}")]
+    NotAResource { property: String, value: String },
+    #[error("{resource}, linked with broker:{property}, is not a broker:{expected}")]
+    WrongType {
+        resource: String,
+        property: String,
+        expected: String,
+    },
+    #[error("invalid crawler configuration: {0}")]
+    Crawler(#[from] crawler::ConfigError),
     #[error("{CONFIG_STORE_PATH_ENV}={0:?} is not a valid URL: {1}")]
     InvalidUrl(String, String),
     #[error(
@@ -177,6 +229,8 @@ impl std::fmt::Display for ConfigLocation {
 #[derive(Debug, Clone, Default)]
 pub struct BrokerSettings {
     values: HashMap<String, String>,
+    /// The participant registry and holder; `None` when the config lists no participant.
+    crawler: Option<ParticipantsConfig>,
     /// Where the values came from. `None` when no config was read.
     source: Option<ConfigLocation>,
 }
@@ -301,60 +355,81 @@ impl BrokerSettings {
         Self::from_graph(store.inner())
     }
 
-    /// Read the `broker:BrokerConfig` resource from `store`'s [`CONFIG_GRAPH`].
+    /// Read the `broker:BrokerConfig` resource, and the participants and holder it links to,
+    /// from `store`'s [`CONFIG_GRAPH`].
     fn from_graph(store: &Store) -> Result<Self, BrokerConfigError> {
-        let query_err = |err: &dyn std::fmt::Display| BrokerConfigError::Query(err.to_string());
-        let sparql = format!(
-            "SELECT ?s ?p ?o WHERE {{ GRAPH <{CONFIG_GRAPH}> {{ \
-             ?s a <{BROKER_NS}BrokerConfig> ; ?p ?o \
-             FILTER(STRSTARTS(STR(?p), \"{BROKER_NS}\")) }} }}"
-        );
-        let prepared = SparqlEvaluator::new()
-            .parse_query(&sparql)
-            .map_err(|err| query_err(&err))?;
-        let QueryResults::Solutions(solutions) = prepared
-            .on_store(store)
-            .execute()
-            .map_err(|err| query_err(&err))?
-        else {
-            return Err(BrokerConfigError::Query("expected solutions".to_string()));
+        let graph = ConfigGraph::new(store);
+        let mut configs = graph.subjects_of_type("BrokerConfig")?;
+        if configs.len() > 1 {
+            return Err(BrokerConfigError::MultipleConfigResources(configs.len()));
+        }
+        let Some(config) = configs.pop() else {
+            return Ok(Self::default());
         };
 
-        let mut subjects = BTreeSet::new();
-        let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for solution in solutions {
-            let solution = solution.map_err(|err| query_err(&err))?;
-            let (Some(s), Some(Term::NamedNode(p)), Some(o)) =
-                (solution.get("s"), solution.get("p"), solution.get("o"))
-            else {
-                continue;
-            };
-            let value = match o {
-                Term::Literal(literal) => literal.value().to_string(),
-                Term::NamedNode(node) => node.as_str().to_string(),
-                other => other.to_string(),
-            };
-            subjects.insert(s.to_string());
-            found
-                .entry(p.as_str()[BROKER_NS.len()..].to_string())
-                .or_default()
-                .push(value);
+        let resource = "the broker:BrokerConfig resource".to_string();
+        let mut properties = graph.properties(&config)?;
+        let participants = properties.remove(PARTICIPANT_LINK).unwrap_or_default();
+        let holders = properties.remove(HOLDER_LINK).unwrap_or_default();
+        let values = single_values(&resource, properties)?
+            .into_iter()
+            .map(|(property, term)| (property, term_value(&term)));
+        let mut settings = Self::from_values(values);
+        settings.crawler = settings.read_crawler(&graph, &resource, participants, holders)?;
+        Ok(settings)
+    }
+
+    /// Build the crawler config from the resources `broker:BrokerConfig` links to. `None` when
+    /// it lists no participant: there is nothing to crawl.
+    fn read_crawler(
+        &self,
+        graph: &ConfigGraph<'_>,
+        resource: &str,
+        participants: Vec<Term>,
+        holders: Vec<Term>,
+    ) -> Result<Option<ParticipantsConfig>, BrokerConfigError> {
+        if holders.len() > 1 {
+            return Err(BrokerConfigError::MultipleValues {
+                resource: resource.to_string(),
+                property: HOLDER_LINK.to_string(),
+                count: holders.len(),
+            });
         }
-        if subjects.len() > 1 {
-            return Err(BrokerConfigError::MultipleConfigResources(subjects.len()));
+        if participants.is_empty() {
+            if !holders.is_empty() || self.get(CRAWL_INTERVAL_SECS).is_some() {
+                tracing::warn!(
+                    "broker:holder or broker:crawlIntervalSecs is set but no broker:participant \
+                     is; the crawler stays off"
+                );
+            }
+            return Ok(None);
         }
 
-        let mut values = BTreeMap::new();
-        for (property, mut objects) in found {
-            if objects.len() > 1 {
-                return Err(BrokerConfigError::MultipleValues {
-                    property,
-                    count: objects.len(),
-                });
-            }
-            values.insert(property, objects.pop().expect("one value"));
-        }
-        Ok(Self::from_values(values))
+        let holder = match holders.into_iter().next() {
+            Some(term) => Some(read_holder(
+                graph,
+                &linked(graph, term, HOLDER_LINK, "Holder")?,
+            )?),
+            None => None,
+        };
+        let mut entries = participants
+            .into_iter()
+            .map(|term| {
+                let node = linked(graph, term, PARTICIPANT_LINK, "Participant")?;
+                read_participant(graph, &node)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // The graph has no order; sort so logs and crawl order are stable.
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let interval_secs = self
+            .positive_integer(CRAWL_INTERVAL_SECS)
+            .map_or(DEFAULT_CRAWL_INTERVAL_SECS, |secs| secs as u64);
+        Ok(Some(ParticipantsConfig::new(
+            interval_secs,
+            entries,
+            holder,
+        )?))
     }
 
     /// Build from already-read values, keyed by [`Setting::property`]. Warns about any
@@ -372,8 +447,15 @@ impl BrokerSettings {
         }
         Self {
             values,
+            crawler: None,
             source: None,
         }
+    }
+
+    /// The participant registry and holder identity, or `None` when the config lists no
+    /// `broker:participant` - see the module doc.
+    pub fn crawler(&self) -> Option<&ParticipantsConfig> {
+        self.crawler.as_ref()
     }
 
     /// `setting`'s value, or `None` when the config graph doesn't set it.
@@ -404,9 +486,129 @@ impl BrokerSettings {
     }
 }
 
+/// Read access to the triples of the config graph.
+struct ConfigGraph<'a> {
+    store: &'a Store,
+    graph: NamedNode,
+}
+
+impl<'a> ConfigGraph<'a> {
+    fn new(store: &'a Store) -> Self {
+        Self {
+            store,
+            graph: NamedNode::new(CONFIG_GRAPH).expect("CONFIG_GRAPH is a valid IRI"),
+        }
+    }
+
+    fn graph_name(&self) -> GraphNameRef<'_> {
+        GraphNameRef::NamedNode(self.graph.as_ref())
+    }
+
+    /// Every subject typed `broker:<class>`.
+    fn subjects_of_type(&self, class: &str) -> Result<Vec<NamedOrBlankNode>, BrokerConfigError> {
+        let class = broker_node(class);
+        self.store
+            .quads_for_pattern(
+                None,
+                Some(rdf::TYPE),
+                Some(class.as_ref().into()),
+                Some(self.graph_name()),
+            )
+            .map(|quad| {
+                quad.map(|quad| quad.subject)
+                    .map_err(|err| BrokerConfigError::Query(err.to_string()))
+            })
+            .collect()
+    }
+
+    /// `subject`'s `broker:` properties, keyed by local name, with every value of each.
+    fn properties(
+        &self,
+        subject: &NamedOrBlankNode,
+    ) -> Result<BTreeMap<String, Vec<Term>>, BrokerConfigError> {
+        let mut found: BTreeMap<String, Vec<Term>> = BTreeMap::new();
+        for quad in self.store.quads_for_pattern(
+            Some(subject.as_ref()),
+            None,
+            None,
+            Some(self.graph_name()),
+        ) {
+            let quad = quad.map_err(|err| BrokerConfigError::Query(err.to_string()))?;
+            if let Some(local) = quad.predicate.as_str().strip_prefix(BROKER_NS) {
+                found
+                    .entry(local.to_string())
+                    .or_default()
+                    .push(quad.object);
+            }
+        }
+        Ok(found)
+    }
+}
+
+fn broker_node(local: &str) -> NamedNode {
+    NamedNode::new(format!("{BROKER_NS}{local}")).expect("broker: IRIs are valid")
+}
+
+/// A term's value as a setting string: a literal's lexical form, an IRI's text.
+fn term_value(term: &Term) -> String {
+    match term {
+        Term::Literal(literal) => literal.value().to_string(),
+        Term::NamedNode(node) => node.as_str().to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Reject any property with more than one value.
+fn single_values(
+    resource: &str,
+    properties: BTreeMap<String, Vec<Term>>,
+) -> Result<BTreeMap<String, Term>, BrokerConfigError> {
+    properties
+        .into_iter()
+        .map(|(property, mut terms)| {
+            if terms.len() > 1 {
+                return Err(BrokerConfigError::MultipleValues {
+                    resource: resource.to_string(),
+                    property,
+                    count: terms.len(),
+                });
+            }
+            Ok((property, terms.pop().expect("one value")))
+        })
+        .collect()
+}
+
+/// The resource a `broker:<property>` link points to, checked to be a `broker:<class>`.
+fn linked(
+    graph: &ConfigGraph<'_>,
+    term: Term,
+    property: &str,
+    class: &str,
+) -> Result<NamedOrBlankNode, BrokerConfigError> {
+    let _ = (graph, term, property, class);
+    todo!()
+}
+
+fn read_participant(
+    graph: &ConfigGraph<'_>,
+    node: &NamedOrBlankNode,
+) -> Result<ParticipantEntry, BrokerConfigError> {
+    let _ = (graph, node);
+    todo!()
+}
+
+fn read_holder(
+    graph: &ConfigGraph<'_>,
+    node: &NamedOrBlankNode,
+) -> Result<HolderConfig, BrokerConfigError> {
+    let _ = (graph, node);
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crawler::CredentialProtocol;
 
     fn store_with(ttl: &str) -> (tempfile::TempDir, ConfigStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -438,6 +640,211 @@ mod tests {
                 .get(POLICY_FILTER_RUN_WHEN_OAUTH2_DISABLED)
                 .as_deref(),
             Some("true")
+        );
+
+        let crawler = settings.crawler().expect("the example lists participants");
+        assert_eq!(crawler.interval_secs, 300);
+        let ids: Vec<_> = crawler.participants.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "gated-participant",
+                "oid4vp-gated-participant",
+                "participant-a"
+            ]
+        );
+        let dcp = &crawler.participants[0];
+        assert_eq!(dcp.credential_protocol, CredentialProtocol::Dcp);
+        assert_eq!(
+            dcp.provider_did.as_deref(),
+            Some("did:web:localhost%3A19002:dsp")
+        );
+        let oid4vp = &crawler.participants[1];
+        assert_eq!(oid4vp.credential_protocol, CredentialProtocol::Oid4Vp);
+        assert_eq!(
+            oid4vp.oid4vp_response_uri.as_deref(),
+            Some("http://127.0.0.1:19003/oid4vp/response")
+        );
+        let open = &crawler.participants[2];
+        assert_eq!(open.name, "Participant A");
+        assert_eq!(open.credential_protocol, CredentialProtocol::None);
+        let holder = crawler.holder.as_ref().expect("the example has a holder");
+        assert_eq!(holder.own_did_host, "localhost:19100");
+        assert!(holder.insecure_http);
+        assert_eq!(
+            holder.credential_jws_file,
+            PathBuf::from("/etc/ds-catalog-broker/holder-credential.jws")
+        );
+    }
+
+    const PREFIX: &str =
+        "@prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .\n";
+
+    fn crawler_from(ttl: &str) -> Result<Option<ParticipantsConfig>, BrokerConfigError> {
+        BrokerSettings::from_turtle(format!("{PREFIX}{ttl}").as_bytes(), None, "test")
+            .map(|settings| settings.crawler().cloned())
+    }
+
+    const OPEN_PARTICIPANT: &str = "<urn:p> a broker:Participant ; broker:participantId \"p\" ; \
+         broker:participantName \"P\" ; broker:catalogRequestUrl \"http://127.0.0.1:1/c\" .\n";
+
+    #[test]
+    fn no_participant_means_no_crawler() {
+        let crawler =
+            crawler_from("<urn:c> a broker:BrokerConfig ; broker:crawlIntervalSecs 5 .\n").unwrap();
+        assert!(crawler.is_none());
+    }
+
+    #[test]
+    fn reads_a_participant_with_the_default_interval_and_no_holder() {
+        let crawler = crawler_from(&format!(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n{OPEN_PARTICIPANT}"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(crawler.interval_secs, DEFAULT_CRAWL_INTERVAL_SECS);
+        assert_eq!(crawler.participants.len(), 1);
+        assert_eq!(crawler.participants[0].id, "p");
+        assert!(crawler.holder.is_none());
+    }
+
+    #[test]
+    fn reads_blank_node_participants_and_holder() {
+        let crawler = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:crawlIntervalSecs 5 ;\n\
+             broker:participant [ a broker:Participant ; broker:participantId \"p\" ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" ;\n\
+               broker:credentialProtocol \"dcp\" ; broker:providerDid \"did:web:h\" ] ;\n\
+             broker:holder [ a broker:Holder ; broker:ownDidHost \"h\" ;\n\
+               broker:credentialJwsFile <file:///run/secrets/holder.jws> ;\n\
+               broker:requiredScope \"s\" ] .\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(crawler.interval_secs, 5);
+        assert_eq!(
+            crawler.participants[0].credential_protocol,
+            CredentialProtocol::Dcp
+        );
+        let holder = crawler.holder.unwrap();
+        assert!(!holder.insecure_http);
+        assert_eq!(
+            holder.credential_jws_file,
+            PathBuf::from("/run/secrets/holder.jws")
+        );
+    }
+
+    #[test]
+    fn a_missing_required_participant_property_is_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; broker:participantId \"p\" ;\n\
+               broker:participantName \"P\" .\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::MissingProperty { property, .. } if property == CATALOG_REQUEST_URL),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_link_to_an_untyped_resource_is_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> broker:participantId \"p\" .\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, BrokerConfigError::WrongType { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_literal_participant_link_is_an_error() {
+        let err = crawler_from("<urn:c> a broker:BrokerConfig ; broker:participant \"p\" .\n")
+            .unwrap_err();
+        assert!(
+            matches!(err, BrokerConfigError::NotAResource { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_credential_protocol_is_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; broker:participantId \"p\" ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" ;\n\
+               broker:credentialProtocol \"oauth\" .\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::InvalidValue { property, .. } if property == CREDENTIAL_PROTOCOL),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_gated_participant_without_a_holder_is_an_error() {
+        let err = crawler_from(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; broker:participantId \"p\" ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" ;\n\
+               broker:credentialProtocol \"dcp\" ; broker:providerDid \"did:web:h\" .\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BrokerConfigError::Crawler(crawler::ConfigError::MissingHolder { .. })
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn two_holders_are_an_error() {
+        let err = crawler_from(&format!(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> ;\n\
+               broker:holder <urn:h1>, <urn:h2> .\n{OPEN_PARTICIPANT}"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::MultipleValues { property, .. } if property == HOLDER_LINK),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_remote_credential_file_is_an_error() {
+        let err = crawler_from(&format!(
+            "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> ; broker:holder <urn:h> .\n\
+             <urn:h> a broker:Holder ; broker:ownDidHost \"h\" ; broker:requiredScope \"s\" ;\n\
+               broker:credentialJwsFile <https://example.org/holder.jws> .\n{OPEN_PARTICIPANT}"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerConfigError::InvalidValue { property, .. } if property == CREDENTIAL_JWS_FILE),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_relative_credential_file_iri_resolves_against_the_config_location() {
+        let ttl = format!(
+            "{PREFIX}<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> ; broker:holder <urn:h> .\n\
+             <urn:h> a broker:Holder ; broker:ownDidHost \"h\" ; broker:requiredScope \"s\" ;\n\
+               broker:credentialJwsFile <holder.jws> .\n{OPEN_PARTICIPANT}"
+        );
+        let settings = BrokerSettings::from_turtle(
+            ttl.as_bytes(),
+            Some("file:///etc/broker/broker.ttl"),
+            "test",
+        )
+        .unwrap();
+        let holder = settings.crawler().unwrap().holder.as_ref().unwrap();
+        assert_eq!(
+            holder.credential_jws_file,
+            PathBuf::from("/etc/broker/holder.jws")
         );
     }
 

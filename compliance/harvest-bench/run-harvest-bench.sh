@@ -157,8 +157,10 @@ cat > "$RUST_CONFIG_DIR/config_graph.ttl" <<TTL
 @prefix broker: <https://catalog-broker.ds-labs.org/ontologies/config#> .
 <urn:ds-catalog-broker:config> a broker:BrokerConfig ;
     broker:httpApiAddr "$RUST_ADDR" ;
-    broker:crawlerConfigPath "$SCRIPT_DIR/participants.toml" .
+    broker:crawlIntervalSecs 5 ;
+    broker:participant <urn:harvest-bench:d>, <urn:harvest-bench:e> .
 TTL
+cat "$SCRIPT_DIR/participants.ttl" >> "$RUST_CONFIG_DIR/config_graph.ttl"
 ( cd "$REPO_ROOT" && CONFIG_STORE_PATH="$RUST_CONFIG_DIR" \
     nohup ./target/release/ds-catalog-broker-rs > "$RESULTS_DIR/rust-http-api.log" 2>&1 & )
 

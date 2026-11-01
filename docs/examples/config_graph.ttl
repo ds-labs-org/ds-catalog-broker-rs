@@ -8,13 +8,21 @@
     # Address the HTTP API listens on.
     broker:httpApiAddr "127.0.0.1:8080" ;
 
-    # Participant registry (TOML). No default: unset serves one sample catalog
-    # from an in-memory cache, with no crawler and no /sparql.
-    broker:crawlerConfigPath "/etc/ds-catalog-broker/participants.toml" ;
+    # Participants to crawl, described below. No default: with none, the broker
+    # serves one sample catalog from an in-memory cache, with no crawler and no
+    # /sparql.
+    broker:participant <urn:ds-catalog-broker:participant:a>,
+        <urn:ds-catalog-broker:participant:dcp>,
+        <urn:ds-catalog-broker:participant:oid4vp> ;
 
-    # Harvesting: how long one participant's crawl may take, how many
-    # participants are crawled at once, and how long a catalog stays cached
-    # after its participant's last successful crawl.
+    # The crawler's own holder identity, described below. Needed only when a
+    # participant uses the dcp or oid4vp credential protocol.
+    broker:holder <urn:ds-catalog-broker:holder> ;
+
+    # Harvesting: how often a full crawl cycle runs, how long one participant's
+    # crawl may take, how many participants are crawled at once, and how long a
+    # catalog stays cached after its participant's last successful crawl.
+    broker:crawlIntervalSecs 300 ;
     broker:crawlTimeoutMs 30000 ;
     broker:crawlConcurrency 8 ;
     broker:catalogMaxAgeSecs 86400 ;
@@ -35,3 +43,34 @@
     broker:policyFilterUnmappableConstraintAction "hide_dataset" ; # skip | drop_policy | hide_dataset
     broker:policyFilterNoPolicyVisibility "open" ;                 # open | closed
     broker:policyFilterRunWhenOauth2Disabled true .
+
+# An open participant: no credential is presented (credentialProtocol "none",
+# the default).
+<urn:ds-catalog-broker:participant:a> a broker:Participant ;
+    broker:participantId "participant-a" ;
+    broker:participantName "Participant A" ;
+    broker:catalogRequestUrl "http://127.0.0.1:19001/dsp/catalog/request" .
+
+# A participant gated by a DCP self-issued token: needs its own DID.
+<urn:ds-catalog-broker:participant:dcp> a broker:Participant ;
+    broker:participantId "gated-participant" ;
+    broker:participantName "DCP-gated participant" ;
+    broker:catalogRequestUrl "http://127.0.0.1:19002/dsp/catalog/request" ;
+    broker:credentialProtocol "dcp" ;
+    broker:providerDid "did:web:localhost%3A19002:dsp" .
+
+# A participant gated by an OID4VP presentation: needs its response URI.
+<urn:ds-catalog-broker:participant:oid4vp> a broker:Participant ;
+    broker:participantId "oid4vp-gated-participant" ;
+    broker:participantName "OID4VP-gated participant" ;
+    broker:catalogRequestUrl "http://127.0.0.1:19003/dsp/catalog/request" ;
+    broker:credentialProtocol "oid4vp" ;
+    broker:oid4vpResponseUri "http://127.0.0.1:19003/oid4vp/response" .
+
+# The crawler's holder identity. The credential (a JWS compact string) is read
+# from a local file at startup, so it never sits in this document.
+<urn:ds-catalog-broker:holder> a broker:Holder ;
+    broker:ownDidHost "localhost:19100" ;
+    broker:insecureHttp true ;   # default false
+    broker:credentialJwsFile "/etc/ds-catalog-broker/holder-credential.jws" ;
+    broker:requiredScope "org.eclipse.dspace.dcp.vc.type:FederatedCatalogAccessCredential:read" .

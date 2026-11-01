@@ -143,7 +143,7 @@ pub(super) async fn sparql_route(
         return (
             StatusCode::NOT_IMPLEMENTED,
             "this instance is running the in-memory catalog cache, which has no SPARQL \
-             (Oxigraph) backend - set broker:crawlerConfigPath to enable the SPARQL endpoint"
+             (Oxigraph) backend - configure a broker:participant to enable the SPARQL endpoint"
                 .to_string(),
         )
             .into_response();
