@@ -1019,7 +1019,8 @@ fn policy_filtered_query_stops_building_the_allow_list_when_cancelled() {
     );
     assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
     assert_eq!(calls, 1);
-    // The partial list was not cached.
+    // The partial list was not cached as a complete one; the next build
+    // resumes and decides only the remaining catalogs.
     let mut again = 0;
     cache
         .sparql_query_json_policy_filtered(
@@ -1032,7 +1033,7 @@ fn policy_filtered_query_stops_building_the_allow_list_when_cancelled() {
             &SparqlLimits::default(),
         )
         .unwrap();
-    assert_eq!(again, 3);
+    assert_eq!(again, 2);
 }
 
 /// A cached allow-list expires, since policy decisions can depend on the
@@ -1062,4 +1063,96 @@ fn policy_filtered_query_allow_list_expires() {
         )
         .unwrap();
     assert_eq!(calls, 1);
+}
+
+/// A build slower than the request time limit finishes over several
+/// requests: each cancelled attempt keeps its progress, and the final one
+/// caches the complete list.
+#[test]
+fn policy_filtered_query_finishes_a_slow_build_across_cancelled_requests() {
+    let cache = cache();
+    for node in ["node-1", "node-2", "node-3"] {
+        let mut catalog = visibility_catalog("public", "t");
+        catalog.origin_node = NodeId::new(node);
+        cache.store_catalog(catalog).unwrap();
+    }
+    let mut decided = 0;
+    // Each request is cancelled after deciding one catalog.
+    for attempt in 0..3 {
+        let token = CancellationToken::new();
+        let limits = SparqlLimits {
+            cancellation: Some(token.clone()),
+            ..SparqlLimits::default()
+        };
+        let result = cache.sparql_query_json_policy_filtered(
+            TITLES,
+            "slow",
+            |catalog| {
+                decided += 1;
+                token.cancel();
+                public_only(catalog)
+            },
+            &limits,
+        );
+        if attempt < 2 {
+            assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
+        }
+    }
+    assert_eq!(decided, 3);
+    // The list is now complete and cached: no further decoding.
+    let mut after = 0;
+    let body = cache
+        .sparql_query_json_policy_filtered(
+            TITLES,
+            "slow",
+            |catalog| {
+                after += 1;
+                public_only(catalog)
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(after, 0);
+    assert!(binding_values(&body).iter().any(|v| v == "t"));
+}
+
+/// Progress from a cancelled build is dropped when a write lands.
+#[test]
+fn policy_filtered_query_drops_partial_progress_after_a_write() {
+    let cache = cache();
+    for node in ["node-1", "node-2"] {
+        let mut catalog = visibility_catalog("public", "t");
+        catalog.origin_node = NodeId::new(node);
+        cache.store_catalog(catalog).unwrap();
+    }
+    let token = CancellationToken::new();
+    let limits = SparqlLimits {
+        cancellation: Some(token.clone()),
+        ..SparqlLimits::default()
+    };
+    let _ = cache.sparql_query_json_policy_filtered(
+        TITLES,
+        "k",
+        |catalog| {
+            token.cancel();
+            public_only(catalog)
+        },
+        &limits,
+    );
+    let mut catalog = visibility_catalog("public", "t");
+    catalog.origin_node = NodeId::new("node-3");
+    cache.store_catalog(catalog).unwrap();
+    let mut calls = 0;
+    cache
+        .sparql_query_json_policy_filtered(
+            TITLES,
+            "k",
+            |catalog| {
+                calls += 1;
+                public_only(catalog)
+            },
+            &SparqlLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(calls, 3);
 }

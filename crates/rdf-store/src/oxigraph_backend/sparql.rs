@@ -20,6 +20,21 @@ pub const ALLOW_LIST_CACHE_TTL: std::time::Duration = std::time::Duration::from_
 /// Most allow-lists kept at once, one per distinct caller key.
 const ALLOW_LIST_CACHE_ENTRIES: usize = 64;
 
+/// How long the progress of a cancelled allow-list build is kept for the
+/// next request to resume. Catalogs decided before the resume can be this
+/// much older than the rest when the list completes.
+pub const PARTIAL_ALLOW_LIST_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Progress of an allow-list build that was cancelled part way, so a store
+/// whose full decode is slower than the request time limit still finishes
+/// over several requests instead of restarting every time.
+pub(super) struct PartialAllowList {
+    write_sequence: u64,
+    pub(super) started_at: std::time::Instant,
+    done: BTreeSet<NamedNode>,
+    visible: BTreeSet<String>,
+}
+
 /// A policy allow-list and the store state it was built from.
 pub(super) struct CachedAllowList {
     write_sequence: u64,
@@ -66,8 +81,14 @@ impl OxigraphCatalogCache {
     /// returns for each. Checks the cancellation token before each graph
     /// scan step and each catalog, so a cancelled request stops here
     /// instead of decoding the rest of the store.
+    ///
+    /// When cancelled part way, the catalogs already decided are kept under
+    /// `key` and `write_sequence` for [`PARTIAL_ALLOW_LIST_TTL`], and the
+    /// next build for the same key and store state resumes from them.
     fn build_allow_list(
         &self,
+        key: &str,
+        write_sequence: u64,
         allow_list: &mut impl FnMut(&Catalog) -> BTreeSet<String>,
         limits: &SparqlLimits,
     ) -> SparqlQueryResult<BTreeSet<String>> {
@@ -81,23 +102,58 @@ impl OxigraphCatalogCache {
             .snapshots_until(None, &cancelled)
             .map_err(|err| SparqlError::Store(err.to_string()))?
             .ok_or(SparqlError::Cancelled)?;
-        let mut visible = BTreeSet::new();
+        let mut partials = self
+            .partial_allow_lists
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut progress = partials
+            .remove(key)
+            .filter(|p| {
+                p.write_sequence == write_sequence
+                    && p.started_at.elapsed() < PARTIAL_ALLOW_LIST_TTL
+            })
+            .unwrap_or_else(|| PartialAllowList {
+                write_sequence,
+                started_at: std::time::Instant::now(),
+                done: BTreeSet::new(),
+                visible: BTreeSet::new(),
+            });
+        drop(partials);
         for (graph_iri, graph) in graphs {
             if cancelled() {
+                self.keep_partial(key, progress);
                 return Err(SparqlError::Cancelled);
             }
-            // Skipped as `catalogs` skips them.
-            let Ok(node) = decode_node_id(&graph_iri) else {
+            if progress.done.contains(&graph_iri) {
                 continue;
-            };
-            if let Ok(Some(catalog)) = self.load_catalog(&node, &graph) {
-                visible.extend(allow_list(&catalog));
             }
+            // Skipped as `catalogs` skips them.
+            if let Ok(node) = decode_node_id(&graph_iri)
+                && let Ok(Some(catalog)) = self.load_catalog(&node, &graph)
+            {
+                progress.visible.extend(allow_list(&catalog));
+            }
+            progress.done.insert(graph_iri);
         }
         if cancelled() {
+            self.keep_partial(key, progress);
             return Err(SparqlError::Cancelled);
         }
-        Ok(visible)
+        Ok(progress.visible)
+    }
+
+    fn keep_partial(&self, key: &str, progress: PartialAllowList) {
+        let mut partials = self
+            .partial_allow_lists
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if partials.len() >= ALLOW_LIST_CACHE_ENTRIES && !partials.contains_key(key) {
+            partials.retain(|_, p| p.started_at.elapsed() < PARTIAL_ALLOW_LIST_TTL);
+            if partials.len() >= ALLOW_LIST_CACHE_ENTRIES {
+                partials.clear();
+            }
+        }
+        partials.insert(key.to_string(), progress);
     }
 
     /// Evaluate an arbitrary, caller-supplied SPARQL query and return
@@ -275,6 +331,12 @@ impl OxigraphCatalogCache {
     /// which then ends in `StoreBusy` (or the caller's time limit).
     /// `allow_list` may therefore run more than once per catalog.
     ///
+    /// A build that is cancelled (typically by the request time limit)
+    /// keeps the catalogs it has decided for [`PARTIAL_ALLOW_LIST_TTL`];
+    /// the next request with the same key and store state resumes from
+    /// there. A store whose full decode exceeds the time limit therefore
+    /// completes over several requests instead of timing out on every one.
+    ///
     /// Alternatives considered: a store transaction gives a read view but
     /// takes the in-memory backend's single writer lock for the whole
     /// query, and oxigraph exposes no public snapshot to hand to both the
@@ -319,7 +381,12 @@ impl OxigraphCatalogCache {
             let visible = match self.cached_allow_list(allow_list_key, before) {
                 Some(visible) => visible,
                 None => {
-                    let visible = Arc::new(self.build_allow_list(&mut allow_list, limits)?);
+                    let visible = Arc::new(self.build_allow_list(
+                        allow_list_key,
+                        before,
+                        &mut allow_list,
+                        limits,
+                    )?);
                     if self.write_sequence.load(Ordering::SeqCst) == before {
                         self.remember_allow_list(allow_list_key, before, Arc::clone(&visible));
                     }

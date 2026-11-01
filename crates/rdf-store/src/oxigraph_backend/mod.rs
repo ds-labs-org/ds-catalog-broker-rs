@@ -483,7 +483,7 @@ mod write;
 
 use iris::*;
 pub use iris::{dataset_resource_iri, service_resource_iri};
-pub use sparql::{ALLOW_LIST_CACHE_TTL, POLICY_FILTERED_ATTEMPTS};
+pub use sparql::{ALLOW_LIST_CACHE_TTL, PARTIAL_ALLOW_LIST_TTL, POLICY_FILTERED_ATTEMPTS};
 use vocab::*;
 
 /// A [`CatalogCache`] backed by a real `contreforts_kg::store::GraphStore`
@@ -501,6 +501,7 @@ pub struct OxigraphCatalogCache {
     /// [`OxigraphCatalogCache::sparql_query_json_policy_filtered`], by
     /// caller key; shared by every clone.
     allow_lists: Arc<std::sync::Mutex<HashMap<String, sparql::CachedAllowList>>>,
+    partial_allow_lists: Arc<std::sync::Mutex<HashMap<String, sparql::PartialAllowList>>>,
 }
 
 /// Marks a write as in progress for as long as it lives: the sequence
@@ -532,6 +533,7 @@ impl OxigraphCatalogCache {
             store,
             write_sequence: Arc::new(AtomicU64::new(0)),
             allow_lists: Arc::default(),
+            partial_allow_lists: Arc::default(),
         })
     }
 
