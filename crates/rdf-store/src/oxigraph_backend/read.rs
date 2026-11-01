@@ -9,7 +9,7 @@ impl OxigraphCatalogCache {
     pub(super) fn load_catalog(
         &self,
         node: &NodeId,
-        graph: &NamedNode,
+        graph: &GraphSnapshot,
     ) -> StoreResult<Option<Catalog>> {
         let base = node_base(node);
         let catalog_class_term = Term::from(dcat_catalog_class());
@@ -95,7 +95,7 @@ impl OxigraphCatalogCache {
         &self,
         base: &str,
         subject: &NamedNode,
-        graph: &NamedNode,
+        graph: &GraphSnapshot,
     ) -> StoreResult<(usize, Dataset)> {
         let id = strip_prefix_decode(subject.as_str(), &format!("{base}/datasets/"))?;
         let index = self.sequence_index(subject, graph)?;
@@ -160,7 +160,7 @@ impl OxigraphCatalogCache {
     pub(super) fn load_policy(
         &self,
         subject: &NamedNode,
-        graph: &NamedNode,
+        graph: &GraphSnapshot,
     ) -> StoreResult<(usize, Policy)> {
         let index = self.sequence_index(subject, graph)?;
         let kind_term = self
@@ -212,7 +212,7 @@ impl OxigraphCatalogCache {
         &self,
         policy_subject: &NamedNode,
         predicate: &NamedNode,
-        graph: &NamedNode,
+        graph: &GraphSnapshot,
     ) -> StoreResult<Vec<Rule>> {
         let mut entries = Vec::new();
         for quad in self.quads(Some(policy_subject), Some(predicate), None, graph)? {
@@ -226,7 +226,7 @@ impl OxigraphCatalogCache {
     pub(super) fn load_rule(
         &self,
         subject: &NamedNode,
-        graph: &NamedNode,
+        graph: &GraphSnapshot,
     ) -> StoreResult<(usize, Rule)> {
         let index = self.sequence_index(subject, graph)?;
         let action = self
@@ -278,7 +278,7 @@ impl OxigraphCatalogCache {
     pub(super) fn load_constraint(
         &self,
         subject: &NamedNode,
-        graph: &NamedNode,
+        graph: &GraphSnapshot,
         depth: usize,
     ) -> StoreResult<(usize, Constraint)> {
         if depth > MAX_CONSTRAINT_DEPTH {
@@ -345,7 +345,7 @@ impl OxigraphCatalogCache {
         &self,
         base: &str,
         subject: &NamedNode,
-        graph: &NamedNode,
+        graph: &GraphSnapshot,
     ) -> StoreResult<(usize, Distribution)> {
         let index = self.sequence_index(subject, graph)?;
         let format = self
@@ -382,7 +382,7 @@ impl OxigraphCatalogCache {
         &self,
         base: &str,
         subject: &NamedNode,
-        graph: &NamedNode,
+        graph: &GraphSnapshot,
     ) -> StoreResult<(usize, DataService)> {
         let id = strip_prefix_decode(subject.as_str(), &format!("{base}/services/"))?;
         let index = self.sequence_index(subject, graph)?;

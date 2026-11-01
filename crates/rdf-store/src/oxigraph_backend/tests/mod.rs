@@ -407,7 +407,9 @@ async fn dataset_with_no_policies_round_trips_to_an_empty_vec() {
     assert_eq!(results[0], catalog);
     assert!(results[0].datasets[0].policies.is_empty());
 
-    let graph = node_iri(&NodeId::new("node-no-policy"));
+    let graph = cache
+        .snapshot(&node_iri(&NodeId::new("node-no-policy")))
+        .unwrap();
     let policy_links = cache
         .quads(None, Some(&odrl_has_policy_pred()), None, &graph)
         .unwrap();
@@ -425,7 +427,9 @@ async fn a_direct_quad_pattern_query_finds_a_policy_by_its_real_odrl_predicates(
     let cache = cache();
     cache.upsert(policy_catalog()).await.unwrap();
 
-    let graph = node_iri(&NodeId::new("node-policy"));
+    let graph = cache
+        .snapshot(&node_iri(&NodeId::new("node-policy")))
+        .unwrap();
     let dataset_subject = dataset_iri(&node_base(&NodeId::new("node-policy")), "ds-policy");
     let policy_links = cache
         .quads(
@@ -467,7 +471,9 @@ async fn a_direct_quad_pattern_query_finds_a_distribution_format_by_its_real_dca
     let cache = cache();
     cache.upsert(rich_catalog()).await.unwrap();
 
-    let graph = node_iri(&NodeId::new("node-rich"));
+    let graph = cache
+        .snapshot(&node_iri(&NodeId::new("node-rich")))
+        .unwrap();
     let matches = cache
         .quads(
             None,
@@ -537,7 +543,9 @@ async fn a_property_keyed_by_a_real_vocabulary_iri_is_stored_under_that_predicat
     let cache = cache();
     cache.upsert(rich_catalog()).await.unwrap();
 
-    let graph = node_iri(&NodeId::new("node-rich"));
+    let graph = cache
+        .snapshot(&node_iri(&NodeId::new("node-rich")))
+        .unwrap();
     let keyword_pred = iri("http://www.w3.org/ns/dcat#keyword");
     let matches = cache
         .quads(None, Some(&keyword_pred), None, &graph)
@@ -572,7 +580,9 @@ async fn upsert_wholesale_replacement_drops_the_prior_catalogs_decomposed_triple
     assert_eq!(results[0], smaller);
 
     // No leftover triples from `rich_catalog`'s ds-1/ds-2/svc-1/svc-2.
-    let graph = node_iri(&NodeId::new("node-rich"));
+    let graph = cache
+        .snapshot(&node_iri(&NodeId::new("node-rich")))
+        .unwrap();
     let all_quads = cache.quads(None, None, None, &graph).unwrap();
     let leaked_old_dataset = all_quads.iter().any(|q| {
         matches!(&q.subject, NamedOrBlankNode::NamedNode(n) if n.as_str().contains("ds-1") || n.as_str().contains("ds-2"))
