@@ -147,6 +147,26 @@ pub enum ClaimValue {
     List(Vec<String>),
 }
 
+impl ClaimValue {
+    /// Does this claim value equal (for [`ClaimValue::Single`]) or
+    /// contain (for [`ClaimValue::List`]) the given string?
+    fn contains(&self, needle: &str) -> bool {
+        match self {
+            ClaimValue::Single(s) => s == needle,
+            ClaimValue::List(values) => values.iter().any(|v| v == needle),
+        }
+    }
+
+    /// Does this claim value equal/contain *any* of the given candidate
+    /// strings? Used by the `isAnyOf` operator.
+    fn contains_any(&self, candidates: &[&str]) -> bool {
+        match self {
+            ClaimValue::Single(s) => candidates.contains(&s.as_str()),
+            ClaimValue::List(values) => values.iter().any(|v| candidates.contains(&v.as_str())),
+        }
+    }
+}
+
 /// The request schema, verbatim per the design doc's "Request/response
 /// JSON schema" section: one dataset, every ODRL policy attached to it,
 /// and the caller's flat claims map.
@@ -178,10 +198,140 @@ pub struct EvaluateResponse {
     pub reason: String,
 }
 
-/// Red-step stub: the signature only. See the green commit for the
-/// deny-overrides implementation.
-pub fn evaluate(_request: &EvaluateRequest) -> EvaluateResponse {
-    todo!("deny-overrides evaluation")
+/// A rule's constraints all match the claims map — a plain AND across
+/// `Rule.constraints` (ODRL's flat-rule model has no OR-within-a-rule; see
+/// the design doc's "Within-rule constraint matching" note). An empty
+/// `constraints` list vacuously satisfies `all()` and so counts as "all
+/// match" — an unconditional rule — exactly as the design doc specifies
+/// for both permissions and prohibitions.
+fn rule_matches(rule: &Rule, claims: &BTreeMap<String, ClaimValue>) -> bool {
+    rule.constraints
+        .iter()
+        .all(|constraint| constraint_matches(constraint, claims))
+}
+
+/// Resolve one atomic constraint against the claims map.
+///
+/// Per the design doc's "leftOperand-to-claim mapping" section: exact
+/// string-key lookup of `left_operand`; a key that isn't present in the
+/// claims map is **always** a miss (`false`), regardless of `operator` —
+/// including for `neq`, which does not treat "claim absent" as vacuously
+/// satisfied. This matches EDC's own posture for an unbound leftOperand
+/// key outside any registered scope (see the design doc's "Prior art"
+/// section).
+///
+/// An `operator` string outside the supported set (`eq`/`neq`/`isAnyOf`)
+/// degrades safely to `false` (non-matching) rather than panicking or
+/// erroring — the design doc's "Explicitly not supported in v1" list
+/// (numeric/date comparisons, `isPartOf`, logical groups) names operators
+/// this engine has no comparator registered for at all; the safe reading
+/// consistent with the "miss, not an error" posture above is that a
+/// constraint this engine cannot evaluate can never contribute a match.
+fn constraint_matches(constraint: &Constraint, claims: &BTreeMap<String, ClaimValue>) -> bool {
+    let Some(value) = claims.get(&constraint.left_operand) else {
+        return false;
+    };
+    match constraint.operator.as_str() {
+        "eq" => value.contains(&constraint.right_operand),
+        "neq" => !value.contains(&constraint.right_operand),
+        "isAnyOf" => {
+            // Wire convention per the design doc: `right_operand` is this
+            // constraint's own comma-delimited list (catalog_core::
+            // Constraint.right_operand is a single String, so ODRL's
+            // normal JSON-LD array-on-rightOperand form isn't available
+            // here). Candidates are trimmed so "DE, FR, NL" and "DE,FR,NL"
+            // behave identically — a robustness allowance beyond the
+            // doc's literal example, not a semantic change to it.
+            let candidates: Vec<&str> =
+                constraint.right_operand.split(',').map(str::trim).collect();
+            value.contains_any(&candidates)
+        }
+        _ => false,
+    }
+}
+
+/// `policy.id`, or a stable placeholder when a harvested policy has no
+/// `@id` — used only to build a human-readable `reason` string, never to
+/// affect the decision itself.
+fn policy_label(policy: &Policy) -> &str {
+    policy.id.as_deref().unwrap_or("<unnamed>")
+}
+
+/// A short, human-readable trace of one rule's constraints, e.g.
+/// `"nationality eq DE"` for a single constraint, `"a eq b and c eq d"`
+/// for several, or `"unconditional"` for an empty constraint list — used
+/// only to build `reason`, never to affect the decision itself.
+fn describe_rule(rule: &Rule) -> String {
+    if rule.constraints.is_empty() {
+        return "unconditional".to_string();
+    }
+    rule.constraints
+        .iter()
+        .map(|c| format!("{} {} {}", c.left_operand, c.operator, c.right_operand))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// The core decision function — see the module doc's "Multiple policies
+/// on one dataset" section for how the design doc's per-`(Dataset,
+/// Policy, claims)` algorithm generalizes to `request.policies`' full
+/// list, and the design doc's "Enforcement decision semantics" section
+/// for the algorithm's justification against XACML/EDC/ODRL prior art.
+///
+/// Deny-overrides at the top level:
+/// 1. Any matching prohibition, in any attached policy, denies outright.
+/// 2. No attached policy has any permission rule at all → allow (open by
+///    default).
+/// 3. Any matching permission, in any attached policy, allows.
+/// 4. Permissions exist somewhere but none matched → deny.
+pub fn evaluate(request: &EvaluateRequest) -> EvaluateResponse {
+    for policy in &request.policies {
+        for (idx, rule) in policy.prohibitions.iter().enumerate() {
+            if rule_matches(rule, &request.claims) {
+                return EvaluateResponse {
+                    dataset_id: request.dataset_id.clone(),
+                    decision: Decision::Deny,
+                    reason: format!(
+                        "prohibition[{idx}] of policy '{}' matched: {}",
+                        policy_label(policy),
+                        describe_rule(rule)
+                    ),
+                };
+            }
+        }
+    }
+
+    let any_permission_declared = request.policies.iter().any(|p| !p.permissions.is_empty());
+    if !any_permission_declared {
+        return EvaluateResponse {
+            dataset_id: request.dataset_id.clone(),
+            decision: Decision::Allow,
+            reason: "no permission rules declared on any attached policy; open by default"
+                .to_string(),
+        };
+    }
+
+    for policy in &request.policies {
+        for (idx, rule) in policy.permissions.iter().enumerate() {
+            if rule_matches(rule, &request.claims) {
+                return EvaluateResponse {
+                    dataset_id: request.dataset_id.clone(),
+                    decision: Decision::Allow,
+                    reason: format!(
+                        "permission[{idx}] of policy '{}' matched: {}",
+                        policy_label(policy),
+                        describe_rule(rule)
+                    ),
+                };
+            }
+        }
+    }
+
+    EvaluateResponse {
+        dataset_id: request.dataset_id.clone(),
+        decision: Decision::Deny,
+        reason: "permission rules exist but none matched the caller's claims".to_string(),
+    }
 }
 
 #[cfg(test)]
