@@ -43,9 +43,20 @@ All settings are properties of a single `broker:BrokerConfig` resource, in
 the `https://catalog-broker.ds-labs.org/ontologies/config#` namespace. The
 subject IRI is up to you. Two `broker:BrokerConfig` resources, or two values
 for one setting (anything but `broker:participant`, which repeats), stop the
-broker at startup. An unknown `broker:` property, on this resource or on a
-participant or the holder, stops the broker too: a typo'd property name
-would otherwise leave the setting at its default without anyone noticing.
+broker at startup. So does anything in the `broker:` namespace that the
+broker would otherwise skip without a word, since a typo there would leave
+a setting at its default without anyone noticing:
+
+- an unknown `broker:` property, on this resource or on a participant or
+  the holder;
+- an `rdf:type` in the `broker:` namespace other than `broker:BrokerConfig`,
+  `broker:Participant` or `broker:Holder` (a misspelled class);
+- a `broker:` property or class on any subject that is neither the
+  `broker:BrokerConfig` resource nor a participant or holder linked from
+  it, including a file with `broker:` triples but no `broker:BrokerConfig`;
+- a blank node as a setting's value.
+
+Triples in other vocabularies (`rdfs:label`, comments as data) are ignored.
 
 The crawler's participants and its holder identity are separate resources,
 linked from `broker:BrokerConfig`; see [Participants and holder](#participants-and-holder).
@@ -154,15 +165,23 @@ following stops the broker at startup:
 - more than one `broker:holder`;
 - an unknown `broker:credentialProtocol` or a non-boolean
   `broker:insecureHttp`;
-- an unknown `broker:` property;
+- a blank `broker:participantId` or `broker:participantName`;
+- a `broker:catalogRequestUrl` or `broker:oid4vpResponseUri` that is not an
+  absolute `http` or `https` URL (a relative IRI resolves against the
+  config's location, so it usually becomes a `file:` IRI and is rejected);
+- a `broker:providerDid` that is not a DID (`did:<method>:<id>`);
+- `broker:providerDid` on a participant whose protocol is not `dcp`, or
+  `broker:oid4vpResponseUri` on one whose protocol is not `oid4vp`;
 - two participants with the same `broker:participantId`;
 - a `dcp` participant without `broker:providerDid`, an `oid4vp` participant
   without `broker:oid4vpResponseUri`, or either one without a
   `broker:holder`.
 
-Errors name a blank-node
-participant by its `broker:participantId`. `broker:holder` or `broker:crawlIntervalSecs` without
-any participant is logged as a warning; the crawler stays off.
+The holder is checked the same way even when there is no participant.
+Errors name a blank-node participant by its `broker:participantId`. With no
+participant the crawler stays off, and a `broker:holder` or any `broker:crawl*`
+or `broker:catalogMaxAgeSecs` setting is logged as a warning, since it has no
+effect.
 
 These replace the participant registry TOML file that
 `broker:crawlerConfigPath` used to name. That property is no longer read.

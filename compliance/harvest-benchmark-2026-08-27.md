@@ -119,7 +119,8 @@ crawler + Oxigraph store + hand-serialized DSP endpoint.
   `spike.CatalogFixtureExtension` mechanism proved out in
   [`crawler-edc-integration-test.md`](crawler-edc-integration-test.md) -
   additive, the original EDC-A/B/C instances were not touched.
-- `compliance/harvest-bench/participants.toml` - a `crates/crawler` config
+- `compliance/harvest-bench/participants.toml` (now `participants.ttl`, a
+  `broker:BrokerConfig` Turtle file) - a `crates/crawler` config
   pointing at the same two HARVEST-D/E instances, `interval_secs = 5` to
   match EDC's own crawl period, `requires_dcp = false` for both (same
   documented scope decision as every prior round -
@@ -659,8 +660,8 @@ the throwaway script itself was deleted rather than left in the repo.
 - `compliance/harvest-bench/edc-fedcat-runtime/` - the new EDC
   federated-catalog crawler Gradle project (source committed;
   `build/`, `.gradle/`, `classpath.txt`, `logs/` gitignored).
-- `compliance/harvest-bench/participants.toml` - the `crates/crawler`
-  config used.
+- `compliance/harvest-bench/participants.toml` (now `participants.ttl`) -
+  the `crates/crawler` config used.
 - `compliance/harvest-bench/catalog-request.k6.js` - the load-test script.
 - `compliance/harvest-bench/sample-rss-cpu.sh` - the RSS/CPU sampler.
 - `compliance/harvest-bench/check_catalog.py` - the correctness check
