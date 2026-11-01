@@ -79,6 +79,12 @@ pub(super) fn sequence_index_pred() -> NamedNode {
     internal("sequenceIndex")
 }
 
+/// Which logical operator a constraint group uses (`odrl:and`, ...), so a
+/// group with no children still reads back as that group.
+pub(super) fn logical_operator_pred() -> NamedNode {
+    internal("logicalOperator")
+}
+
 pub(super) fn odrl(local: &str) -> NamedNode {
     iri(format!("{ODRL_NS}{local}"))
 }

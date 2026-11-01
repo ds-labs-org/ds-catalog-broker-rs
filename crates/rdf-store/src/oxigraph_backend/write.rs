@@ -339,14 +339,6 @@ impl OxigraphCatalogCache {
                 )?;
             }
             Constraint::Logical(logical) => {
-                // A child would be written at `depth + 1`; skip the
-                // whole remaining sibling list once that would exceed
-                // the bound (uniform across siblings - see this fn's
-                // own doc comment) rather than writing a partially
-                // truncated group.
-                if depth >= MAX_CONSTRAINT_DEPTH {
-                    return Ok(());
-                }
                 let (predicate, children): (NamedNode, &[Constraint]) = match logical {
                     LogicalConstraint::And(children) => (odrl_and_pred(), children),
                     LogicalConstraint::Or(children) => (odrl_or_pred(), children),
@@ -355,6 +347,20 @@ impl OxigraphCatalogCache {
                         (odrl_and_sequence_pred(), children)
                     }
                 };
+                // Always written, so an empty group reads back as itself.
+                self.insert(
+                    constraint_node,
+                    &logical_operator_pred(),
+                    &Term::from(predicate.clone()),
+                    graph,
+                )?;
+                // Children would sit at `depth + 1`. Past the bound they are
+                // all dropped, before any link to them is written, the way
+                // `crawler::parse_constraint` drops them: the group stays,
+                // empty.
+                if depth >= MAX_CONSTRAINT_DEPTH {
+                    return Ok(());
+                }
                 for (child_index, child) in children.iter().enumerate() {
                     let child_node = constraint_iri(constraint_node.as_str(), child_index);
                     self.insert(

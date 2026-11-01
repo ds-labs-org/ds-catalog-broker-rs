@@ -319,11 +319,19 @@ impl OxigraphCatalogCache {
             ));
         }
 
-        for (predicate, build) in logical_constraint_preds() {
+        let operator = self
+            .first_object(subject, &logical_operator_pred(), graph)?
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "{} has neither odrl:leftOperand nor fcns:logicalOperator",
+                    subject.as_str()
+                ))
+            })?;
+        if let Some((predicate, build)) = logical_constraint_preds()
+            .into_iter()
+            .find(|(predicate, _)| Term::from(predicate.clone()) == operator)
+        {
             let child_quads = self.quads(Some(subject), Some(&predicate), None, graph)?;
-            if child_quads.is_empty() {
-                continue;
-            }
             let mut child_entries = Vec::new();
             for quad in child_quads {
                 let child_subject =
@@ -336,7 +344,7 @@ impl OxigraphCatalogCache {
         }
 
         Err(StoreError::Backend(format!(
-            "{} is missing odrl:leftOperand and carries none of odrl:and/odrl:or/odrl:xone/odrl:andSequence",
+            "{} has fcns:logicalOperator {operator}, which is none of odrl:and/odrl:or/odrl:xone/odrl:andSequence",
             subject.as_str()
         )))
     }
