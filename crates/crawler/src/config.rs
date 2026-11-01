@@ -115,7 +115,10 @@ pub struct HolderConfig {
     ///
     /// A VC is a *bearer credential* - whoever holds the JWS can present
     /// it - so it is kept out of the config document itself, which may be
-    /// fetched over HTTP. The file is still plain, unencrypted text: this
+    /// fetched from another machine. The flip side is that the config picks
+    /// which local file is sent as the credential, so
+    /// [`Self::read_credential_jws`] only accepts a file that is a VC in
+    /// compact JWS form. The file is still plain, unencrypted text: this
     /// project has no secret-management story yet (see the `dataspace`
     /// study repo's `authority/` placeholder), so protecting it is left to
     /// the file's permissions.
@@ -140,8 +143,51 @@ impl HolderConfig {
                 path: self.credential_jws_file.display().to_string(),
             });
         }
+        check_compact_jws(jws).map_err(|reason| ConfigError::InvalidCredentialJws {
+            path: self.credential_jws_file.display().to_string(),
+            reason,
+        })?;
         Ok(jws.to_string())
     }
+}
+
+/// Whether `jws` looks like a Verifiable Credential in compact JWS form
+/// (RFC 7515 section 7.1): three non-empty, canonical base64url segments,
+/// a JSON header naming a signing `alg`, and a JSON payload that is a
+/// `VerifiableCredential` - VC-JWT's `vc` claim, or a VC 2.0 JOSE payload
+/// that is the credential itself. The signature is the verifier's business;
+/// this only stops a file that is plainly something else (an environment
+/// dump, a key, another kind of bearer token) from being sent as the
+/// crawler's credential.
+fn check_compact_jws(jws: &str) -> Result<(), &'static str> {
+    use serde_json::Value;
+    let segments: Vec<&str> = jws.split('.').collect();
+    let [_, _, signature] = segments[..] else {
+        return Err("expected three dot-separated segments");
+    };
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err("a segment is empty");
+    }
+    dcp_core::b64_decode(signature).map_err(|_| "the signature is not base64url")?;
+    let (_, header, payload) = dcp_core::decode_jws_unverified(jws)
+        .map_err(|_| "the header or payload is not base64url-encoded JSON")?;
+    let alg = header
+        .get("alg")
+        .and_then(Value::as_str)
+        .ok_or("the header names no alg")?;
+    if alg.is_empty() || alg.trim() != alg || alg.eq_ignore_ascii_case("none") {
+        return Err("the header's alg is empty or none");
+    }
+    let credential = payload.get("vc").unwrap_or(&payload);
+    let is_credential = match credential.get("type") {
+        Some(Value::String(kind)) => kind == "VerifiableCredential",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "VerifiableCredential"),
+        _ => false,
+    };
+    if !is_credential {
+        return Err("the payload is not a VerifiableCredential");
+    }
+    Ok(())
 }
 
 /// A crawler configuration that violates one of the invariants
@@ -169,6 +215,10 @@ pub enum ConfigError {
     },
     #[error("the holder credential file {path} is empty")]
     EmptyCredentialFile { path: String },
+    /// The file holds something other than a compact JWS. Its content is
+    /// deliberately not echoed: the file may be anything a config names.
+    #[error("the holder credential file {path} does not hold a compact JWS: {reason}")]
+    InvalidCredentialJws { path: String, reason: &'static str },
 }
 
 impl ParticipantsConfig {
@@ -313,25 +363,119 @@ mod tests {
         assert!(matches!(err, ConfigError::MissingHolder { id } if id == "gated"));
     }
 
+    /// Encode `json` as one base64url JWS segment.
+    fn segment(json: &str) -> String {
+        dcp_core::b64_encode(json)
+    }
+
+    /// A compact JWS: `header` and `payload` are JSON, the signature is
+    /// arbitrary (its check is the verifier's business).
+    fn jws(header: &str, payload: &str) -> String {
+        format!("{}.{}.c2lnbmF0dXJl", segment(header), segment(payload))
+    }
+
+    /// A VC-JWT whose header names ES256.
+    fn valid_jws() -> String {
+        jws(
+            r#"{"alg":"ES256","typ":"JWT"}"#,
+            r#"{"vc":{"type":["VerifiableCredential","FederatedCatalogAccessCredential"]}}"#,
+        )
+    }
+
+    /// Write `content` to a fresh credential file and read it back.
+    fn read_credential(content: &str) -> Result<String, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("holder.jws");
+        std::fs::write(&file, content).unwrap();
+        let mut config = holder();
+        config.credential_jws_file = file;
+        config.read_credential_jws()
+    }
+
     #[test]
     fn reads_and_trims_the_credential_file() {
-        let dir = std::env::temp_dir().join(format!("crawler-holder-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("holder.jws");
-        std::fs::write(&file, "header.payload.signature\n").unwrap();
-        let mut config = holder();
-        config.credential_jws_file = file.clone();
-        assert_eq!(
-            config.read_credential_jws().unwrap(),
-            "header.payload.signature"
-        );
-
-        std::fs::write(&file, "  \n").unwrap();
+        let valid = valid_jws();
+        assert_eq!(read_credential(&format!("{valid}\n")).unwrap(), valid);
         assert!(matches!(
-            config.read_credential_jws(),
+            read_credential("  \n"),
             Err(ConfigError::EmptyCredentialFile { .. })
         ));
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Whatever file the config names is sent as the credential, so only a
+    /// compact JWS is accepted: not environment variables, a key, or a
+    /// JSON credential.
+    #[test]
+    fn rejects_a_credential_file_that_is_not_a_compact_jws() {
+        // A VC 2.0 JOSE credential (the payload is the credential) passes.
+        let vc2 = jws(r#"{"alg":"ES256"}"#, r#"{"type":["VerifiableCredential"]}"#);
+        assert_eq!(read_credential(&vc2).unwrap(), vc2);
+
+        let header = "eyJhbGciOiJFUzI1NiJ9"; // {"alg":"ES256"}
+        let cases = [
+            ("environment", "PATH=/usr/bin\0HOME=/root\0".to_string()),
+            (
+                "PEM key",
+                "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMG\n-----END PRIVATE KEY-----".to_string(),
+            ),
+            (
+                "JSON credential",
+                r#"{"@context":[],"type":["VerifiableCredential"]}"#.to_string(),
+            ),
+            ("two segments", format!("{header}.eyJ2YyI6e319")),
+            ("four segments", format!("{header}.e30.c2ln.c2ln")),
+            ("empty signature", format!("{header}.e30.")),
+            ("empty payload", format!("{header}..c2ln")),
+            ("not base64url", format!("{header}.e30.c2ln+/==")),
+            ("header not JSON", "aGVsbG8.e30.c2ln".to_string()), // "hello"
+            (
+                "header without alg",
+                "eyJ0eXAiOiJKV1QifQ.e30.c2ln".to_string(),
+            ), // {"typ":"JWT"}
+            ("alg none", "eyJhbGciOiJub25lIn0.e30.c2ln".to_string()), // {"alg":"none"}
+            ("inner whitespace", format!("{header}.e30 .c2ln")),
+            (
+                "empty alg",
+                jws(
+                    r#"{"alg":""}"#,
+                    r#"{"vc":{"type":["VerifiableCredential"]}}"#,
+                ),
+            ),
+            (
+                "padded none",
+                jws(
+                    r#"{"alg":" none"}"#,
+                    r#"{"vc":{"type":["VerifiableCredential"]}}"#,
+                ),
+            ),
+            // A bearer token of another kind, such as a service-account JWT.
+            (
+                "not a credential",
+                jws(r#"{"alg":"RS256"}"#, r#"{"sub":"system:serviceaccount"}"#),
+            ),
+            ("payload not JSON", format!("{header}.aGVsbG8.c2ln")),
+            // `l` leaves non-zero trailing bits: dcp_core's strict decoder
+            // refuses them (`c2k` would be canonical).
+            (
+                "non-canonical base64url",
+                format!("{}.c2l", valid_jws().rsplit_once('.').unwrap().0),
+            ),
+        ];
+        for (name, content) in cases {
+            assert!(
+                matches!(
+                    read_credential(&content),
+                    Err(ConfigError::InvalidCredentialJws { .. })
+                ),
+                "{name} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_error_does_not_echo_the_file_content() {
+        let err = read_credential("SECRET_TOKEN=hunter2").unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
     }
 
     #[test]

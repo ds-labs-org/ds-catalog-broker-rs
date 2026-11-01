@@ -100,7 +100,7 @@ docker run --rm -p 8080:8080 \
 `CONFIG_STORE_PATH` is the only input. The image sets it to
 `/etc/ds-catalog-broker/config.ttl`, so a container started without that
 file mounted stops at once, rather than starting with built-in defaults.
-Point it elsewhere (a directory, another file, or an `http(s)://` URL) as
+Point it elsewhere (a directory, another file, or an `https://` URL) as
 described in [configuration.md](configuration.md).
 
 The config must set `broker:httpApiAddr` to a non-loopback address, for

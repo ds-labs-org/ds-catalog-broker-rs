@@ -11,8 +11,10 @@
 //! - **a plain path or a `file:///` URL to a directory**: a `contreforts-config` datadir, of
 //!   which only `<dir>/config_graph.ttl` is read;
 //! - **a plain path or a `file:///` URL to a file**: that Turtle document itself;
-//! - **an `http://` or `https://` URL**: a Turtle document fetched once at startup. A non-2xx
+//! - **an `https://` URL**: a Turtle document fetched once at startup. A non-2xx
 //!   answer is an error, not an empty config. Relative IRIs in it resolve against the URL.
+//!   Plain `http://` is accepted only for `localhost` or a loopback address, since the config
+//!   decides where the crawler sends its credential.
 //!
 //! Unset, the location is `contreforts-config`'s per-user default, `<os-data-dir>/config_store`.
 //! No setting is read from the environment.
@@ -285,9 +287,14 @@ pub enum BrokerConfigError {
     #[error("{CONFIG_STORE_PATH_ENV}={0:?} is not a valid URL: {1}")]
     InvalidUrl(String, String),
     #[error(
-        "{CONFIG_STORE_PATH_ENV}={0:?} uses an unsupported URL scheme (expected file, http or https)"
+        "{CONFIG_STORE_PATH_ENV}={0:?} uses an unsupported URL scheme (expected file or https)"
     )]
     UnsupportedScheme(String),
+    #[error(
+        "{CONFIG_STORE_PATH_ENV}={0:?} is plain http to something other than a loopback address; \
+         the config decides where the crawler sends its credential, so fetch it over https"
+    )]
+    InsecureRemote(String),
     #[error("failed to read {location}: {source}")]
     Read {
         location: String,
@@ -315,7 +322,8 @@ pub enum ConfigLocation {
 
 impl ConfigLocation {
     /// Parse a `CONFIG_STORE_PATH` value. Anything without `://` is a plain path; `file://`
-    /// URLs become paths; `http`/`https` stay URLs; any other scheme is rejected.
+    /// URLs become paths; `https` URLs, and `http` ones to a loopback host, stay URLs; any other
+    /// URL is rejected.
     pub fn parse(raw: &str) -> Result<Self, BrokerConfigError> {
         if !raw.contains("://") {
             return Ok(Self::Local(PathBuf::from(raw)));
@@ -323,7 +331,11 @@ impl ConfigLocation {
         let url = Url::parse(raw)
             .map_err(|err| BrokerConfigError::InvalidUrl(raw.to_string(), err.to_string()))?;
         match url.scheme() {
-            "http" | "https" => Ok(Self::Remote(url)),
+            // Plain http could be rewritten in transit, and the config
+            // decides where the crawler sends its credential: only this
+            // machine is trusted over it.
+            "http" | "https" if remote_allowed(&url) => Ok(Self::Remote(url)),
+            "http" => Err(BrokerConfigError::InsecureRemote(redacted(&url))),
             "file" => url.to_file_path().map(Self::Local).map_err(|()| {
                 BrokerConfigError::InvalidUrl(raw.to_string(), "not a local file path".to_string())
             }),
@@ -332,11 +344,61 @@ impl ConfigLocation {
     }
 }
 
+/// Whether a config may be fetched from, or a credential sent to, `url`:
+/// over https, or over plain http to a loopback address. A host name, even
+/// `localhost`, is not trusted as loopback: where it goes is up to the
+/// resolver.
+fn remote_allowed(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host_str().is_some_and(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
+/// The client that fetches a remote config: it follows a redirect only to a
+/// location `CONFIG_STORE_PATH` could name itself, and reaches a loopback
+/// address directly rather than through a proxy from the environment.
+fn config_client(url: &Url) -> reqwest::Result<reqwest::Client> {
+    let redirects = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            attempt.error("too many redirects")
+        } else if remote_allowed(attempt.url()) {
+            attempt.follow()
+        } else {
+            let target = redacted(attempt.url());
+            attempt.error(format!(
+                "refused a redirect to {target}: a config is fetched over https, or plain http \
+                 to a loopback address"
+            ))
+        }
+    });
+    let builder = reqwest::Client::builder().redirect(redirects);
+    if url.scheme() == "http" {
+        builder.no_proxy().build()
+    } else {
+        builder.build()
+    }
+}
+
+/// `url` without any user name or password, for messages and logs.
+fn redacted(url: &Url) -> String {
+    let mut url = url.clone();
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    url.to_string()
+}
+
 impl std::fmt::Display for ConfigLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Local(path) => write!(f, "{}", path.display()),
-            Self::Remote(url) => write!(f, "{url}"),
+            Self::Remote(url) => write!(f, "{}", redacted(url)),
         }
     }
 }
@@ -354,7 +416,7 @@ pub struct BrokerSettings {
 impl BrokerSettings {
     /// Resolve `CONFIG_STORE_PATH` (see the module doc) and read the config it names, if
     /// there is one. `http` is used only for an `http(s)://` location.
-    pub async fn load(http: &reqwest::Client) -> Result<Self, BrokerConfigError> {
+    pub async fn load() -> Result<Self, BrokerConfigError> {
         let raw = std::env::var(CONFIG_STORE_PATH_ENV)
             .ok()
             .filter(|v| !v.is_empty());
@@ -382,7 +444,7 @@ impl BrokerSettings {
             },
         };
 
-        let mut settings = Self::from_location(&location, http).await?;
+        let mut settings = Self::from_location(&location).await?;
         tracing::info!(
             location = %location,
             settings = settings.values.len(),
@@ -397,10 +459,7 @@ impl BrokerSettings {
     /// *not* opened with [`ConfigStore::open`], which creates a missing directory and rewrites a
     /// corrupt `config_graph.ttl` from its `.bak.N` backups. A missing or unparsable file is an
     /// error instead.
-    pub async fn from_location(
-        location: &ConfigLocation,
-        http: &reqwest::Client,
-    ) -> Result<Self, BrokerConfigError> {
+    pub async fn from_location(location: &ConfigLocation) -> Result<Self, BrokerConfigError> {
         match location {
             ConfigLocation::Local(path) => {
                 let file = if path.is_dir() {
@@ -426,7 +485,11 @@ impl BrokerSettings {
                     location: location.to_string(),
                     source,
                 };
-                let turtle = http
+                if !remote_allowed(url) {
+                    return Err(BrokerConfigError::InsecureRemote(redacted(url)));
+                }
+                let turtle = config_client(url)
+                    .map_err(fetch)?
                     .get(url.clone())
                     .header(reqwest::header::ACCEPT, "text/turtle")
                     .send()
@@ -921,12 +984,26 @@ impl Properties {
         Ok(value)
     }
 
-    /// `property` as an absolute `http(s)` URL, if set.
-    fn optional_http_url(&self, property: &str) -> Result<Option<String>, BrokerConfigError> {
+    /// `property` as an absolute `http(s)` URL, if set. When the endpoint
+    /// carries the crawler's credential (`gated`), plain http is accepted
+    /// only to a loopback address, as for a remote config.
+    fn optional_endpoint_url(
+        &self,
+        property: &str,
+        gated: bool,
+    ) -> Result<Option<String>, BrokerConfigError> {
         let Some(value) = self.optional(property)? else {
             return Ok(None);
         };
         match Url::parse(&value) {
+            Ok(url) if gated && !remote_allowed(&url) && url.scheme() == "http" => Err(self
+                .invalid(
+                    property,
+                    value,
+                    "this endpoint receives the crawler's credential: expected https, or plain \
+                     http to a loopback address"
+                        .to_string(),
+                )),
             Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(Some(value)),
             _ => Err(self.invalid(
                 property,
@@ -1054,8 +1131,9 @@ fn read_participant(
     };
     let id = props.non_empty(PARTICIPANT_ID)?;
     let name = props.non_empty(PARTICIPANT_NAME)?;
+    let gated = credential_protocol != CredentialProtocol::None;
     let catalog_request_url = props
-        .optional_http_url(CATALOG_REQUEST_URL)?
+        .optional_endpoint_url(CATALOG_REQUEST_URL, gated)?
         .ok_or_else(|| BrokerConfigError::MissingProperty {
             resource: props.resource.clone(),
             property: CATALOG_REQUEST_URL.to_string(),
@@ -1068,7 +1146,7 @@ fn read_participant(
         CredentialProtocol::Dcp,
         "dcp",
     )?;
-    let oid4vp_response_uri = props.optional_http_url(OID4VP_RESPONSE_URI)?;
+    let oid4vp_response_uri = props.optional_endpoint_url(OID4VP_RESPONSE_URI, true)?;
     props.only_for(
         OID4VP_RESPONSE_URI,
         &oid4vp_response_uri,
@@ -1212,7 +1290,7 @@ mod tests {
         let crawler = crawler_from(
             "<urn:c> a broker:BrokerConfig ; broker:crawlIntervalSecs 5 ;\n\
              broker:participant [ a broker:Participant ; broker:participantId \"p\" ;\n\
-               broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl \"https://h/c\" ;\n\
                broker:credentialProtocol \"dcp\" ; broker:providerDid \"did:web:h\" ] ;\n\
              broker:holder [ a broker:Holder ; broker:ownDidHost \"h\" ;\n\
                broker:credentialJwsFile <file:///run/secrets/holder.jws> ;\n\
@@ -1287,7 +1365,7 @@ mod tests {
         let err = crawler_from(
             "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
              <urn:p> a broker:Participant ; broker:participantId \"p\" ;\n\
-               broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" ;\n\
+               broker:participantName \"P\" ; broker:catalogRequestUrl \"https://h/c\" ;\n\
                broker:credentialProtocol \"dcp\" ; broker:providerDid \"did:web:h\" .\n",
         )
         .unwrap_err();
@@ -1647,14 +1725,46 @@ mod tests {
         ));
     }
 
+    /// The config names where the crawler sends its credential, so a
+    /// remote config must come over https; plain http only reaches this
+    /// machine.
+    #[test]
+    fn plain_http_config_is_refused_except_on_loopback() {
+        for raw in [
+            "http://config.example.org/broker.ttl",
+            "http://10.0.0.5:8080/broker.ttl",
+            "http://127.0.0.1.example.org/broker.ttl",
+            "HTTP://config.example.org/broker.ttl",
+            // A name is only as local as the resolver makes it.
+            "http://localhost:8000/broker.ttl",
+        ] {
+            assert!(
+                matches!(
+                    ConfigLocation::parse(raw),
+                    Err(BrokerConfigError::InsecureRemote(_))
+                ),
+                "{raw} was accepted"
+            );
+        }
+        for raw in [
+            "http://127.0.0.1:8000/broker.ttl",
+            "http://127.1.2.3/broker.ttl",
+            "http://[::1]:8000/broker.ttl",
+            "https://config.example.org/broker.ttl",
+        ] {
+            assert!(
+                matches!(ConfigLocation::parse(raw), Ok(ConfigLocation::Remote(_))),
+                "{raw} was refused"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn reads_a_datadir_via_a_file_url() {
         let (dir, _store) = store_with(ONE_SETTING);
         let url = Url::from_directory_path(dir.path()).unwrap();
         let location = ConfigLocation::parse(url.as_str()).unwrap();
-        let settings = BrokerSettings::from_location(&location, &reqwest::Client::new())
-            .await
-            .unwrap();
+        let settings = BrokerSettings::from_location(&location).await.unwrap();
         assert_eq!(settings.get(HTTP_API_ADDR).as_deref(), Some("0.0.0.0:9000"));
     }
 
@@ -1668,9 +1778,7 @@ mod tests {
             Url::from_file_path(&file).unwrap().to_string(),
         ] {
             let location = ConfigLocation::parse(&raw).unwrap();
-            let settings = BrokerSettings::from_location(&location, &reqwest::Client::new())
-                .await
-                .unwrap();
+            let settings = BrokerSettings::from_location(&location).await.unwrap();
             assert_eq!(settings.get(HTTP_API_ADDR).as_deref(), Some("0.0.0.0:9000"));
         }
     }
@@ -1693,13 +1801,88 @@ mod tests {
         format!("http://{addr}")
     }
 
+    #[test]
+    fn the_refusal_does_not_echo_a_password_in_the_url() {
+        let err = ConfigLocation::parse("http://svc:s3cr3t@config.example.org/broker.ttl")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("s3cr3t"), "{err}");
+        let location = ConfigLocation::Remote(
+            Url::parse("https://svc:s3cr3t@config.example.org/broker.ttl").unwrap(),
+        );
+        assert!(!location.to_string().contains("s3cr3t"), "{location}");
+    }
+
+    /// The rule holds however the location was built, not only through
+    /// `ConfigLocation::parse`.
+    #[tokio::test]
+    async fn a_remote_plain_http_location_is_refused_before_any_request() {
+        let location =
+            ConfigLocation::Remote(Url::parse("http://config.invalid/broker.ttl").unwrap());
+        assert!(matches!(
+            BrokerSettings::from_location(&location).await,
+            Err(BrokerConfigError::InsecureRemote(_))
+        ));
+    }
+
+    /// A redirect must not lead the fetch somewhere `CONFIG_STORE_PATH`
+    /// itself could not point.
+    #[tokio::test]
+    async fn a_redirect_to_a_location_that_would_be_refused_is_not_followed() {
+        use axum::{Router, response::Redirect, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/start.ttl",
+                get(move || async move {
+                    Redirect::temporary(&format!("http://localhost:{port}/broker.ttl"))
+                }),
+            )
+            .route("/broker.ttl", get(|| async { ONE_SETTING }));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let location =
+            ConfigLocation::parse(&format!("http://127.0.0.1:{port}/start.ttl")).unwrap();
+        assert!(
+            BrokerSettings::from_location(&location).await.is_err(),
+            "followed a redirect to plain http on a non-loopback-literal host"
+        );
+    }
+
+    /// A gated participant's endpoints carry the crawler's credential, so
+    /// they need https too (or a loopback address); an open one does not.
+    #[test]
+    fn a_gated_participant_needs_https_endpoints() {
+        assert_eq!(
+            participant_error(
+                "broker:participantId \"p\" ; broker:participantName \"P\" ; \
+                 broker:catalogRequestUrl \"http://h/c\" ; \
+                 broker:credentialProtocol \"dcp\" ; broker:providerDid \"did:web:h\""
+            ),
+            CATALOG_REQUEST_URL
+        );
+        assert_eq!(
+            participant_error(&format!(
+                "{ID_NAME_URL} ; broker:credentialProtocol \"oid4vp\" ; \
+                 broker:oid4vpResponseUri \"http://h/response\""
+            )),
+            OID4VP_RESPONSE_URI
+        );
+        let open = "<urn:c> a broker:BrokerConfig ; broker:participant <urn:p> .\n\
+             <urn:p> a broker:Participant ; broker:participantId \"p\" ; \
+             broker:participantName \"P\" ; broker:catalogRequestUrl \"http://h/c\" .\n";
+        assert!(
+            crawler_from(open).is_ok(),
+            "an open participant may use http"
+        );
+    }
+
     #[tokio::test]
     async fn fetches_turtle_over_http() {
         let base = serve_turtle().await;
         let location = ConfigLocation::parse(&format!("{base}/broker.ttl")).unwrap();
-        let settings = BrokerSettings::from_location(&location, &reqwest::Client::new())
-            .await
-            .unwrap();
+        let settings = BrokerSettings::from_location(&location).await.unwrap();
         assert_eq!(settings.get(HTTP_API_ADDR).as_deref(), Some("0.0.0.0:9000"));
     }
 
@@ -1708,7 +1891,7 @@ mod tests {
         let base = serve_turtle().await;
         let location = ConfigLocation::parse(&format!("{base}/missing.ttl")).unwrap();
         assert!(matches!(
-            BrokerSettings::from_location(&location, &reqwest::Client::new()).await,
+            BrokerSettings::from_location(&location).await,
             Err(BrokerConfigError::Fetch { .. })
         ));
     }
@@ -1719,7 +1902,7 @@ mod tests {
         let missing = dir.path().join("nope");
         let location = ConfigLocation::Local(missing.clone());
         assert!(matches!(
-            BrokerSettings::from_location(&location, &reqwest::Client::new()).await,
+            BrokerSettings::from_location(&location).await,
             Err(BrokerConfigError::Read { .. })
         ));
         assert!(!missing.exists());
@@ -1733,7 +1916,7 @@ mod tests {
         std::fs::write(dir.path().join("config_graph.ttl.bak.1"), ONE_SETTING).unwrap();
         let location = ConfigLocation::Local(dir.path().to_path_buf());
         assert!(matches!(
-            BrokerSettings::from_location(&location, &reqwest::Client::new()).await,
+            BrokerSettings::from_location(&location).await,
             Err(BrokerConfigError::Parse { .. })
         ));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "not turtle");
@@ -1831,7 +2014,7 @@ mod tests {
     }
 
     const ID_NAME_URL: &str = "broker:participantId \"p\" ; broker:participantName \"P\" ; \
-         broker:catalogRequestUrl \"http://h/c\"";
+         broker:catalogRequestUrl \"https://h/c\"";
 
     #[test]
     fn participant_values_that_do_not_parse_are_errors() {
