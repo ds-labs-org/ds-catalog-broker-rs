@@ -84,7 +84,9 @@ impl OxigraphCatalogCache {
     ///
     /// When cancelled part way, the catalogs already decided are kept under
     /// `key` and `write_sequence` for [`PARTIAL_ALLOW_LIST_TTL`], and the
-    /// next build for the same key and store state resumes from them.
+    /// next build for the same key and store state resumes from them. A
+    /// catalog whose `allow_list` call ended after the cancellation is not
+    /// kept, since the callback may have returned a partial answer.
     fn build_allow_list(
         &self,
         key: &str,
@@ -131,7 +133,15 @@ impl OxigraphCatalogCache {
             if let Ok(node) = decode_node_id(&graph_iri)
                 && let Ok(Some(catalog)) = self.load_catalog(&node, &graph)
             {
-                progress.visible.extend(allow_list(&catalog));
+                let decided = allow_list(&catalog);
+                // A cancelled callback returns what it had decided so
+                // far. Recording that as the catalog's answer would make
+                // a resumed build skip it and cache an incomplete list.
+                if cancelled() {
+                    self.keep_partial(key, progress);
+                    return Err(SparqlError::Cancelled);
+                }
+                progress.visible.extend(decided);
             }
             progress.done.insert(graph_iri);
         }

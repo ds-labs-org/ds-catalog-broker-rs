@@ -1012,15 +1012,19 @@ fn policy_filtered_query_stops_building_the_allow_list_when_cancelled() {
         "k",
         |catalog| {
             calls += 1;
-            token.cancel();
+            // The second catalog is still being decided when the request
+            // is cancelled, so its answer is not kept.
+            if calls == 2 {
+                token.cancel();
+            }
             public_only(catalog)
         },
         &limits,
     );
     assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
-    assert_eq!(calls, 1);
+    assert_eq!(calls, 2);
     // The partial list was not cached as a complete one; the next build
-    // resumes and decides only the remaining catalogs.
+    // resumes and decides only the catalogs not yet fully decided.
     let mut again = 0;
     cache
         .sparql_query_json_policy_filtered(
@@ -1077,19 +1081,24 @@ fn policy_filtered_query_finishes_a_slow_build_across_cancelled_requests() {
         cache.store_catalog(catalog).unwrap();
     }
     let mut decided = 0;
-    // Each request is cancelled after deciding one catalog.
+    // Each request fully decides one catalog, then is cancelled while
+    // deciding the next one, whose answer is discarded.
     for attempt in 0..3 {
         let token = CancellationToken::new();
         let limits = SparqlLimits {
             cancellation: Some(token.clone()),
             ..SparqlLimits::default()
         };
+        let mut calls_this_request = 0;
         let result = cache.sparql_query_json_policy_filtered(
             TITLES,
             "slow",
             |catalog| {
                 decided += 1;
-                token.cancel();
+                calls_this_request += 1;
+                if calls_this_request == 2 {
+                    token.cancel();
+                }
                 public_only(catalog)
             },
             &limits,
@@ -1098,7 +1107,9 @@ fn policy_filtered_query_finishes_a_slow_build_across_cancelled_requests() {
             assert!(matches!(result, Err(SparqlError::Cancelled)), "{result:?}");
         }
     }
-    assert_eq!(decided, 3);
+    // 2 + 2 + 1: the cancelled catalog of the first two requests is decided
+    // again by the next one.
+    assert_eq!(decided, 5);
     // The list is now complete and cached: no further decoding.
     let mut after = 0;
     let body = cache
